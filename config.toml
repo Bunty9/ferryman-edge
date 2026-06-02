@@ -1,0 +1,28 @@
+# ferryman-edge routing config. Hot-reloaded on SIGUSR1.
+#
+# mTLS terminate -> JWT verify (RS256, moka-cached) -> per-tenant rate limit
+# (governor, keyed by Claims.sub) -> prefix-longest-match routing with the
+# P2 circuit breaker. Reload TLS + routes atomically with:
+#   kill -USR1 $(pidof ferryman-edge-server)
+
+health_interval_secs = 5
+default_cooldown_secs = 30
+
+# Per-tenant requests/sec cap, keyed by JWT `sub` claim.
+tenant_rps = 1000
+
+[tls]
+cert_path      = "certs/server.crt"
+key_path       = "certs/server.key"
+client_ca_path = "certs/ca-bundle.crt"
+
+[jwt]
+jwks_path = "certs/jwt-pub.pem"
+
+[[routes]]
+prefix = "/svc-a"
+upstream = "http://localhost:8001"
+
+[[routes]]
+prefix = "/svc-b"
+upstream = "http://localhost:8002"

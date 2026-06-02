@@ -1,0 +1,45 @@
+[package]
+name = "ferryman-edge-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Programmable mTLS L7 reverse proxy binary — wires ferryman-edge-core behind a tokio-rustls acceptor."
+
+[[bin]]
+name = "ferryman-edge-server"
+path = "src/main.rs"
+
+[features]
+# Default: collect the inbound body once, forward as `Full<Bytes>`. Lower
+# code complexity and faster for typical JSON payloads under ~256 KB.
+default = []
+# Streaming body forwarding via `BoxBody`. Lower steady-state allocations
+# for large payloads at the cost of code complexity and per-frame overhead.
+# See README "Design tradeoffs" for measurements.
+boxed_body = []
+
+[dependencies]
+ferryman-edge-core = { path = "../core" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+arc-swap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }

@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/server",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Runtime + HTTP
+tokio = { version = "1.47", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+hyper = { version = "1.5", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+
+# TLS termination + mTLS (P4 core)
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+webpki = "0.22"
+
+# Auth + rate limit (P4 additions over P2)
+jsonwebtoken = "9"
+moka = { version = "0.12", features = ["future"] }
+governor = "0.7"
+
+# HTTP client (active health checker + benches)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Concurrency primitives
+arc-swap = "1.7"
+parking_lot = "0.12"
+
+# Filesystem watching — kept for reference; P4 prefers SIGUSR1 reload.
+notify = "6"
+
+# URL parsing (validation in proxy hot path)
+url = "2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# dev-dependencies that any workspace member may opt in to via
+# `[dev-dependencies]` + `workspace = true`.
+[workspace.dependencies.criterion]
+version = "0.5"
+
+[workspace.dependencies.proptest]
+version = "1"
+
+[workspace.dependencies.wiremock]
+version = "0.6"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

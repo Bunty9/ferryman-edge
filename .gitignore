@@ -1,0 +1,26 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Generated test/dev certificate material — never commit private keys
+certs/*.pem
+certs/*.key
+certs/*.crt
+certs/*.csr
+certs/*.srl
+!certs/.gitkeep
+
+# Environment + secrets
+.env
+.env.local
+.envrc
+
+# wrk2 / reload bench result dumps
+benches/*.txt
+benches/results/
+
+# Editors / OS noise
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,57 @@
+# Fly.io deployment manifest for ferryman-edge.
+#
+# Two-region failover demo: primary in `sin`, secondary in `iad`. mTLS
+# terminates inside the proxy itself, so this is NOT behind Fly's managed
+# certificates — we publish a raw TCP service and rely on the cert/key
+# bundle baked into /app/certs (or mounted from a Fly secret store).
+#
+#   fly launch --copy-config --no-deploy
+#   fly scale count 1 --region sin
+#   fly scale count 1 --region iad
+#   fly deploy
+
+app = "ferryman-edge"
+primary_region = "sin"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "info"
+  FERRYMAN_EDGE_CONFIG = "/app/config.toml"
+  FERRYMAN_EDGE_BIND = "0.0.0.0:8443"
+  FERRYMAN_EDGE_METRICS_BIND = "0.0.0.0:9090"
+
+# mTLS terminates inside the proxy — Fly exposes the raw TCP port and we do
+# *not* enable `force_https` / managed certs.
+[[services]]
+  internal_port = 8443
+  protocol = "tcp"
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 8443
+
+[[services]]
+  internal_port = 9090
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 9090
+    handlers = ["http"]
+
+[[regions]]
+  code = "sin"
+
+[[regions]]
+  code = "iad"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
