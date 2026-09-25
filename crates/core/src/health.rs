@@ -35,7 +35,10 @@ pub async fn health_loop(table: SharedTable, interval: Duration) {
         let current = table.load_full();
         for (_, up) in &current.rules {
             let url = health_url(&up.uri);
-            let host = up.uri.host().unwrap_or("").to_string();
+            let host = up
+                .uri
+                .authority()
+                .map_or_else(String::new, |a| a.to_string());
             match client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => {
                     up.mark_success();

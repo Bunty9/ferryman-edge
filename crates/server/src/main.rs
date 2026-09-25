@@ -1,28 +1,17 @@
 //! ferryman-edge-server — programmable mTLS L7 reverse proxy.
 //!
-//! Wires `ferryman-edge-core` behind a `tokio-rustls` acceptor:
-//!
-//!   inbound TCP
-//!     -> `TlsAcceptor::accept` using the *current* `ReloadingTls` config
-//!     -> hyper `serve_connection` over the TLS stream
-//!     -> per-request: JWT verify, rate-limit by `Claims::sub`, route, proxy.
-//!
-//! Phase 1: the full acceptor wire-up is gated behind a `todo!()` for the
-//! request-level auth path (see `tls_serve`); `cargo check --workspace`
-//! passes and the binary builds. Phase 2 fills in the auth middleware and
-//! takes wrk2 numbers.
-
-mod proxy;
-mod reload;
+//! This binary is arg parsing + boot: load config, build the mTLS/JWT/route
+//! primitives, spin up background tasks (health checker, SIGUSR1 reload,
+//! rate-limiter GC), then hand off to `ferryman_edge_server::serve` for the
+//! accept loop and per-request pipeline.
 
 use arc_swap::ArcSwap;
 use clap::Parser;
 use ferryman_edge_core::{
-    build_limiter, build_table, health_loop, ratelimit::Limiter, ConfigToml, JwtVerifier,
+    build_limiter, build_table, health_loop, spawn_gc, ConfigToml, JwtVerifier, Limiter,
     ReloadingTls, SharedTable,
 };
-use http_body_util::Full;
-use hyper::body::Bytes;
+use ferryman_edge_server::{reload, serve, AppState, UpstreamClient};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -32,6 +21,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
+
+/// Rate-limiter GC interval — evicts per-tenant state that hasn't been
+/// touched recently so the keyed store doesn't grow unbounded.
+const LIMITER_GC_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
 #[command(name = "ferryman-edge-server", about = "programmable mTLS L7 proxy")]
@@ -88,8 +81,8 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     // JWT verifier reads the RSA pub key once at boot. Cache TTL == 5 min,
-    // capacity == 10k. Stable across reloads — re-init on Phase 2 if the
-    // issuer key rotates.
+    // capacity == 10k. Stable across reloads — re-init if the issuer key
+    // rotates (not wired to SIGUSR1; that reloads TLS + routes only).
     let jwks_pem = std::fs::read(&cfg.jwt.jwks_path)?;
     let jwt: Arc<JwtVerifier> = Arc::new(JwtVerifier::new(&jwks_pem)?);
 
@@ -97,6 +90,9 @@ async fn main() -> anyhow::Result<()> {
     // `tenant_rps == 0` — rate limiting is disabled outright rather than
     // silently clamped to 1 rps.
     let limiter: Option<Arc<Limiter>> = build_limiter(cfg.tenant_rps);
+    if let Some(l) = &limiter {
+        spawn_gc(l.clone(), LIMITER_GC_INTERVAL);
+    }
 
     // Prometheus exporter binds its own listener so the proxy is unaffected
     // by /metrics scrape traffic.
@@ -111,56 +107,36 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared hyper upstream client. Single instance across the process — its
     // internal pool multiplexes HTTP/2 streams to each upstream.
-    let _client: Client<HttpConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let client: UpstreamClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+    let state = Arc::new(AppState {
+        tls,
+        table: shared,
+        jwt,
+        limiter,
+        client,
+    });
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, "ferryman-edge-server listening (mTLS)");
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let _tls = tls.clone();
-        let _shared = shared.clone();
-        let _jwt = jwt.clone();
-        let _limiter = limiter.clone();
-        let _client = _client.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tls_serve(stream, peer, _tls, _shared, _jwt, _limiter, _client).await {
-                tracing::debug!(?peer, ?e, "connection closed with error");
-            }
-        });
+    serve(listener, state, shutdown_signal()).await;
+    Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT (fly.toml uses `kill_signal = "SIGINT"`,
+/// `kill_timeout = 30`) so `serve` can start its own bounded drain.
+async fn shutdown_signal() {
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(?e, "failed to install SIGTERM handler");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received"),
     }
-}
-
-/// Per-connection task. Phase 2 fills in the auth + rate-limit middleware
-/// between the TLS handshake and `proxy::handle`; for now the
-/// `todo!()` keeps the workspace honest about what's missing while still
-/// type-checking the full call graph.
-#[allow(clippy::too_many_arguments)]
-async fn tls_serve(
-    _stream: tokio::net::TcpStream,
-    _peer: SocketAddr,
-    _tls: Arc<ReloadingTls>,
-    _shared: SharedTable,
-    _jwt: Arc<JwtVerifier>,
-    _limiter: Option<Arc<Limiter>>,
-    _client: Client<HttpConnector, Full<Bytes>>,
-) -> anyhow::Result<()> {
-    // Phase 2: tokio_rustls::TlsAcceptor::from(_tls.current()).accept(_stream)
-    // -> hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-    //    .serve_connection(TokioIo::new(tls_stream), service_fn(|req| async {
-    //        let token = req.headers().get("authorization") ...;
-    //        let claims = _jwt.verify(token).await ...;
-    //        ferryman_edge_core::ratelimit::check(&_limiter, &claims.sub) ...;
-    //        proxy::handle(_shared.clone(), _client.clone(), req).await
-    //    }))
-    todo!("Phase 2: wire tokio-rustls acceptor + JWT/ratelimit middleware around proxy::handle")
-}
-
-/// Placeholder for a future `/metrics` router served via tower (e.g. when
-/// scrape filtering or auth on the metrics surface is needed). The
-/// Prometheus exporter currently owns the listener directly — see `main()`.
-#[allow(dead_code)]
-fn metrics_router() {
-    todo!("Phase 2: optional tower router for /metrics with auth + scrape filters");
 }

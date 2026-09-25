@@ -13,7 +13,7 @@
 # route in URL answers 2xx.
 # Usage:  ./benches/reload.sh [duration_secs] [workers]
 # Env:    URL (default https://localhost:8443/svc-a/echo), FERRYMAN_JWT
-#         (minted via scripts/mint-jwt.sh if unset), PID (else pgrep).
+#         (minted via scripts/mint-jwt.sh if unset), PID (else pidof).
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ for f in ca.crt client.crt client.key jwt-priv.pem; do
     [ -f "${CERTS}/${f}" ] || { echo "missing ${CERTS}/${f}; run scripts/gen-test-certs.sh" >&2; exit 1; }
 done
 FERRYMAN_JWT="${FERRYMAN_JWT:-$("${ROOT}/scripts/mint-jwt.sh")}"
-PID="${PID:-$(pgrep -x ferryman-edge-server || true)}"
+PID="${PID:-$(pidof -s ferryman-edge-server || true)}"
 [ -n "$PID" ] || { echo "ferryman-edge-server not running (set PID=...)" >&2; exit 1; }
 
 LOG_DIR="$(mktemp -d)"

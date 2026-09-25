@@ -77,8 +77,19 @@ impl ReloadingTls {
         self.inner.load_full()
     }
 
+    /// Re-read cert/key/client-CA from the configured paths and swap them in
+    /// atomically. This is what the SIGUSR1 loop calls; it's also exposed
+    /// directly so callers (tests, or an operator tool) can trigger a
+    /// reload without going through a process signal — signals are
+    /// process-wide, which makes them awkward in a multi-instance test
+    /// process.
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let cfg = build_mtls_config(&self.paths.0, &self.paths.1, &self.paths.2)?;
+        self.inner.store(cfg);
+        Ok(())
+    }
+
     fn watch(s: Arc<Self>) {
-        let paths = s.paths.clone();
         tokio::spawn(async move {
             let mut sig =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
@@ -91,11 +102,8 @@ impl ReloadingTls {
                 };
             // SIGUSR1 triggers reload — simpler and more reliable than notify on k8s ConfigMap mounts.
             while sig.recv().await.is_some() {
-                match build_mtls_config(&paths.0, &paths.1, &paths.2) {
-                    Ok(cfg) => {
-                        s.inner.store(cfg);
-                        tracing::info!("mTLS config reloaded");
-                    }
+                match s.reload() {
+                    Ok(()) => tracing::info!("mTLS config reloaded"),
                     Err(e) => tracing::error!(?e, "mTLS reload failed; keeping old"),
                 }
             }

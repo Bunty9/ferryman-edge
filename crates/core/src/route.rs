@@ -38,7 +38,7 @@ fn now_secs() -> u64 {
 }
 
 fn emit_circuit_gauge(uri: &http::Uri, state: u8) {
-    let host = uri.host().unwrap_or("").to_string();
+    let host = uri.authority().map_or_else(String::new, |a| a.to_string());
     let v = match state {
         CLOSED => 0.0,
         OPEN => 1.0,
@@ -175,6 +175,15 @@ impl RouteTable {
             .iter()
             .find(|(prefix, up)| matches_prefix(path, prefix) && up.is_routable())
             .map(|(_, up)| up)
+    }
+
+    /// Whether any rule's prefix matches `path`, ignoring circuit-breaker
+    /// state. Lets the caller tell "no route configured" (404) apart from
+    /// "a route matched but its upstream isn't currently routable" (503).
+    pub fn has_prefix(&self, path: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|(prefix, _)| matches_prefix(path, prefix))
     }
 }
 

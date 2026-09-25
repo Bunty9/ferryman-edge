@@ -32,3 +32,12 @@ rustls-pki-types = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { workspace = true }
 governor = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["async_tokio"] }
+tokio = { workspace = true }
+jsonwebtoken = { workspace = true }
+
+[[bench]]
+name = "jwt_verify"
+harness = false
