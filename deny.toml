@@ -29,6 +29,8 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "OpenSSL",
+    # webpki-roots (Mozilla CA bundle data), pulled in by reqwest's rustls-tls.
+    "CDLA-Permissive-2.0",
 ]
 
 [sources]

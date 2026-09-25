@@ -27,13 +27,13 @@ tracing = { workspace = true }
 # P4 stack additions
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { workspace = true }
 governor = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 tokio = { workspace = true }
 jsonwebtoken = { workspace = true }

@@ -58,6 +58,13 @@ pub struct TlsToml {
 pub struct JwtToml {
     /// Path to the RSA public key PEM used for RS256 verification.
     pub jwks_path: String,
+    /// Required `iss` claim. Unset = not checked.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Required `aud` claim. Unset = not checked (tokens that carry an `aud`
+    /// are then rejected by `jsonwebtoken`).
+    #[serde(default)]
+    pub audience: Option<String>,
 }
 
 /// One routing rule.
@@ -118,6 +125,8 @@ mod tests {
             },
             jwt: JwtToml {
                 jwks_path: "certs/jwt-pub.pem".into(),
+                issuer: None,
+                audience: None,
             },
             routes: vec![RouteToml {
                 prefix: "/svc-a".into(),

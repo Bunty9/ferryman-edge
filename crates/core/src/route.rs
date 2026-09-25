@@ -75,34 +75,25 @@ impl Upstream {
     /// (older than `cooldown_secs`) is treated the same way, so recovery
     /// never wedges on a lost probe.
     pub fn is_routable(&self) -> bool {
-        match self.state.load(Ordering::Acquire) {
-            CLOSED => true,
-            HALF_OPEN if self.cooldown_elapsed() => {
-                // Stale probe — nobody reported back. Downgrade to Open so
-                // the single-flight below can arm a fresh probe. If we lose
-                // this race, whoever won will drive the same downgrade.
-                let _ = self.state.compare_exchange(
-                    HALF_OPEN,
-                    OPEN,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-                self.try_probe()
-            }
-            OPEN => self.try_probe(),
-            _ => false, // HalfOpen, probe still in flight within cooldown
+        let state = self.state.load(Ordering::Acquire);
+        if state == CLOSED {
+            return true;
         }
-    }
-
-    fn cooldown_elapsed(&self) -> bool {
+        // Open, or HalfOpen with a probe in flight. The transition timestamp
+        // is the single-flight token: only the caller whose CAS moves it
+        // from the stale value to `now` becomes the probe. Using the state
+        // byte as the token instead leaves an ABA window where two callers
+        // both see a stale HalfOpen and both probe.
+        let stamped = self.last_transition_unix.load(Ordering::Acquire);
         let now = now_secs();
-        now.saturating_sub(self.last_transition_unix.load(Ordering::Acquire)) >= self.cooldown_secs
-    }
-
-    /// Single-flight Open -> HalfOpen transition. Only the CAS winner is
-    /// routed; everyone else sees `false`.
-    fn try_probe(&self) -> bool {
-        if !self.cooldown_elapsed() {
+        if now.saturating_sub(stamped) < self.cooldown_secs {
+            return false;
+        }
+        if self
+            .last_transition_unix
+            .compare_exchange(stamped, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return false;
         }
         if self
@@ -110,13 +101,9 @@ impl Upstream {
             .compare_exchange(OPEN, HALF_OPEN, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            self.last_transition_unix
-                .store(now_secs(), Ordering::Release);
             emit_circuit_gauge(&self.uri, HALF_OPEN);
-            true
-        } else {
-            false
         }
+        true
     }
 
     /// Mark this upstream as failed and stamp the failure time. Called from
@@ -170,11 +157,31 @@ impl RouteTable {
         Self { rules }
     }
 
+    /// The upstream for the most specific matching prefix, if that upstream
+    /// is routable. A tripped breaker yields `None` — it never falls through
+    /// to a shorter prefix, which would send one service's traffic to
+    /// another service's backend.
     pub fn lookup(&self, path: &str) -> Option<&Upstream> {
         self.rules
             .iter()
-            .find(|(prefix, up)| matches_prefix(path, prefix) && up.is_routable())
+            .find(|(prefix, _)| matches_prefix(path, prefix))
             .map(|(_, up)| up)
+            .filter(|up| up.is_routable())
+    }
+
+    /// Carry circuit-breaker state across a reload: every rule whose prefix,
+    /// upstream URI, and cooldown are unchanged reuses the old `Upstream`
+    /// (and so its shared breaker atomics). Without this a SIGUSR1 during an
+    /// incident would reset every breaker to Closed and send full traffic at
+    /// dead backends.
+    pub fn inherit_breakers(&mut self, old: &RouteTable) {
+        for (prefix, up) in &mut self.rules {
+            if let Some((_, prev)) = old.rules.iter().find(|(p, prev)| {
+                p == prefix && prev.uri == up.uri && prev.cooldown_secs == up.cooldown_secs
+            }) {
+                *up = prev.clone();
+            }
+        }
     }
 
     /// Whether any rule's prefix matches `path`, ignoring circuit-breaker
@@ -238,6 +245,41 @@ mod tests {
     // ----- circuit breaker ----------------------------------------------
 
     #[test]
+    fn open_breaker_does_not_fall_through_to_shorter_prefix() {
+        let specific = upstream(30);
+        let catch_all = upstream(30);
+        let table = RouteTable::new(vec![
+            ("/".to_string(), catch_all),
+            ("/svc-a".to_string(), specific.clone()),
+        ]);
+        specific.mark_failed();
+        assert!(table.lookup("/svc-a/x").is_none());
+        assert!(table.has_prefix("/svc-a/x"));
+        assert!(table.lookup("/other").is_some());
+    }
+
+    #[test]
+    fn reload_inherits_breaker_state_for_unchanged_rules() {
+        let a = upstream(30);
+        let old = RouteTable::new(vec![("/svc-a".to_string(), a.clone())]);
+        a.mark_failed();
+
+        let mut same = RouteTable::new(vec![("/svc-a".to_string(), upstream(30))]);
+        same.inherit_breakers(&old);
+        assert!(same.lookup("/svc-a").is_none(), "breaker stays open");
+
+        let mut moved = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            Upstream::new("http://localhost:9999".parse().unwrap(), 30),
+        )]);
+        moved.inherit_breakers(&old);
+        assert!(
+            moved.lookup("/svc-a").is_some(),
+            "new upstream starts closed"
+        );
+    }
+
+    #[test]
     fn closed_is_routable() {
         let up = upstream(30);
         assert!(up.is_routable());
@@ -285,14 +327,38 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_callers_admit_exactly_one_probe() {
+        for _ in 0..200 {
+            let up = upstream(30);
+            up.mark_failed();
+            force_cooldown_elapsed(&up);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let admitted: usize = (0..8)
+                .map(|_| {
+                    let (up, barrier) = (up.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        up.is_routable() as usize
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .sum();
+            assert_eq!(admitted, 1);
+        }
+    }
+
+    #[test]
     fn stale_half_open_reprobes() {
         let up = upstream(30);
         up.mark_failed();
         force_cooldown_elapsed(&up);
         assert!(up.is_routable()); // wins the probe, now HalfOpen
         assert!(!up.is_routable()); // second caller blocked while probe pending
-                                    // Probe never reports back. Back-date the HalfOpen transition past
-                                    // the cooldown to simulate it going stale.
+
+        // Probe never reports back. Back-date the HalfOpen transition past
+        // the cooldown to simulate it going stale.
         force_cooldown_elapsed(&up);
         assert!(up.is_routable()); // re-armed as a fresh probe, not wedged
     }

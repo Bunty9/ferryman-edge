@@ -46,6 +46,12 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(25);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Each stream may buffer up to `proxy::MAX_BODY_BYTES` in collected mode,
+/// so this bounds per-connection body memory (64 × 8 MiB).
+// ponytail: per-connection bound only; add a global in-flight-bytes
+// semaphore if many clients trickling large bodies becomes a real threat.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 64;
 
 /// Accept loop. Runs until `shutdown` resolves, then stops accepting new
 /// connections, lets in-flight ones finish (bounded by `SHUTDOWN_DRAIN`),
@@ -60,6 +66,10 @@ pub async fn serve(
     http.http1()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
+    http.http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
 
     tokio::pin!(shutdown);
     loop {
@@ -120,6 +130,14 @@ async fn handle_conn(
         };
     metrics::histogram!("ferryman_tls_handshake_seconds").record(started.elapsed().as_secs_f64());
 
+    // ALPN already decided the protocol. Pinning it skips the auto
+    // builder's version sniff, which has no timeout of its own and would
+    // let a silent client hold the connection open forever.
+    let http = if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+        http.http2_only()
+    } else {
+        http.http1_only()
+    };
     let io = TokioIo::new(tls_stream);
     let svc = service_fn(move |req| {
         let state = state.clone();
@@ -157,6 +175,10 @@ async fn route_request(
         }
     }
 
+    // Strip hop-by-hop headers *before* stamping: a client could otherwise
+    // send `Connection: x-ferryman-tenant` and have the strip delete the
+    // stamped value.
+    proxy::strip_hop_by_hop(req.headers_mut());
     // Stamp the tenant for the upstream; discard whatever the client sent
     // to close the obvious spoofing hole.
     req.headers_mut().remove("x-ferryman-tenant");

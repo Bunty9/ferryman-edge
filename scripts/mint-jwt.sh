@@ -6,6 +6,7 @@
 #
 # Outputs the complete JWT token to stdout.
 # Env override: JWT_PRIV_KEY (path to private key; default: certs/jwt-priv.pem)
+# Optional claims: JWT_ISS, JWT_AUD (match [jwt] issuer / audience in config.toml)
 
 set -euo pipefail
 
@@ -41,7 +42,10 @@ HEADER='{"alg":"RS256","typ":"JWT"}'
 HEADER_B64=$(echo -n "$HEADER" | base64url_encode)
 
 # Build payload
-PAYLOAD="{\"sub\":\"${SUB}\",\"exp\":${EXP},\"scope\":\"${SCOPE}\"}"
+EXTRA=""
+[ -n "${JWT_ISS:-}" ] && EXTRA="${EXTRA},\"iss\":\"${JWT_ISS}\""
+[ -n "${JWT_AUD:-}" ] && EXTRA="${EXTRA},\"aud\":\"${JWT_AUD}\""
+PAYLOAD="{\"sub\":\"${SUB}\",\"exp\":${EXP},\"scope\":\"${SCOPE}\"${EXTRA}}"
 PAYLOAD_B64=$(echo -n "$PAYLOAD" | base64url_encode)
 
 # Build message to sign

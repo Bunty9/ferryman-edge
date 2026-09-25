@@ -58,7 +58,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 /// Strip the standard hop-by-hop headers plus anything named in the
 /// `Connection` header (RFC 9110 §7.6.1) — applied to both the outbound
 /// request and the inbound-from-upstream response.
-fn strip_hop_by_hop(headers: &mut HeaderMap) {
+pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     let mut extra: Vec<String> = Vec::new();
     for v in headers.get_all(http::header::CONNECTION) {
         if let Ok(s) = v.to_str() {
@@ -77,15 +77,16 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-/// Append the client IP to `x-forwarded-for` (creating it if absent).
-fn append_xff(headers: &mut HeaderMap, ip: IpAddr) {
-    let value = match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        Some(existing) => format!("{existing}, {ip}"),
-        None => ip.to_string(),
-    };
-    if let Ok(hv) = HeaderValue::from_str(&value) {
-        headers.insert("x-forwarded-for", hv);
-    }
+/// This is the edge: whatever forwarding headers the client sent are
+/// untrusted, so replace them with the peer address instead of appending.
+fn set_forwarded(headers: &mut HeaderMap, ip: IpAddr) {
+    headers.remove("forwarded");
+    headers.remove("x-real-ip");
+    headers.insert(
+        "x-forwarded-for",
+        HeaderValue::from_str(&ip.to_string()).expect("an IP is a valid header value"),
+    );
+    headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
 }
 
 #[cfg(not(feature = "boxed_body"))]
@@ -100,7 +101,44 @@ pub(crate) fn text_body(bytes: Bytes) -> Body {
         .boxed()
 }
 
-/// Handle a single inbound request.
+fn plain(status: u16, msg: &'static [u8]) -> anyhow::Result<Response<Body>> {
+    metrics::counter!("ferryman_requests_total", "status" => status.to_string()).increment(1);
+    Ok(Response::builder()
+        .status(status)
+        .body(text_body(Bytes::from_static(msg)))?)
+}
+
+/// `.` / `..` segments (also percent-encoded) would let `/svc-a/../svc-b`
+/// match the `/svc-a` route and then be normalised by the upstream into a
+/// different service's path. Reject rather than normalise.
+fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        let seg = seg.to_ascii_lowercase().replace("%2e", ".");
+        seg == "." || seg == ".."
+    })
+}
+
+/// True when a client-request failure was caused by *our* side of the
+/// exchange — the inbound body hit the size cap or the client went away
+/// mid-upload (hyper reports both as a user body error) — rather than by
+/// the upstream. Those must not trip the upstream's breaker, or any
+/// authenticated client could open it for every tenant.
+fn is_client_body_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain(e).any(|c| {
+        c.is::<LengthLimitError>()
+            || c.downcast_ref::<hyper::Error>()
+                .is_some_and(|h| h.is_user())
+    })
+}
+
+fn error_chain<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(e), |c| c.source())
+}
+
+/// Handle a single inbound request. Hop-by-hop headers are already stripped
+/// by the caller (before it stamps `x-ferryman-tenant`).
 pub async fn handle(
     table: SharedTable,
     client: Client<HttpConnector, Body>,
@@ -111,40 +149,28 @@ pub async fn handle(
     let snapshot = table.load();
     let path = req.uri().path().to_string();
 
+    if has_dot_segment(&path) {
+        return plain(400, b"bad path");
+    }
+
     let upstream = match snapshot.lookup(&path) {
         Some(u) => u.clone(),
-        None => {
-            // A prefix matched but its upstream's breaker is open: 503.
-            // Nothing matched at all: 404.
-            let status: u16 = if snapshot.has_prefix(&path) { 503 } else { 404 };
-            metrics::counter!("ferryman_requests_total", "status" => status.to_string())
-                .increment(1);
-            let msg: &'static [u8] = if status == 503 {
-                b"upstream unavailable"
-            } else {
-                b"no route"
-            };
-            return Ok(Response::builder()
-                .status(status)
-                .body(text_body(Bytes::from_static(msg)))?);
-        }
+        // A prefix matched but its upstream's breaker is open: 503.
+        None if snapshot.has_prefix(&path) => return plain(503, b"upstream unavailable"),
+        None => return plain(404, b"no route"),
     };
 
     // Fast rejection for a declared oversized body — skips dialing the
     // upstream entirely. `forward_body` below is the backstop for chunked
     // uploads that lie about (or omit) Content-Length.
-    if let Some(len) = req
+    if req
         .headers()
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
     {
-        if len > MAX_BODY_BYTES as u64 {
-            metrics::counter!("ferryman_requests_total", "status" => "413").increment(1);
-            return Ok(Response::builder()
-                .status(413)
-                .body(text_body(Bytes::from_static(b"payload too large")))?);
-        }
+        return plain(413, b"payload too large");
     }
 
     // Rebuild URI: upstream scheme+authority + original path+query. Inbound
@@ -164,21 +190,19 @@ pub async fn handle(
             HeaderValue::from_str(authority.as_str())?,
         );
     }
-    strip_hop_by_hop(&mut parts.headers);
-    append_xff(&mut parts.headers, peer_ip);
-    parts
-        .headers
-        .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    set_forwarded(&mut parts.headers, peer_ip);
 
-    let fwd_body = match forward_body(body).await {
-        Ok(b) => b,
-        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            metrics::counter!("ferryman_requests_total", "status" => "413").increment(1);
-            return Ok(Response::builder()
-                .status(413)
-                .body(text_body(Bytes::from_static(b"payload too large")))?);
+    // One deadline for the whole exchange: reading the client body,
+    // the upstream round trip, and (collected mode) the response body.
+    let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
+    let fwd_body = match tokio::time::timeout_at(deadline, forward_body(body)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+            return plain(413, b"payload too large");
         }
-        Err(e) => return Err(e),
+        Ok(Err(e)) => return Err(e),
+        // The client is the slow party here; not the upstream's fault.
+        Err(_) => return plain(408, b"request body timeout"),
     };
     let fwd = Request::from_parts(parts, fwd_body);
 
@@ -187,78 +211,79 @@ pub async fn handle(
         .uri
         .authority()
         .map_or_else(String::new, |a| a.to_string());
-    let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
-    match tokio::time::timeout_at(deadline, client.request(fwd)).await {
-        Err(_) => {
-            upstream.mark_failed();
-            metrics::counter!(
-                "ferryman_requests_total",
-                "status" => "504",
-                "upstream" => host
-            )
-            .increment(1);
-            Ok(Response::builder()
-                .status(504)
-                .body(text_body(Bytes::from_static(b"upstream timeout")))?)
+    let resp = match tokio::time::timeout_at(deadline, client.request(fwd)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) if is_client_body_error(&e) => {
+            let too_large = error_chain(&e).any(|c| c.is::<LengthLimitError>());
+            return if too_large {
+                plain(413, b"payload too large")
+            } else {
+                plain(400, b"request body error")
+            };
         }
         Ok(Err(e)) => {
+            tracing::warn!(upstream = %host, error = %e, "upstream request failed");
             upstream.mark_failed();
-            metrics::counter!(
-                "ferryman_requests_total",
-                "status" => "502",
-                "upstream" => host
-            )
-            .increment(1);
-            let msg = format!("upstream: {e}");
-            Ok(Response::builder()
+            metrics::counter!("ferryman_requests_total", "status" => "502", "upstream" => host)
+                .increment(1);
+            return Ok(Response::builder()
                 .status(502)
-                .body(text_body(Bytes::from(msg)))?)
+                .body(text_body(Bytes::from_static(b"bad gateway")))?);
         }
-        Ok(Ok(resp)) => {
-            let status = resp.status();
-            // Only gateway-class 5xx mean "this upstream is unhealthy"; a 500
-            // is an application bug on one request and must not blackhole
-            // the whole route for a cooldown.
-            if matches!(status.as_u16(), 502..=504) {
+        Err(_) => {
+            // Streaming mode shares this deadline with a possibly slow client
+            // upload, so only the collected mode can blame the upstream.
+            if cfg!(not(feature = "boxed_body")) {
                 upstream.mark_failed();
-            } else {
-                upstream.mark_success();
             }
-            metrics::histogram!(
-                "ferryman_request_duration_seconds",
-                "upstream" => host.clone()
-            )
-            .record(started.elapsed().as_secs_f64());
-            metrics::counter!(
-                "ferryman_requests_total",
-                "status" => status.as_u16().to_string(),
-                "upstream" => host
-            )
-            .increment(1);
-
-            let (mut resp_parts, resp_body) = resp.into_parts();
-            strip_hop_by_hop(&mut resp_parts.headers);
-            // Don't echo the upstream's HTTP version (e.g. an HTTP/1.0
-            // upstream) back to the client; hyper picks the wire version.
-            resp_parts.version = http::Version::default();
-
-            #[cfg(not(feature = "boxed_body"))]
-            let out_body: Body = match tokio::time::timeout_at(deadline, resp_body.collect()).await
-            {
-                Ok(collected) => Full::new(collected?.to_bytes()),
-                Err(_) => {
-                    upstream.mark_failed();
-                    return Ok(Response::builder()
-                        .status(504)
-                        .body(text_body(Bytes::from_static(b"upstream timeout")))?);
-                }
-            };
-            #[cfg(feature = "boxed_body")]
-            let out_body: Body = resp_body.map_err(Into::into).boxed();
-
-            Ok(Response::from_parts(resp_parts, out_body))
+            metrics::counter!("ferryman_requests_total", "status" => "504", "upstream" => host)
+                .increment(1);
+            return Ok(Response::builder()
+                .status(504)
+                .body(text_body(Bytes::from_static(b"upstream timeout")))?);
         }
+    };
+
+    let status = resp.status();
+    let (mut resp_parts, resp_body) = resp.into_parts();
+    strip_hop_by_hop(&mut resp_parts.headers);
+    // Don't echo the upstream's HTTP version (e.g. an HTTP/1.0 upstream)
+    // back to the client; hyper picks the wire version.
+    resp_parts.version = http::Version::default();
+
+    #[cfg(not(feature = "boxed_body"))]
+    let out_body: Body = match tokio::time::timeout_at(deadline, resp_body.collect()).await {
+        Ok(Ok(collected)) => Full::new(collected.to_bytes()),
+        Ok(Err(_)) | Err(_) => {
+            upstream.mark_failed();
+            metrics::counter!("ferryman_requests_total", "status" => "502", "upstream" => host)
+                .increment(1);
+            return Ok(Response::builder()
+                .status(502)
+                .body(text_body(Bytes::from_static(b"bad gateway")))?);
+        }
+    };
+    #[cfg(feature = "boxed_body")]
+    let out_body: Body = resp_body.map_err(Into::into).boxed();
+
+    // Only gateway-class 5xx mean "this upstream is unhealthy"; a 500 is an
+    // application bug on one request and must not blackhole the whole route
+    // for a cooldown.
+    if matches!(status.as_u16(), 502..=504) {
+        upstream.mark_failed();
+    } else {
+        upstream.mark_success();
     }
+    metrics::histogram!("ferryman_request_duration_seconds", "upstream" => host.clone())
+        .record(started.elapsed().as_secs_f64());
+    metrics::counter!(
+        "ferryman_requests_total",
+        "status" => status.as_u16().to_string(),
+        "upstream" => host
+    )
+    .increment(1);
+
+    Ok(Response::from_parts(resp_parts, out_body))
 }
 
 // ----- Body forwarding strategies ------------------------------------------
@@ -288,4 +313,25 @@ async fn forward_body(body: Incoming) -> anyhow::Result<Body> {
 #[cfg(feature = "boxed_body")]
 async fn forward_body(body: Incoming) -> anyhow::Result<Body> {
     Ok(Limited::new(body, MAX_BODY_BYTES).boxed())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_dot_segment;
+
+    #[test]
+    fn dot_segments_are_detected() {
+        for bad in [
+            "/svc-a/../svc-b",
+            "/svc-a/./x",
+            "/svc-a/%2e%2e/svc-b",
+            "/svc-a/%2E/x",
+            "/..",
+        ] {
+            assert!(has_dot_segment(bad), "{bad}");
+        }
+        for ok in ["/svc-a/x", "/svc-a/.hidden", "/svc-a/a..b", "/"] {
+            assert!(!has_dot_segment(ok), "{ok}");
+        }
+    }
 }

@@ -84,7 +84,14 @@ async fn main() -> anyhow::Result<()> {
     // capacity == 10k. Stable across reloads — re-init if the issuer key
     // rotates (not wired to SIGUSR1; that reloads TLS + routes only).
     let jwks_pem = std::fs::read(&cfg.jwt.jwks_path)?;
-    let jwt: Arc<JwtVerifier> = Arc::new(JwtVerifier::new(&jwks_pem)?);
+    let mut verifier = JwtVerifier::new(&jwks_pem)?;
+    if let Some(iss) = &cfg.jwt.issuer {
+        verifier = verifier.with_issuer(iss);
+    }
+    if let Some(aud) = &cfg.jwt.audience {
+        verifier = verifier.with_audience(aud);
+    }
+    let jwt: Arc<JwtVerifier> = Arc::new(verifier);
 
     // Per-tenant rate limiter, keyed by `Claims::sub`. `None` when
     // `tenant_rps == 0` — rate limiting is disabled outright rather than

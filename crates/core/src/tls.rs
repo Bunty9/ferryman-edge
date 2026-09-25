@@ -2,7 +2,7 @@
 //!
 //! Uses `rustls` 0.23 with the `aws-lc-rs` cryptographic provider — FIPS
 //! path is via the same `aws-lc-fips-sys` crate (interview talking point).
-//! The cert chain is loaded via `rustls-pemfile` 2 from disk; we deliberately
+//! The cert chain is loaded via `rustls-pki-types`' PEM parser from disk; we deliberately
 //! avoid `webpki-roots` for the *client* CA store because we want only the
 //! tenant's CA chain to validate inbound peers.
 //!
@@ -14,9 +14,9 @@
 //! with predictable semantics across every deploy target.
 
 use arc_swap::ArcSwap;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ServerConfig, WebPkiClientVerifier};
-use std::io::BufReader;
 use std::sync::Arc;
 
 /// Build a fully-configured mTLS [`ServerConfig`]. Loads:
@@ -34,14 +34,12 @@ pub fn build_mtls_config(
     client_ca_path: &str,
 ) -> anyhow::Result<Arc<ServerConfig>> {
     let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(cert_path)?))
-            .collect::<Result<_, _>>()?;
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut BufReader::new(std::fs::File::open(key_path)?))?
-            .ok_or_else(|| anyhow::anyhow!("no private key in {}", key_path))?;
+        CertificateDer::pem_file_iter(cert_path)?.collect::<Result<_, _>>()?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| anyhow::anyhow!("no usable private key in {key_path}: {e}"))?;
 
     let mut roots = rustls::RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(client_ca_path)?)) {
+    for c in CertificateDer::pem_file_iter(client_ca_path)? {
         roots.add(c?)?;
     }
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;

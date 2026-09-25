@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-rust-version = "1.78"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -26,7 +26,6 @@ tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"]
 # TLS termination + mTLS (P4 core)
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 rustls-pki-types = "1"
 webpki = "0.22"
 

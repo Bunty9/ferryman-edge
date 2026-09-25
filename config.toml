@@ -18,6 +18,11 @@ client_ca_path = "certs/ca-bundle.crt"
 
 [jwt]
 jwks_path = "certs/jwt-pub.pem"
+# Strongly recommended outside local dev: without these, any token signed by
+# the issuer key is accepted, whichever service it was minted for. Mint
+# matching test tokens with JWT_ISS=... JWT_AUD=... scripts/mint-jwt.sh.
+# issuer   = "https://issuer.example"
+# audience = "ferryman-edge"
 
 [[routes]]
 prefix = "/svc-a"

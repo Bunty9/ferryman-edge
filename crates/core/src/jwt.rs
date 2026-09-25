@@ -45,7 +45,13 @@ impl JwtVerifier {
     pub fn new(jwks_pem: &[u8]) -> anyhow::Result<Self> {
         Ok(Self {
             key: DecodingKey::from_rsa_pem(jwks_pem)?,
-            validation: Validation::new(Algorithm::RS256),
+            validation: {
+                let mut v = Validation::new(Algorithm::RS256);
+                // Checked once at decode; a token is only cached after it
+                // passes, and a past `nbf` stays past, so hits need no recheck.
+                v.validate_nbf = true;
+                v
+            },
             cache: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(300))
@@ -57,6 +63,23 @@ impl JwtVerifier {
     /// cache-hit re-check. Defaults to `jsonwebtoken`'s standard 60s.
     pub fn with_leeway(mut self, secs: u64) -> Self {
         self.validation.leeway = secs;
+        self
+    }
+
+    /// Require `iss` to equal `issuer`. Without it, any token signed by the
+    /// issuer key is accepted, whoever it was minted for.
+    pub fn with_issuer(mut self, issuer: &str) -> Self {
+        self.validation.set_issuer(&[issuer]);
+        // `set_issuer` alone only checks `iss` when present; a token that
+        // omits it would pass.
+        self.validation.required_spec_claims.insert("iss".into());
+        self
+    }
+
+    /// Require `aud` to contain `audience`.
+    pub fn with_audience(mut self, audience: &str) -> Self {
+        self.validation.set_audience(&[audience]);
+        self.validation.required_spec_claims.insert("aud".into());
         self
     }
 
@@ -108,6 +131,51 @@ mod tests {
         let claims = verifier.verify(&token).await.expect("should verify");
         assert_eq!(claims.sub, "tenant-a");
         assert_eq!(claims.scope, "read");
+    }
+
+    fn sign_json(value: serde_json::Value) -> String {
+        encode(
+            &Header::new(Algorithm::RS256),
+            &value,
+            &EncodingKey::from_rsa_pem(PRIV_PEM).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn issuer_and_audience_enforced_when_configured() {
+        let exp = now_secs() + 3600;
+        let verifier = JwtVerifier::new(PUB_PEM)
+            .unwrap()
+            .with_issuer("https://issuer.test")
+            .with_audience("ferryman-edge");
+        let good = sign_json(serde_json::json!({
+            "sub": "t", "exp": exp, "iss": "https://issuer.test", "aud": "ferryman-edge"
+        }));
+        assert!(verifier.verify(&good).await.is_some());
+        for bad in [
+            serde_json::json!({"sub": "t", "exp": exp, "iss": "https://evil.test", "aud": "ferryman-edge"}),
+            serde_json::json!({"sub": "t", "exp": exp, "iss": "https://issuer.test", "aud": "other-svc"}),
+            serde_json::json!({"sub": "t", "exp": exp}),
+        ] {
+            assert!(verifier.verify(&sign_json(bad)).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn token_with_aud_rejected_when_no_audience_configured() {
+        let verifier = JwtVerifier::new(PUB_PEM).unwrap();
+        let token =
+            sign_json(serde_json::json!({"sub": "t", "exp": now_secs() + 3600, "aud": "x"}));
+        assert!(verifier.verify(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn not_yet_valid_token_rejected() {
+        let verifier = JwtVerifier::new(PUB_PEM).unwrap().with_leeway(0);
+        let now = now_secs();
+        let token = sign_json(serde_json::json!({"sub": "t", "exp": now + 3600, "nbf": now + 600}));
+        assert!(verifier.verify(&token).await.is_none());
     }
 
     #[tokio::test]

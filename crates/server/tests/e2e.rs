@@ -19,6 +19,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::convert::Infallible;
@@ -181,8 +182,15 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let xff = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let body = req.into_body().collect().await.unwrap().to_bytes();
     Ok(Response::builder()
+        .header("x-echo-xff", xff)
         .status(200)
         .header("x-upstream", "yes")
         .header("x-echo-method", method)
@@ -387,13 +395,11 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 
 async fn fetch_peer_leaf_der(proxy_addr: SocketAddr, certs: &TestCerts) -> Vec<u8> {
     let client_certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut &certs.client_cert_pem[..])
+        CertificateDer::pem_slice_iter(&certs.client_cert_pem)
             .collect::<Result<_, _>>()
             .unwrap();
     let client_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut &certs.client_key_pem[..])
-            .unwrap()
-            .unwrap();
+        PrivateKeyDer::from_pem_slice(&certs.client_key_pem).unwrap();
 
     let mut cfg = rustls::ClientConfig::builder()
         .dangerous()
@@ -435,6 +441,27 @@ async fn valid_request_succeeds_and_tenant_header_is_enforced() {
         h.upstream_addr.to_string()
     );
     assert_eq!(resp.text().await.unwrap(), "hello body");
+}
+
+#[tokio::test]
+async fn client_cannot_strip_tenant_or_spoof_forwarding_headers() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+
+    // HTTP/1.1 only: h2 forbids the Connection header outright.
+    let resp = h
+        .client_http1_only()
+        .get(h.url("/svc-a/hello"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("connection", "keep-alive, x-ferryman-tenant")
+        .header("x-forwarded-for", "6.6.6.6")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("x-echo-tenant").unwrap(), "tenant-a");
+    assert_eq!(resp.headers().get("x-echo-xff").unwrap(), "127.0.0.1");
 }
 
 // ----- (b) HTTP/2 regression ------------------------------------------------

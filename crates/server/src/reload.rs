@@ -38,22 +38,23 @@ pub fn spawn_reload(path: PathBuf, table: SharedTable) {
             };
         while sig.recv().await.is_some() {
             match reload_once(&path) {
-                Some(new_table) => {
+                Ok(mut new_table) => {
+                    new_table.inherit_breakers(&table.load());
                     table.store(Arc::new(new_table));
                     tracing::info!(path = %path.display(), "routing table reloaded");
                 }
-                None => {
-                    tracing::error!(path = %path.display(), "route reload failed; keeping old table");
+                Err(e) => {
+                    tracing::error!(path = %path.display(), ?e, "route reload failed; keeping old table");
                 }
             }
         }
     });
 }
 
-fn reload_once(path: &Path) -> Option<RouteTable> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let cfg: ConfigToml = toml::from_str(&raw).ok()?;
-    build_table(&cfg).ok()
+fn reload_once(path: &Path) -> anyhow::Result<RouteTable> {
+    let raw = std::fs::read_to_string(path)?;
+    let cfg: ConfigToml = toml::from_str(&raw)?;
+    build_table(&cfg)
 }
 
 /// Helper for tests / integration code that build their own `SharedTable`
