@@ -80,15 +80,15 @@ impl ReloadingTls {
     fn watch(s: Arc<Self>) {
         let paths = s.paths.clone();
         tokio::spawn(async move {
-            let mut sig = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::user_defined1(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(?e, "failed to register SIGUSR1 handler");
-                    return;
-                }
-            };
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(?e, "failed to register SIGUSR1 handler");
+                        return;
+                    }
+                };
             // SIGUSR1 triggers reload — simpler and more reliable than notify on k8s ConfigMap mounts.
             while sig.recv().await.is_some() {
                 match build_mtls_config(&paths.0, &paths.1, &paths.2) {

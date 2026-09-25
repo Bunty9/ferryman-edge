@@ -19,7 +19,6 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use std::sync::atomic::Ordering;
 
 pub type Body = Full<Bytes>;
 
@@ -62,7 +61,7 @@ pub async fn handle(
     let host = upstream.uri.host().unwrap_or("").to_string();
     match client.request(fwd).await {
         Ok(resp) => {
-            upstream.alive.store(true, Ordering::Relaxed); // recovery
+            upstream.mark_success(); // recovery
             let status = resp.status().as_u16();
             let body = resp.into_body().collect().await?.to_bytes();
             metrics::histogram!(

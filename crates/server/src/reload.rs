@@ -28,15 +28,14 @@ use std::sync::Arc;
 /// process exit.
 pub fn spawn_reload(path: PathBuf, table: SharedTable) {
     tokio::spawn(async move {
-        let mut sig = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::user_defined1(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(?e, "failed to register SIGUSR1 for route reload");
-                return;
-            }
-        };
+        let mut sig =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(?e, "failed to register SIGUSR1 for route reload");
+                    return;
+                }
+            };
         while sig.recv().await.is_some() {
             match reload_once(&path) {
                 Some(new_table) => {

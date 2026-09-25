@@ -1,12 +1,20 @@
 //! Active health checker. Probes every upstream's `/health` on a fixed
-//! interval; flips `Upstream::alive` and emits the
-//! `ferryman_upstream_alive` gauge.
+//! interval; flips the circuit breaker (`Upstream::mark_success` /
+//! `mark_failed`) and emits the `ferryman_upstream_alive` gauge.
 //!
 //! Copied verbatim from `ferryman/crates/core/src/health.rs` (P2).
 
 use crate::route::SharedTable;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// Builds the `/health` probe URL for an upstream. `http::Uri`'s `Display`
+/// renders an empty path as `/` (e.g. `http://localhost:8001` becomes
+/// `http://localhost:8001/`), so a naive `format!("{uri}/health")` produces
+/// a double slash. Trim any trailing `/` from the base first.
+fn health_url(uri: &http::Uri) -> String {
+    let base = uri.to_string();
+    format!("{}/health", base.trim_end_matches('/'))
+}
 
 /// Runs forever. Cancel by aborting the spawned task.
 pub async fn health_loop(table: SharedTable, interval: Duration) {
@@ -26,11 +34,11 @@ pub async fn health_loop(table: SharedTable, interval: Duration) {
         ticker.tick().await;
         let current = table.load_full();
         for (_, up) in &current.rules {
-            let url = format!("{}/health", up.uri);
+            let url = health_url(&up.uri);
             let host = up.uri.host().unwrap_or("").to_string();
             match client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => {
-                    up.alive.store(true, Ordering::Relaxed);
+                    up.mark_success();
                     metrics::gauge!("ferryman_upstream_alive", "upstream" => host).set(1.0);
                 }
                 _ => {
@@ -39,5 +47,22 @@ pub async fn health_loop(table: SharedTable, interval: Duration) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_double_slash_for_bare_authority() {
+        let uri: http::Uri = "http://localhost:8001".parse().unwrap();
+        assert_eq!(health_url(&uri), "http://localhost:8001/health");
+    }
+
+    #[test]
+    fn preserves_non_root_path() {
+        let uri: http::Uri = "http://localhost:8001/base".parse().unwrap();
+        assert_eq!(health_url(&uri), "http://localhost:8001/base/health");
     }
 }

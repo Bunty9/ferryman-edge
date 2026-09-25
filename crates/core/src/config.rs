@@ -73,15 +73,58 @@ pub struct RouteToml {
 }
 
 /// Build a [`RouteTable`] from a parsed [`ConfigToml`]. Returns an error if
-/// any upstream URI fails to parse — the caller should keep the old table
-/// in that case.
+/// any upstream URI fails to parse or has no authority (e.g. a relative
+/// path with no scheme/host — nothing the proxy could dial) — the caller
+/// should keep the old table in that case.
 pub fn build_table(cfg: &ConfigToml) -> anyhow::Result<RouteTable> {
     let default_cooldown = cfg.default_cooldown_secs;
     let mut rules = Vec::with_capacity(cfg.routes.len());
     for r in &cfg.routes {
         let uri: http::Uri = r.upstream.parse()?;
+        if uri.authority().is_none() {
+            anyhow::bail!(
+                "route {:?}: upstream {:?} has no authority (scheme://host)",
+                r.prefix,
+                r.upstream
+            );
+        }
         let cooldown = r.cooldown_secs.unwrap_or(default_cooldown);
         rules.push((r.prefix.clone(), Upstream::new(uri, cooldown)));
     }
     Ok(RouteTable::new(rules))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_config_toml_parses_and_builds() {
+        let raw = include_str!("../../../config.toml");
+        let cfg: ConfigToml = toml::from_str(raw).expect("config.toml should parse");
+        build_table(&cfg).expect("build_table should succeed for config.toml");
+    }
+
+    #[test]
+    fn build_table_rejects_upstream_without_authority() {
+        let cfg = ConfigToml {
+            health_interval_secs: 5,
+            default_cooldown_secs: 30,
+            tenant_rps: 1000,
+            tls: TlsToml {
+                cert_path: "certs/server.crt".into(),
+                key_path: "certs/server.key".into(),
+                client_ca_path: "certs/ca-bundle.crt".into(),
+            },
+            jwt: JwtToml {
+                jwks_path: "certs/jwt-pub.pem".into(),
+            },
+            routes: vec![RouteToml {
+                prefix: "/svc-a".into(),
+                upstream: "/no-authority-here".into(),
+                cooldown_secs: None,
+            }],
+        };
+        assert!(build_table(&cfg).is_err());
+    }
 }

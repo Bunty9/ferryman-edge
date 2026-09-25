@@ -93,8 +93,10 @@ async fn main() -> anyhow::Result<()> {
     let jwks_pem = std::fs::read(&cfg.jwt.jwks_path)?;
     let jwt: Arc<JwtVerifier> = Arc::new(JwtVerifier::new(&jwks_pem)?);
 
-    // Per-tenant rate limiter, keyed by `Claims::sub`.
-    let limiter: Arc<Limiter> = build_limiter(cfg.tenant_rps);
+    // Per-tenant rate limiter, keyed by `Claims::sub`. `None` when
+    // `tenant_rps == 0` — rate limiting is disabled outright rather than
+    // silently clamped to 1 rps.
+    let limiter: Option<Arc<Limiter>> = build_limiter(cfg.tenant_rps);
 
     // Prometheus exporter binds its own listener so the proxy is unaffected
     // by /metrics scrape traffic.
@@ -141,7 +143,7 @@ async fn tls_serve(
     _tls: Arc<ReloadingTls>,
     _shared: SharedTable,
     _jwt: Arc<JwtVerifier>,
-    _limiter: Arc<Limiter>,
+    _limiter: Option<Arc<Limiter>>,
     _client: Client<HttpConnector, Full<Bytes>>,
 ) -> anyhow::Result<()> {
     // Phase 2: tokio_rustls::TlsAcceptor::from(_tls.current()).accept(_stream)
