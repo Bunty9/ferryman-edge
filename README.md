@@ -101,7 +101,8 @@ Every request passes the same gates, in order:
 | No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
 | Body ≤ 8 MiB | `413` | |
-| 30 s deadline over client body read, upstream round trip, and (collected mode) response body | `408` slow client, `502` transport error, `504` timeout | `ferryman_request_duration_seconds{upstream}` |
+| Client body read within 30 s (collected mode; read before route lookup) | `408` slow client, `400` body error | |
+| Upstream round trip within 30 s, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
 
 On the way through, the proxy strips hop-by-hop headers (both directions,
 including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
@@ -109,12 +110,14 @@ including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
 upstream, replaces `x-forwarded-for` with the peer IP (dropping client-sent
 `Forwarded` / `X-Real-IP`), sets `x-forwarded-proto: https`, and downgrades
 the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
-(`h2` or `http/1.1`); h2 connections get keep-alive pings and a 64-stream
-cap.
+(`h2` or `http/1.1`). A connection with no request within 10 s of the
+handshake is closed (this also covers a stalled h2 preface); h2 connections
+then get keep-alive pings and a 64-stream cap.
 
 Each upstream has a Closed / Open / HalfOpen circuit breaker
-(`ferryman_circuit_state{upstream}`: 0/1/2). A transport error, timeout, or
-502–504 opens it; after `cooldown_secs` exactly one request is let through
+(`ferryman_circuit_state{upstream}`: 0/1/2; `cooldown_secs` must be ≥ 1).
+A transport error, a 502–504, or a timeout opens it — under `boxed_body` a
+timeout only counts if the client had finished uploading; after `cooldown_secs` exactly one request is let through
 as the probe. A plain `500` does not trip it, and neither does a failure
 caused by the client's own body (size cap, disconnect). The active health
 checker (`GET <upstream>/health` every `health_interval_secs`) opens and
@@ -140,7 +143,9 @@ Cargo feature `boxed_body` swaps the upstream client to
 off, the proxy collects each body once into a `Full<Bytes>` before
 forwarding. Both builds enforce the 8 MiB request cap; under streaming, a
 chunked upload with no `Content-Length` that exceeds it is cut mid-stream
-and surfaces as a `502` rather than a clean `413`.
+and answered `413`, without counting against the upstream's breaker.
+Streaming mode has no separate body-read deadline: a slow upload runs
+inside the upstream's 30 s budget and ends as `504`.
 
 Estimates from the design spec (not yet measured here): `boxed` adds ~200 µs per request at 10 MB; `collected`
 adds ~80 µs at 1 KB but allocates ~`req_size`. For an internal proxy

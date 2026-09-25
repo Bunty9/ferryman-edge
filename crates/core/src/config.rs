@@ -96,6 +96,13 @@ pub fn build_table(cfg: &ConfigToml) -> anyhow::Result<RouteTable> {
             );
         }
         let cooldown = r.cooldown_secs.unwrap_or(default_cooldown);
+        // 0 would let every caller through as a "probe": the breaker would
+        // be silently disabled.
+        anyhow::ensure!(
+            cooldown > 0,
+            "route {}: cooldown_secs must be at least 1",
+            r.prefix
+        );
         rules.push((r.prefix.clone(), Upstream::new(uri, cooldown)));
     }
     Ok(RouteTable::new(rules))
@@ -134,6 +141,16 @@ mod tests {
                 cooldown_secs: None,
             }],
         };
+        assert!(build_table(&cfg).is_err());
+    }
+
+    #[test]
+    fn build_table_rejects_zero_cooldown() {
+        let raw = include_str!("../../../config.toml").replace(
+            "upstream = \"http://localhost:8001\"",
+            "upstream = \"http://localhost:8001\"\ncooldown_secs = 0",
+        );
+        let cfg: ConfigToml = toml::from_str(&raw).unwrap();
         assert!(build_table(&cfg).is_err());
     }
 }

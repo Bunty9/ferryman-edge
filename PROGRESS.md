@@ -72,9 +72,12 @@
       workers; wrk2 cannot do mTLS).
 - [x] e2e suite (`crates/server/tests/e2e.rs`) under both feature sets;
       CI mTLS smoke asserts status codes instead of `|| true`.
-- [x] Opus review pass: fall-through routing, breaker-trip by client
-      body errors, `Connection`-nominated tenant strip, XFF spoofing,
-      dot-segment routing, `iss`/`aud`/`nbf` — all fixed with tests.
+- [x] Two Opus review passes: fall-through routing, breaker trips caused
+      by client body errors or slow uploads, `Connection`-nominated tenant
+      strip, XFF spoofing, dot-segment routing, `iss`/`aud`/`nbf`, silent
+      post-handshake clients. Fixed; tests cover routing, the tenant
+      strip, XFF, oversized chunked upload vs breaker, dot segments, and
+      JWT claims. The 30 s timer paths (408, slow upload) are untested.
 - [x] `cargo deny check` clean (4 advisories cleared by `cargo update`,
       `rustls-pemfile` replaced by `rustls-pki-types` PEM API).
 

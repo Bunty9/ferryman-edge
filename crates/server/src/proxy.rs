@@ -25,6 +25,8 @@ use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "boxed_body")]
@@ -40,8 +42,14 @@ pub type Body = http_body_util::combinators::BoxBody<Bytes, BoxErr>;
 /// upstreams start accepting large uploads.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
-/// Wall-clock budget for the whole upstream round trip.
+/// Wall-clock budget for the upstream round trip, starting once the request
+/// body is ready to send.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Budget for receiving the client's body (collected mode). Separate from
+/// `UPSTREAM_TIMEOUT` so a slow client can't make a healthy upstream look
+/// timed out.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -153,16 +161,8 @@ pub async fn handle(
         return plain(400, b"bad path");
     }
 
-    let upstream = match snapshot.lookup(&path) {
-        Some(u) => u.clone(),
-        // A prefix matched but its upstream's breaker is open: 503.
-        None if snapshot.has_prefix(&path) => return plain(503, b"upstream unavailable"),
-        None => return plain(404, b"no route"),
-    };
-
-    // Fast rejection for a declared oversized body — skips dialing the
-    // upstream entirely. `forward_body` below is the backstop for chunked
-    // uploads that lie about (or omit) Content-Length.
+    // Fast rejection for a declared oversized body. `forward_body` below is
+    // the backstop for chunked uploads that lie about (or omit) it.
     if req
         .headers()
         .get(http::header::CONTENT_LENGTH)
@@ -173,10 +173,32 @@ pub async fn handle(
         return plain(413, b"payload too large");
     }
 
+    // Deal with the client's body *before* route lookup: lookup may admit
+    // this request as the breaker's half-open probe, and a probe that ends
+    // in a client-side 408/413/400 would never report back. The body read
+    // has its own deadline so a slow uploader can't eat into (and then be
+    // blamed as) the upstream's time budget.
+    let (mut parts, body) = req.into_parts();
+    let (fwd_body, upload_done) =
+        match tokio::time::timeout(BODY_READ_TIMEOUT, forward_body(body)).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                return plain(413, b"payload too large");
+            }
+            Ok(Err(_)) => return plain(400, b"request body error"),
+            Err(_) => return plain(408, b"request body timeout"),
+        };
+
+    let upstream = match snapshot.lookup(&path) {
+        Some(u) => u.clone(),
+        // A prefix matched but its upstream's breaker is open: 503.
+        None if snapshot.has_prefix(&path) => return plain(503, b"upstream unavailable"),
+        None => return plain(404, b"no route"),
+    };
+
     // Rebuild URI: upstream scheme+authority + original path+query. Inbound
     // HTTP/2 requests carry the proxy's own scheme/authority in `parts.uri`,
     // so this is always a full rebuild, never a patch.
-    let (mut parts, body) = req.into_parts();
     let mut up_parts = upstream.uri.clone().into_parts();
     up_parts.path_and_query = parts.uri.path_and_query().cloned();
     parts.uri = http::Uri::from_parts(up_parts)?;
@@ -192,18 +214,9 @@ pub async fn handle(
     }
     set_forwarded(&mut parts.headers, peer_ip);
 
-    // One deadline for the whole exchange: reading the client body,
-    // the upstream round trip, and (collected mode) the response body.
+    // The upstream's budget starts now: round trip plus (collected mode)
+    // the response body.
     let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
-    let fwd_body = match tokio::time::timeout_at(deadline, forward_body(body)).await {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            return plain(413, b"payload too large");
-        }
-        Ok(Err(e)) => return Err(e),
-        // The client is the slow party here; not the upstream's fault.
-        Err(_) => return plain(408, b"request body timeout"),
-    };
     let fwd = Request::from_parts(parts, fwd_body);
 
     // host:port, so two upstreams on one host stay distinct series.
@@ -231,9 +244,9 @@ pub async fn handle(
                 .body(text_body(Bytes::from_static(b"bad gateway")))?);
         }
         Err(_) => {
-            // Streaming mode shares this deadline with a possibly slow client
-            // upload, so only the collected mode can blame the upstream.
-            if cfg!(not(feature = "boxed_body")) {
+            // In streaming mode the upload runs inside this deadline; only
+            // blame the upstream if the client had finished sending.
+            if upload_done.load(Ordering::Acquire) {
                 upstream.mark_failed();
             }
             metrics::counter!("ferryman_requests_total", "status" => "504", "upstream" => host)
@@ -293,10 +306,18 @@ pub async fn handle(
 // JSON < 256 KB). Hiring-panel question to anticipate: "why is the default
 // off?" — see README "Design tradeoffs".
 
+/// Whether the client finished sending its body. Collected mode always has
+/// by the time the upstream is dialed; streaming mode flips it when the
+/// body reaches end-of-stream.
+type UploadDone = Arc<AtomicBool>;
+
 #[cfg(not(feature = "boxed_body"))]
-async fn forward_body(body: Incoming) -> anyhow::Result<Body> {
+async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
     match Limited::new(body, MAX_BODY_BYTES).collect().await {
-        Ok(collected) => Ok(Full::new(collected.to_bytes())),
+        Ok(collected) => Ok((
+            Full::new(collected.to_bytes()),
+            Arc::new(AtomicBool::new(true)),
+        )),
         Err(e) => match e.downcast::<LengthLimitError>() {
             Ok(too_large) => Err(anyhow::Error::new(*too_large)),
             Err(other) => Err(anyhow::anyhow!("{other}")),
@@ -304,15 +325,52 @@ async fn forward_body(body: Incoming) -> anyhow::Result<Body> {
     }
 }
 
-// ponytail: a chunked request with no Content-Length can still exceed
-// MAX_BODY_BYTES here; `Limited` cuts the stream but by then headers are
-// already forwarded upstream, so it surfaces as a 502 rather than a clean
-// 413. The Content-Length pre-check above covers the common declared-size
-// case. Upgrade path: peek the first frame before dialing upstream if
-// chunked oversized uploads become a real traffic pattern.
+// A chunked upload with no Content-Length that exceeds MAX_BODY_BYTES is cut
+// mid-stream by `Limited`; `is_client_body_error` maps that to 413 (or 400
+// for a client disconnect) and keeps it off the breaker.
 #[cfg(feature = "boxed_body")]
-async fn forward_body(body: Incoming) -> anyhow::Result<Body> {
-    Ok(Limited::new(body, MAX_BODY_BYTES).boxed())
+async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
+    let inner = Limited::new(body, MAX_BODY_BYTES);
+    // hyper never polls a body that already reports end-of-stream (e.g. a
+    // GET), so seed the flag rather than waiting for a poll.
+    let done: UploadDone = Arc::new(AtomicBool::new(hyper::body::Body::is_end_stream(&inner)));
+    let body = TrackEnd {
+        inner,
+        done: done.clone(),
+    };
+    Ok((body.boxed(), done))
+}
+
+/// Body wrapper that records when the inner body reaches end-of-stream.
+#[cfg(feature = "boxed_body")]
+struct TrackEnd<B> {
+    inner: B,
+    done: UploadDone,
+}
+
+#[cfg(feature = "boxed_body")]
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) || self.inner.is_end_stream() {
+            self.done.store(true, Ordering::Release);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]

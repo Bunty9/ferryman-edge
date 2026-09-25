@@ -393,7 +393,10 @@ impl ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
-async fn fetch_peer_leaf_der(proxy_addr: SocketAddr, certs: &TestCerts) -> Vec<u8> {
+async fn tls_connect(
+    proxy_addr: SocketAddr,
+    certs: &TestCerts,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let client_certs: Vec<CertificateDer<'static>> =
         CertificateDer::pem_slice_iter(&certs.client_cert_pem)
             .collect::<Result<_, _>>()
@@ -411,7 +414,11 @@ async fn fetch_peer_leaf_der(proxy_addr: SocketAddr, certs: &TestCerts) -> Vec<u
     let connector = TlsConnector::from(Arc::new(cfg));
     let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
     let server_name = ServerName::try_from("127.0.0.1").unwrap();
-    let tls_stream = connector.connect(server_name, stream).await.unwrap();
+    connector.connect(server_name, stream).await.unwrap()
+}
+
+async fn fetch_peer_leaf_der(proxy_addr: SocketAddr, certs: &TestCerts) -> Vec<u8> {
+    let tls_stream = tls_connect(proxy_addr, certs).await;
     let (_, conn) = tls_stream.get_ref();
     conn.peer_certificates().unwrap()[0].to_vec()
 }
@@ -621,6 +628,57 @@ async fn unknown_route_and_body_size_limit() {
 }
 
 // ----- (g) upstream down: breaker trips -------------------------------------
+
+/// An oversized chunked upload (no Content-Length, so no precheck) must be
+/// a client-side 413 and must NOT open the route's breaker — otherwise any
+/// tenant could take a route down for everyone.
+#[tokio::test]
+async fn oversized_chunked_upload_is_413_and_does_not_trip_breaker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let (mut rd, mut wr) = tokio::io::split(tls);
+
+    let head = format!(
+        "POST /svc-a/upload HTTP/1.1\r\nhost: localhost\r\n\
+         authorization: Bearer {token}\r\ntransfer-encoding: chunked\r\n\r\n"
+    );
+    // The proxy may answer and stop reading before we finish; ignore write
+    // errors from that point on.
+    let writer = tokio::spawn(async move {
+        wr.write_all(head.as_bytes()).await?;
+        let chunk = vec![b'x'; 64 * 1024];
+        let frame = format!("{:x}\r\n", chunk.len());
+        for _ in 0..(9 * 16) {
+            // 9 MiB total, over the 8 MiB cap
+            wr.write_all(frame.as_bytes()).await?;
+            wr.write_all(&chunk).await?;
+            wr.write_all(b"\r\n").await?;
+        }
+        wr.write_all(b"0\r\n\r\n").await?;
+        std::io::Result::Ok(())
+    });
+
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(20), rd.read(&mut buf))
+        .await
+        .expect("proxy answered")
+        .unwrap();
+    let status_line = String::from_utf8_lossy(&buf[..n]);
+    assert!(status_line.starts_with("HTTP/1.1 413"), "{status_line}");
+    writer.abort();
+
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/hello"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must still be closed");
+}
 
 #[tokio::test]
 async fn upstream_down_trips_the_breaker() {

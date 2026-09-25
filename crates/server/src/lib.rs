@@ -24,6 +24,7 @@ use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -139,13 +140,32 @@ async fn handle_conn(
         http.http1_only()
     };
     let io = TokioIo::new(tls_stream);
+    let seen_request = Arc::new(AtomicBool::new(false));
+    let seen = seen_request.clone();
     let svc = service_fn(move |req| {
+        seen.store(true, Ordering::Release);
         let state = state.clone();
         async move { Ok::<_, Infallible>(route_request(state, req, peer).await) }
     });
 
-    let conn = http.serve_connection(io, svc);
-    if let Err(e) = watcher.watch(conn.into_owned()).await {
+    let conn = watcher.watch(http.serve_connection(io, svc).into_owned());
+    // Neither hyper's h2 handshake (waiting for the client preface) nor its
+    // keep-alive pings, which only start after it, have a timer; a client
+    // that completes TLS and then goes silent would hold the connection
+    // forever. Drop it if no request arrives in time.
+    let first_request = tokio::time::sleep(HEADER_READ_TIMEOUT);
+    tokio::pin!(conn, first_request);
+    let result = tokio::select! {
+        r = &mut conn => r,
+        _ = &mut first_request => {
+            if !seen_request.load(Ordering::Acquire) {
+                tracing::debug!(?peer, "no request before timeout; closing");
+                return;
+            }
+            conn.await
+        }
+    };
+    if let Err(e) = result {
         tracing::debug!(?peer, ?e, "connection error");
     }
 }
