@@ -8,7 +8,6 @@
 > miniature scale.
 
 [![ci](https://img.shields.io/badge/ci-pending-lightgrey.svg)](./.github/workflows/ci.yml)
-[![crates.io](https://img.shields.io/badge/crates.io-pending-lightgrey.svg)](#)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem
@@ -79,15 +78,56 @@ Pinned versions live in [`Cargo.toml`](./Cargo.toml).
 # 2. Build + run against the example config (mTLS terminate on :8443).
 cargo run -p ferryman-edge-server -- --config config.toml
 
-# 3. Call with a valid client cert:
+# 3. Call with a valid client cert + an RS256 JWT signed by certs/jwt-priv.pem:
 curl -i --cacert certs/ca.crt \
         --cert   certs/client.crt \
         --key    certs/client.key \
+        -H "Authorization: Bearer $(scripts/mint-jwt.sh tenant-a 3600)" \
         https://localhost:8443/svc-a/hello
 
 # 4. Hot-reload cert + routing table atomically:
 kill -USR1 $(pidof ferryman-edge-server)
 ```
+
+## Request pipeline
+
+Every request passes the same gates, in order:
+
+| Gate | Reject with | Metric |
+| --- | --- | --- |
+| TLS handshake, client cert must chain to `client_ca_path` (10 s timeout) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
+| `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
+| Per-tenant GCRA limit keyed by `sub` (`tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
+| No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
+| Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
+| Body ≤ 8 MiB | `413` | |
+| 30 s deadline over client body read, upstream round trip, and (collected mode) response body | `408` slow client, `502` transport error, `504` timeout | `ferryman_request_duration_seconds{upstream}` |
+
+On the way through, the proxy strips hop-by-hop headers (both directions,
+including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
+(any client-supplied value is dropped first). It rewrites `Host` to the
+upstream, replaces `x-forwarded-for` with the peer IP (dropping client-sent
+`Forwarded` / `X-Real-IP`), sets `x-forwarded-proto: https`, and downgrades
+the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
+(`h2` or `http/1.1`); h2 connections get keep-alive pings and a 64-stream
+cap.
+
+Each upstream has a Closed / Open / HalfOpen circuit breaker
+(`ferryman_circuit_state{upstream}`: 0/1/2). A transport error, timeout, or
+502–504 opens it; after `cooldown_secs` exactly one request is let through
+as the probe. A plain `500` does not trip it, and neither does a failure
+caused by the client's own body (size cap, disconnect). The active health
+checker (`GET <upstream>/health` every `health_interval_secs`) opens and
+closes it too. A route reload keeps breaker state for rules whose prefix,
+upstream, and cooldown are unchanged.
+
+SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
+25 s. SIGUSR1 reloads TLS material and the routing table; the JWT settings
+and `tenant_rps` are read once at boot.
+
+Set `[jwt] issuer` and `audience` for anything beyond local dev — without
+them, any token signed by the issuer key is accepted, whichever service it
+was minted for.
 
 ## Design tradeoffs
 
@@ -95,11 +135,14 @@ P4 makes three decisions worth defending in a hiring loop.
 
 ### (a) `boxed_body` is off by default
 
-Cargo feature `boxed_body` streams the request body to the upstream via
-`http_body_util::BoxBody`. With it off, the proxy collects the body once
-into a `Full<Bytes>` before forwarding.
+Cargo feature `boxed_body` swaps the upstream client to
+`http_body_util::BoxBody` and streams request and response bodies. With it
+off, the proxy collects each body once into a `Full<Bytes>` before
+forwarding. Both builds enforce the 8 MiB request cap; under streaming, a
+chunked upload with no `Content-Length` that exceeds it is cut mid-stream
+and surfaces as a `502` rather than a clean `413`.
 
-Numbers from spec: `boxed` adds ~200 µs per request at 10 MB; `collected`
+Estimates from the design spec (not yet measured here): `boxed` adds ~200 µs per request at 10 MB; `collected`
 adds ~80 µs at 1 KB but allocates ~`req_size`. For an internal proxy
 fronting JSON APIs under ~256 KB the collected path wins on code
 complexity, allocator pressure (because the JSON allocator already paid
@@ -145,25 +188,29 @@ surfaces atomically from the operator's perspective.
   libc + dynamic loader). ~12 MB extra over a musl/scratch build. Worth
   it for the audit + FIPS leverage.
 
-## Bench targets (per `projects-l3-l4.md` § P4)
+## Benchmarks
 
 ```bash
-# Sustain 50k rps with mTLS + JWT enabled.
-wrk2 -c 1000 -t 16 -R 50000 -d 60s \
-     -s benches/wrk2.lua \
-     https://localhost:8443/svc-a/echo
+# JWT verify: cache hit vs miss (criterion).
+cargo bench -p ferryman-edge-core --bench jwt_verify
 
-# Zero-loss reload bench: sustains wrk2 while flipping SIGUSR1 mid-run.
-./benches/reload.sh 60 50000
+# Zero-loss reload check: curl workers (fresh mTLS handshake per request)
+# while SIGUSR1 fires at 50% and 75% of the run. Needs the server up and
+# an upstream answering /svc-a/echo.
+./benches/reload.sh 60 8
 ```
 
-| Metric                                                            | Target          |
-| ----------------------------------------------------------------- | --------------- |
-| Throughput @ mTLS + JWT                                           | 50,000 rps      |
-| p99 latency                                                       | < 8 ms          |
-| TLS handshake p99 (full chain validation)                         | < 50 ms         |
-| Cert chain depth in bench                                         | 4 intermediates |
-| Hot-reload during sustained wrk2                                  | zero failed reqs|
+wrk/wrk2 cannot present a TLS client certificate, so `benches/wrk2.lua`
+only works against a listener without mTLS; the 50k rps target below needs
+an mTLS-capable load generator and is not measured yet.
+
+| Metric | Target | Measured |
+| --- | --- | --- |
+| JWT verify, cache hit vs miss | ≥ 10× | 0.68 µs vs 150 µs (~220×), criterion, dev laptop |
+| Hot reload under load | zero failed reqs | 3725 / 3725 OK across 2× SIGUSR1 (60 s, 8 workers, release) |
+| Throughput @ mTLS + JWT | 50,000 rps | — |
+| p99 latency | < 8 ms | — |
+| TLS handshake p99 (full chain validation) | < 50 ms | 119 ms, but client and server shared one box (contended) |
 
 ## Repository layout
 
@@ -172,14 +219,15 @@ ferryman-edge/
   Cargo.toml                       # workspace
   config.toml                      # example: TLS paths, JWKS, 2 upstreams, rps cap
   crates/
-    core/                          # tls, jwt, ratelimit, route, health, config
-    server/                        # tokio-rustls acceptor, proxy handler, SIGUSR1 reload
+    core/                          # tls, jwt, ratelimit, route, health, config (+ jwt_verify bench)
+    server/                        # accept loop + auth middleware (lib), proxy, reload, e2e tests
   certs/                           # generated, gitignored (see scripts/gen-test-certs.sh)
   scripts/
     gen-test-certs.sh              # root + 3 intermediates + server + client + JWT keypair
+    mint-jwt.sh                    # RS256 token signed by certs/jwt-priv.pem (openssl only)
   benches/
-    wrk2.lua                       # throughput target script
-    reload.sh                      # zero-loss reload bench (wrk2 + kill -USR1)
+    wrk2.lua                       # throughput script (non-mTLS listeners only)
+    reload.sh                      # zero-loss reload check (curl workers + kill -USR1)
   Dockerfile                       # cargo-chef multi-stage, distroless final
   fly.toml                         # Fly.io 2-region (sin + iad)
   deny.toml                        # cargo-deny config
@@ -193,13 +241,10 @@ ferryman-edge/
 
 ## Roadmap
 
-Phase 1 (scaffold + `cargo check` green + first handshake accepted on
-:8443) is the current sprint — see
-[`docs/plans/2026-05-28-ferryman-edge-phase-1-scaffold.md`](./docs/plans/2026-05-28-ferryman-edge-phase-1-scaffold.md).
-Phase 2 wires the `tokio-rustls` acceptor + JWT/ratelimit middleware
-into the request path and takes wrk2 numbers. Subsequent phases harden
-the cert-rotation story and ship the Fly.io demo. See
-[`PROGRESS.md`](./PROGRESS.md).
+Phase 1 (scaffold) and Phase 2 (mTLS + JWT + rate limit on the real
+request path, circuit breaker, streaming `boxed_body`, e2e tests) are
+done. Open: mTLS-capable throughput numbers against the 50k rps / p99
+targets, and the Fly.io 2-region deploy. See [`PROGRESS.md`](./PROGRESS.md).
 
 ## License <a id="license"></a>
 

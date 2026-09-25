@@ -2,8 +2,9 @@
 #
 # Two-region failover demo: primary in `sin`, secondary in `iad`. mTLS
 # terminates inside the proxy itself, so this is NOT behind Fly's managed
-# certificates — we publish a raw TCP service and rely on the cert/key
-# bundle baked into /app/certs (or mounted from a Fly secret store).
+# certificates — we publish a raw TCP service. The image ships no key
+# material: mount certs/ (server cert + key, client-CA bundle, JWT public
+# key) at /app/certs, e.g. from Fly secrets, or the server exits at boot.
 #
 #   fly launch --copy-config --no-deploy
 #   fly scale count 1 --region sin
@@ -36,19 +37,12 @@ kill_timeout = "30s"
   [[services.ports]]
     port = 8443
 
-[[services]]
-  internal_port = 9090
-  protocol = "tcp"
-
-  [[services.ports]]
-    port = 9090
-    handlers = ["http"]
-
-[[regions]]
-  code = "sin"
-
-[[regions]]
-  code = "iad"
+# /metrics stays private: Fly's managed Prometheus scrapes it over the
+# internal network. Publishing 9090 would leak upstream names and traffic
+# shape to anyone.
+[metrics]
+  port = 9090
+  path = "/metrics"
 
 [[vm]]
   size = "shared-cpu-1x"
