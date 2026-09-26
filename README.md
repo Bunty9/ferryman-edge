@@ -89,6 +89,9 @@ curl -i --cacert certs/ca.crt \
 kill -USR1 $(pidof ferryman-edge-server)
 ```
 
+Configuration reference, reload, metrics and troubleshooting:
+[`docs/operations.md`](./docs/operations.md).
+
 ## Request pipeline
 
 Every request passes the same gates, in order:
@@ -239,6 +242,7 @@ ferryman-edge/
   rust-toolchain.toml              # stable channel
   .github/workflows/ci.yml         # fmt + clippy + nextest + deny + criterion + mTLS smoke
   docs/
+    operations.md                  # config reference, reload, metrics, troubleshooting
     specs/2026-05-28-ferryman-edge-design.md
     plans/2026-05-28-ferryman-edge-phase-1-scaffold.md
   PROGRESS.md

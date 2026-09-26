@@ -8,7 +8,10 @@
 # Debian userland.
 
 # ---- Stage 1: chef base (cargo-chef for layer-cacheable builds) -------------
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+# Builder and runtime must share a Debian release: a binary linked against
+# a newer glibc (e.g. trixie's 2.41) fails to start on distroless
+# cc-debian12 (2.36) with "GLIBC_2.38 not found". Bump both together.
+FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /app
 
 # ---- Stage 2: planner (compute the recipe of dependencies) ------------------
