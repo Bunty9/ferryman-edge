@@ -680,6 +680,24 @@ async fn oversized_chunked_upload_is_413_and_does_not_trip_breaker() {
     assert_eq!(resp.status(), 200, "breaker must still be closed");
 }
 
+/// A client that completes the mTLS handshake and then sends nothing must
+/// not hold the connection open forever (10s first-request timeout).
+#[tokio::test]
+async fn silent_client_is_disconnected() {
+    use tokio::io::AsyncReadExt;
+
+    let h = Harness::new(0).await;
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(20), tls.read(&mut buf))
+        .await
+        .expect("server closed the idle connection")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(9));
+}
+
 #[tokio::test]
 async fn upstream_down_trips_the_breaker() {
     let h = Harness::new(0).await;

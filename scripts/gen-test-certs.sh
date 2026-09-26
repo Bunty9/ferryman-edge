@@ -36,8 +36,12 @@ gen_ca() {
     openssl genrsa -out "${name}.key" 2048 >/dev/null 2>&1
     if [ -z "$signer_key" ]; then
         # self-signed root
+        # Explicit CA extensions: strict verifiers (e.g. Python 3.13's
+        # VERIFY_X509_STRICT) reject a root without keyUsage.
         openssl req -x509 -new -nodes -key "${name}.key" \
             -sha256 -days 365 -subj "${subj}" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
             -out "${name}.crt" >/dev/null 2>&1
     else
         openssl req -new -key "${name}.key" -subj "${subj}" -out "${name}.csr" >/dev/null 2>&1
