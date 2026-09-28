@@ -1,7 +1,7 @@
 # Operating ferryman-edge
 
 How to configure, run, reload, observe and debug the proxy. For the
-request pipeline and design rationale see the [README](../README.md).
+request pipeline and design rationale see the [README](https://github.com/Bunty9/ferryman-edge#readme).
 
 ## Configuration reference
 

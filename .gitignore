@@ -24,3 +24,6 @@ benches/results/
 .idea/
 .vscode/
 .DS_Store
+
+# mdBook output
+book/book/

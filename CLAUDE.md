@@ -75,6 +75,16 @@ SIGUSR1 reloads.
 - Running the server in the background from a tool call: redirect its
   stdout/stderr to a file, or a trailing `| tail` waits forever.
 
+## Documentation site
+
+`book/` is an mdBook published to https://bunty9.github.io/ferryman-edge/ by
+`.github/workflows/docs.yml` on pushes touching docs. It `{{#include}}`s
+`README.md` (via the `<!-- ANCHOR: overview/design -->` comment pairs —
+keep them), `docs/operations.md`, `docs/publishing.md` and `CHANGELOG.md`,
+so edit those files, not copies. Links inside included regions must be
+absolute or they break in the book. Build locally with
+`mdbook build book` (output `book/book/`, gitignored).
+
 ## Releasing
 
 Both crates share one version; publish core before server

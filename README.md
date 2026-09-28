@@ -10,8 +10,10 @@
 [![ci](https://github.com/Bunty9/ferryman-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/ferryman-edge/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/ferryman-edge.svg)](https://crates.io/crates/ferryman-edge)
 [![docs.rs](https://img.shields.io/docsrs/ferryman-edge)](https://docs.rs/ferryman-edge)
+[![guide](https://img.shields.io/badge/guide-mdBook-blue.svg)](https://bunty9.github.io/ferryman-edge/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
+<!-- ANCHOR: overview -->
 ## The problem
 
 Real edge proxies do **mTLS termination**, **JWT validation in-line**,
@@ -69,7 +71,9 @@ Cloudflare Pingora team to reply.
 | Deploy                | Fly.io 2-region (`sin` + `iad`)                           |
 | CI                    | GHA (stable + beta) + `cargo-deny` + `cargo-nextest` + criterion (non-blocking) + mTLS smoke |
 
-Pinned versions live in [`Cargo.toml`](./Cargo.toml).
+Pinned versions live in [`Cargo.toml`](https://github.com/Bunty9/ferryman-edge/blob/main/Cargo.toml).
+
+<!-- ANCHOR_END: overview -->
 
 ## Install
 
@@ -104,6 +108,7 @@ kill -USR1 $(pidof ferryman-edge-server)
 Configuration reference, reload, metrics and troubleshooting:
 [`docs/operations.md`](./docs/operations.md).
 
+<!-- ANCHOR: design -->
 ## Request pipeline
 
 Every request passes the same gates, in order:
@@ -232,6 +237,8 @@ an mTLS-capable load generator and is not measured yet.
 | p99 latency | < 8 ms | — |
 | TLS handshake p99 (full chain validation) | < 50 ms | 119 ms, but client and server shared one box (contended) |
 
+<!-- ANCHOR_END: design -->
+
 ## Repository layout
 
 ```
@@ -256,6 +263,7 @@ ferryman-edge/
   docs/
     operations.md                  # config reference, reload, metrics, troubleshooting
     publishing.md                  # crates.io release plan + checklist
+  book/                            # mdBook site (GitHub Pages); includes README, docs/, CHANGELOG
     specs/2026-05-28-ferryman-edge-design.md
     plans/2026-05-28-ferryman-edge-phase-1-scaffold.md
   PROGRESS.md

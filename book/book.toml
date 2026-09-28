@@ -1,0 +1,11 @@
+[book]
+title = "ferryman-edge"
+description = "mTLS-terminating L7 reverse proxy in Rust: JWT auth, per-tenant rate limiting, circuit breaking, hot reload."
+authors = ["Bunty9"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/Bunty9/ferryman-edge"
+edit-url-template = "https://github.com/Bunty9/ferryman-edge/edit/main/book/{path}"
+site-url = "/ferryman-edge/"
