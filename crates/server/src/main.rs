@@ -2,16 +2,16 @@
 //!
 //! This binary is arg parsing + boot: load config, build the mTLS/JWT/route
 //! primitives, spin up background tasks (health checker, SIGUSR1 reload,
-//! rate-limiter GC), then hand off to `ferryman_edge_server::serve` for the
+//! rate-limiter GC), then hand off to `ferryman_edge::serve` for the
 //! accept loop and per-request pipeline.
 
 use arc_swap::ArcSwap;
 use clap::Parser;
+use ferryman_edge::{reload, serve, AppState, UpstreamClient};
 use ferryman_edge_core::{
     build_limiter, build_table, health_loop, spawn_gc, ConfigToml, JwtVerifier, Limiter,
     ReloadingTls, SharedTable,
 };
-use ferryman_edge_server::{reload, serve, AppState, UpstreamClient};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;

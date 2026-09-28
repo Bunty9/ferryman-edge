@@ -69,6 +69,16 @@ Cloudflare Pingora team to reply.
 
 Pinned versions live in [`Cargo.toml`](./Cargo.toml).
 
+## Install
+
+```bash
+cargo install ferryman-edge      # installs the `ferryman-edge-server` binary
+```
+
+The reusable pieces (TLS reload, JWT verifier, rate limiter, routing +
+circuit breaker) are published separately as
+[`ferryman-edge-core`](https://crates.io/crates/ferryman-edge-core).
+
 ## Quick start
 
 ```bash
@@ -76,7 +86,7 @@ Pinned versions live in [`Cargo.toml`](./Cargo.toml).
 ./scripts/gen-test-certs.sh
 
 # 2. Build + run against the example config (mTLS terminate on :8443).
-cargo run -p ferryman-edge-server -- --config config.toml
+cargo run -p ferryman-edge -- --config config.toml
 
 # 3. Call with a valid client cert + an RS256 JWT signed by certs/jwt-priv.pem:
 curl -i --cacert certs/ca.crt \

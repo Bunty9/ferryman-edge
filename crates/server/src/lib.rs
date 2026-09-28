@@ -1,4 +1,4 @@
-//! ferryman-edge-server — programmable mTLS L7 reverse proxy pipeline.
+//! ferryman-edge — programmable mTLS L7 reverse proxy pipeline.
 //!
 //!   inbound TCP
 //!     -> `TlsAcceptor::accept` using the *current* `ReloadingTls` config
@@ -8,6 +8,11 @@
 //! `main.rs` is arg parsing + boot; this crate root owns the accept loop
 //! (`serve`) and the auth middleware in front of `proxy::handle`, so both
 //! can be driven directly from an integration test without a real process.
+//!
+//! Most users want the `ferryman-edge-server` binary (`cargo install
+//! ferryman-edge`). This library API exists for that binary and its tests
+//! and is not yet semver-stable; the reusable primitives live in
+//! `ferryman-edge-core`.
 
 pub mod proxy;
 pub mod reload;

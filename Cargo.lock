@@ -524,34 +524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
-name = "ferryman-edge-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "criterion",
- "governor",
- "http",
- "hyper",
- "hyper-util",
- "jsonwebtoken",
- "metrics",
- "moka",
- "parking_lot",
- "reqwest",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "ferryman-edge-server"
+name = "ferryman-edge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -582,6 +555,33 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "ferryman-edge-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "criterion",
+ "governor",
+ "http",
+ "hyper",
+ "hyper-util",
+ "jsonwebtoken",
+ "metrics",
+ "moka",
+ "parking_lot",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

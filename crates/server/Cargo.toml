@@ -1,5 +1,5 @@
 [package]
-name = "ferryman-edge-server"
+name = "ferryman-edge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

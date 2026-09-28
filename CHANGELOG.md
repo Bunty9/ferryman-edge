@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `ferryman-edge-core` and `ferryman-edge-server`.
+All notable changes to `ferryman-edge-core` and `ferryman-edge` (the proxy).
 Both crates share one version. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).

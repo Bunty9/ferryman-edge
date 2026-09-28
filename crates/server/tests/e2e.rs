@@ -8,8 +8,8 @@
 //! production. JWTs are signed with the same RSA fixture keypair
 //! `ferryman-edge-core`'s own tests use.
 
+use ferryman_edge::{reload, serve, AppState, UpstreamClient};
 use ferryman_edge_core::{build_limiter, Claims, JwtVerifier, ReloadingTls, RouteTable, Upstream};
-use ferryman_edge_server::{reload, serve, AppState, UpstreamClient};
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};

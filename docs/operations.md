@@ -45,7 +45,7 @@ first request on a new connection, 64 concurrent h2 streams per connection,
 
 ```bash
 ./scripts/gen-test-certs.sh                       # certs/ (gitignored)
-cargo run -p ferryman-edge-server -- --config config.toml
+cargo run -p ferryman-edge -- --config config.toml
 
 curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
      -H "Authorization: Bearer $(scripts/mint-jwt.sh tenant-a 3600)" \

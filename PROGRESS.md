@@ -48,7 +48,7 @@
 - [x] `docs/plans/2026-05-28-ferryman-edge-phase-1-scaffold.md`.
 - [x] `cargo check --workspace` passes locally (verified at end of
       scaffold).
-- [x] `cargo run -p ferryman-edge-server -- --config config.toml`
+- [x] `cargo run -p ferryman-edge -- --config config.toml`
       binds `:8443`, a curl with valid client cert completes the
       handshake.
 

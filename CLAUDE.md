@@ -13,9 +13,9 @@ cargo lives in `~/.cargo/bin` (not on the default PATH in some shells).
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features ferryman-edge-server/boxed_body -- -D warnings
+cargo clippy --workspace --all-targets --features ferryman-edge/boxed_body -- -D warnings
 cargo test --workspace
-cargo test --workspace --features ferryman-edge-server/boxed_body
+cargo test --workspace --features ferryman-edge/boxed_body
 cargo deny check
 cargo bench -p ferryman-edge-core --bench jwt_verify
 ```

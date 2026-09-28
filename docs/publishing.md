@@ -5,7 +5,7 @@ Two crates, one shared version (`[workspace.package] version`):
 | Crate | What users get | Depends on |
 | --- | --- | --- |
 | `ferryman-edge-core` | library: TLS reload, JWT verifier, rate limiter, routing + breaker | — |
-| `ferryman-edge-server` | `cargo install ferryman-edge-server` binary, plus the `serve` library | `ferryman-edge-core` (same version) |
+| `ferryman-edge` | `cargo install ferryman-edge` → `ferryman-edge-server` binary, plus the (unstable) `serve` library | `ferryman-edge-core` (same version) |
 
 Publish order is always core first, then server. `cargo publish --workspace`
 does this automatically.
@@ -30,19 +30,13 @@ does this automatically.
   build in isolation, with server resolved against core through a temporary
   registry, which is how crates.io will resolve it.
 
-## Before the first publish — decide
+## Decisions taken
 
-1. **Crate names are permanent.** `ferryman-edge`, `ferryman-edge-core` and
-   `ferryman-edge-server` were all unclaimed on 2026-09-28. If you'd rather
-   users run `cargo install ferryman-edge`, rename the server package now
-   (the lib name then becomes `ferryman_edge`; update `main.rs`, `e2e.rs`,
-   CI and docs).
-2. **Is `ferryman-edge-server`'s library API something you want to keep
-   semver-stable?** It exposes `serve`, `AppState`, `proxy`, `reload`. If
-   not, keep it but say "unstable, for the binary and tests" in the crate
-   docs, or mark the modules `#[doc(hidden)]`.
-3. **Resolve the open Docker item** (`PROGRESS.md`); it doesn't block the
-   crates, but the README points at the container workflow.
+- Names: `ferryman-edge-core` (library) and `ferryman-edge` (proxy). The
+  proxy's binary stays `ferryman-edge-server`, so Docker, CI, `pidof` and
+  the docs keep working.
+- The proxy crate's library API (`serve`, `AppState`, `proxy`, `reload`) is
+  documented as not semver-stable; it exists for the binary and its tests.
 
 ## Release checklist
 
@@ -59,14 +53,14 @@ git status --short && gh run list --limit 1
 # 3. Full local gate (both feature sets).
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features ferryman-edge-server/boxed_body -- -D warnings
+cargo clippy --workspace --all-targets --features ferryman-edge/boxed_body -- -D warnings
 cargo test --workspace
-cargo test --workspace --features ferryman-edge-server/boxed_body
+cargo test --workspace --features ferryman-edge/boxed_body
 cargo deny check
 
 # 4. Inspect what ships, then rehearse.
 cargo package -p ferryman-edge-core --list
-cargo package -p ferryman-edge-server --list
+cargo package -p ferryman-edge --list
 cargo publish --workspace --dry-run
 
 # 5. Commit, tag, push.
@@ -81,22 +75,22 @@ cargo publish --workspace
 After publishing:
 
 - Check <https://docs.rs/ferryman-edge-core> and
-  <https://docs.rs/ferryman-edge-server> build. docs.rs builds
+  <https://docs.rs/ferryman-edge> build. docs.rs builds
   `aws-lc-sys`; if it fails there, add
   `[package.metadata.docs.rs]` settings rather than changing the TLS
   provider.
-- `cargo install ferryman-edge-server` on a clean machine and run the
+- `cargo install ferryman-edge` on a clean machine and run the
   README quick start.
 - Add the crates.io and docs.rs badges back to `README.md`.
 - Create a GitHub release from the tag with the CHANGELOG section.
 
 ## If something goes wrong
 
-- Bad release: `cargo yank --version X.Y.Z ferryman-edge-server` (and core
+- Bad release: `cargo yank --version X.Y.Z ferryman-edge` (and core
   if needed), fix, publish X.Y.Z+1. Yanking stops new lockfiles from
   picking it; it does not delete it.
 - Core published but server failed: fix server and publish only it
-  (`cargo publish -p ferryman-edge-server`); don't re-bump core.
+  (`cargo publish -p ferryman-edge`); don't re-bump core.
 - Leaked secret in a package: yank it, rotate the secret, and contact
   crates.io support — yanked crates stay downloadable.
 

@@ -2,7 +2,7 @@
 
 Building blocks behind the [`ferryman-edge`](https://github.com/Bunty9/ferryman-edge)
 mTLS reverse proxy. No HTTP serving here — the
-[`ferryman-edge-server`](https://crates.io/crates/ferryman-edge-server) crate
+[`ferryman-edge`](https://crates.io/crates/ferryman-edge) crate
 wires these behind a `tokio-rustls` acceptor.
 
 | Module | What it gives you |
