@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+# Tests and benches need repo-level fixtures (incl. test-only private keys);
+# they run in CI from the repository, not from the published crate.
+exclude = ["tests/", "benches/"]
 description = "Programmable mTLS L7 reverse proxy binary — wires ferryman-edge-core behind a tokio-rustls acceptor."
 
 [lib]

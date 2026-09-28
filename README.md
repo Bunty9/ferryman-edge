@@ -243,9 +243,11 @@ ferryman-edge/
   .github/workflows/ci.yml         # fmt + clippy + nextest + deny + criterion + mTLS smoke
   docs/
     operations.md                  # config reference, reload, metrics, troubleshooting
+    publishing.md                  # crates.io release plan + checklist
     specs/2026-05-28-ferryman-edge-design.md
     plans/2026-05-28-ferryman-edge-phase-1-scaffold.md
   PROGRESS.md
+  CHANGELOG.md
 ```
 
 ## Roadmap

@@ -75,6 +75,16 @@ SIGUSR1 reloads.
 - Running the server in the background from a tool call: redirect its
   stdout/stderr to a file, or a trailing `| tail` waits forever.
 
+## Releasing
+
+Both crates share one version; publish core before server
+(`cargo publish --workspace` orders it). Full checklist and open decisions
+in `docs/publishing.md`. Never run a real `cargo publish` without an
+explicit request — it is irreversible. `cargo publish --workspace
+--dry-run` is safe. When bumping, change `[workspace.package] version`
+and the `version` on server's `ferryman-edge-core` dependency together,
+and update `CHANGELOG.md`.
+
 ## Commits
 
 Author is `Bunty9 <Bunty9@users.noreply.github.com>`; no AI attribution
