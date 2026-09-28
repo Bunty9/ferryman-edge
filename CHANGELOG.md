@@ -7,7 +7,7 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
-## [0.1.0] — first release
+## [0.1.0] — 2026-09-28
 
 ### Added
 - mTLS termination on rustls 0.23 + aws-lc-rs; client certs required and
@@ -25,3 +25,6 @@ Both crates share one version. Format follows
   collecting them.
 - Prometheus metrics (requests, auth failures, rate limiting, TLS
   handshakes, breaker state, upstream health).
+
+[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Bunty9/ferryman-edge/releases/tag/v0.1.0

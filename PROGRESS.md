@@ -97,6 +97,11 @@
 - [ ] Optional: global in-flight body-bytes budget (today bounded per
       connection: 64 streams × 8 MiB).
 
+## Releases
+
+- v0.1.0 (2026-09-28): `ferryman-edge-core` and `ferryman-edge` on
+  crates.io; GitHub release from tag `v0.1.0`.
+
 ## Done
 
 - Phase 1 scaffold.

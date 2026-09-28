@@ -1,5 +1,8 @@
 # ferryman-edge-core
 
+[![crates.io](https://img.shields.io/crates/v/ferryman-edge-core.svg)](https://crates.io/crates/ferryman-edge-core)
+[![docs.rs](https://img.shields.io/docsrs/ferryman-edge-core)](https://docs.rs/ferryman-edge-core)
+
 Building blocks behind the [`ferryman-edge`](https://github.com/Bunty9/ferryman-edge)
 mTLS reverse proxy. No HTTP serving here — the
 [`ferryman-edge`](https://crates.io/crates/ferryman-edge) crate

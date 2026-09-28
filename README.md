@@ -8,6 +8,8 @@
 > miniature scale.
 
 [![ci](https://github.com/Bunty9/ferryman-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/ferryman-edge/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ferryman-edge.svg)](https://crates.io/crates/ferryman-edge)
+[![docs.rs](https://img.shields.io/docsrs/ferryman-edge)](https://docs.rs/ferryman-edge)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem

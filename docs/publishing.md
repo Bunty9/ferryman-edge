@@ -30,6 +30,14 @@ does this automatically.
   build in isolation, with server resolved against core through a temporary
   registry, which is how crates.io will resolve it.
 
+## Status
+
+v0.1.0 of both crates is published (2026-09-28). The first publish hit
+crates.io's new-crate rate limit (429, "published too many new crates in a
+short period"); new crates refill about one per 10 minutes. Publishing
+core and then the proxy needed two waits. Later version bumps of existing
+crates use a separate, looser limit.
+
 ## Decisions taken
 
 - Names: `ferryman-edge-core` (library) and `ferryman-edge` (proxy). The
