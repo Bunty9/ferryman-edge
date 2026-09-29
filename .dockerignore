@@ -1,0 +1,9 @@
+# Keep the build context small and free of secrets: the builders compile
+# from source, so local build output and generated keys never belong in it.
+target/
+.git/
+**/.demo/
+certs/
+book/book/
+scratchpad/
+.remember/

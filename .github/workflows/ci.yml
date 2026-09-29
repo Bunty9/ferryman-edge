@@ -64,6 +64,34 @@ jobs:
       - name: cargo bench --no-run
         run: cargo bench --workspace --no-run
 
+  examples:
+    name: edge-demo walkthrough (${{ matrix.body }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - body: collected
+            features: ""
+          - body: boxed_body
+            features: "--features ferryman-edge/boxed_body"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build proxy + demo
+        run: cargo build -p ferryman-edge -p ferryman-edge-demo ${{ matrix.features }}
+      - name: Run every feature end to end
+        run: target/debug/edge-demo run
+      - name: Upload demo logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-demo-logs-${{ matrix.body }}
+          path: examples/edge-demo/.demo/run/*.log
+
   mtls-smoke:
     name: mTLS smoke (curl --cacert --cert --key)
     runs-on: ubuntu-latest

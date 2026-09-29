@@ -48,6 +48,7 @@ package in their project". Feature list = README "Request pipeline" +
   (already a dev-dep). Everything else is already in the workspace. No
   `nix`/`libc`: signal children with `kill -<SIG> <pid>` via
   `std::process::Command`.
+  *Deviation (accepted in review):* `aws-lc-rs` (already in the tree via rustls) is a direct dep of edge-demo for RSA-2048 keygen, because rcgen can't generate RSA keys; `pem` encodes them.
 - `cargo fmt`, clippy `-D warnings` (both feature sets), `cargo test
   --workspace`, and `cargo deny check` stay green.
 - Commits authored by `Bunty9 <Bunty9@users.noreply.github.com>`, no AI

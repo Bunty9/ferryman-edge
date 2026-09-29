@@ -38,6 +38,13 @@ SIGUSR1 reloads.
 - `crates/server/src/lib.rs` — accept loop (`serve`) and auth middleware;
   `proxy.rs` — per-request forwarding; `reload.rs` — SIGUSR1 route reload;
   `main.rs` — boot only.
+- `examples/edge-demo` (`ferryman-edge-demo`, publish = false): `backend`
+  sample upstream + `edge-demo` driver (`setup` | `token` | `run`). `run`
+  spawns the real proxy binary and checks every feature; CI runs it for
+  both body modes. `examples/embed-core`: ferryman-edge-core in an axum
+  service. Behaviour changes to the request path must keep
+  `cargo build -p ferryman-edge -p ferryman-edge-demo && target/debug/edge-demo run`
+  green; update its scenarios and README when behaviour changes.
 - `crates/server/tests/e2e.rs` — in-process end-to-end tests with
   rcgen-generated chains; drive `serve` directly, use `ReloadingTls::reload()`
   rather than signals (signals are process-wide).

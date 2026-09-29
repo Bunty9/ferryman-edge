@@ -85,6 +85,17 @@ The reusable pieces (TLS reload, JWT verifier, rate limiter, routing +
 circuit breaker) are published separately as
 [`ferryman-edge-core`](https://crates.io/crates/ferryman-edge-core).
 
+## Examples
+
+- [`examples/edge-demo`](https://github.com/Bunty9/ferryman-edge/tree/main/examples/edge-demo)
+  runs the proxy in front of sample services and exercises every feature
+  end to end: mTLS, JWT claims, tenant propagation, routing, body limits,
+  rate limiting, circuit breaking, hot reload of routes and certificates,
+  metrics, and graceful shutdown. One command: `examples/edge-demo/run.sh`.
+- [`examples/embed-core`](https://github.com/Bunty9/ferryman-edge/tree/main/examples/embed-core)
+  adds mTLS, JWT auth and per-tenant rate limiting to your own axum
+  service with `ferryman-edge-core`, no proxy hop.
+
 ## Quick start
 
 ```bash
@@ -263,6 +274,9 @@ ferryman-edge/
   docs/
     operations.md                  # config reference, reload, metrics, troubleshooting
     publishing.md                  # crates.io release plan + checklist
+  examples/
+    edge-demo/                     # run the proxy: PKI, tokens, config, backends, 11 scenarios
+    embed-core/                    # ferryman-edge-core inside your own axum service
   book/                            # mdBook site (GitHub Pages); includes README, docs/, CHANGELOG
     specs/2026-05-28-ferryman-edge-design.md
     plans/2026-05-28-ferryman-edge-phase-1-scaffold.md
