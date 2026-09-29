@@ -1,0 +1,58 @@
+# ferryman-edge in front of three services, plus Prometheus.
+#
+#   docker compose -f examples/edge-demo/compose/docker-compose.yml up -d --build
+#
+# Trust boundary: only `edge` publishes a port. orders / inventory / payments
+# sit on the compose network with no published ports, so from the host the
+# proxy is the only way in. Backends trust `x-ferryman-tenant` because edge
+# overwrites it on every request — which holds only as long as nothing else
+# on this network can reach them. In production, enforce that with network
+# policy, not just by not publishing ports.
+#
+# Readiness: no container healthchecks. The images are distroless (no shell,
+# no curl), and the proxy doesn't need them: its own health checker probes
+# each backend's /health every `health_interval_secs` and keeps a route's
+# breaker open (503) until the backend answers.
+
+x-backend: &backend
+  image: ferryman-edge-demo-backend
+  build:
+    context: ../../..
+    dockerfile: examples/edge-demo/compose/Dockerfile.backend
+
+services:
+  edge:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    image: ferryman-edge
+    ports:
+      - "8443:8443"          # mTLS listener; metrics (9090) stay internal
+    volumes:
+      # PKI written by `edge-demo setup` (ca.crt, server.crt/key,
+      # jwt-signing.pub). Read-only: the proxy never writes it.
+      - ../.demo:/app/certs:ro
+      - ./ferryman.toml:/app/config.toml:ro
+    depends_on: [orders, inventory, payments]
+    stop_signal: SIGTERM       # graceful drain (up to 25 s)
+    stop_grace_period: 30s
+
+  orders:
+    <<: *backend
+    command: ["--name", "orders", "--bind", "0.0.0.0:9101"]
+
+  inventory:
+    <<: *backend
+    command: ["--name", "inventory", "--bind", "0.0.0.0:9102"]
+
+  payments:
+    <<: *backend
+    command: ["--name", "payments", "--bind", "0.0.0.0:9103"]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"          # Prometheus UI on http://localhost:9091
+    depends_on: [edge]

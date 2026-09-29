@@ -81,8 +81,9 @@
       (408, slow upload) are untested.
 - [x] Docker: the original image built but could not start
       (`GLIBC_2.38 not found`: trixie builder vs cc-debian12 runtime).
-      Builder pinned to bookworm; the rebuilt image is not yet verified
-      (local Docker daemon stopped responding mid-build).
+      Builder pinned to bookworm; verified 2026-09-30 via the edge-demo
+      compose stack (serves mTLS + JWT, SIGUSR1 reload, SIGTERM drain with
+      exit 0). `.dockerignore` cut the build context from ~2.4 GB to 417 kB.
 - [x] `cargo deny check` clean (4 advisories cleared by `cargo update`,
       `rustls-pemfile` replaced by `rustls-pki-types` PEM API).
 
@@ -96,6 +97,14 @@
       are boot-time only today).
 - [ ] Optional: global in-flight body-bytes budget (today bounded per
       connection: 64 streams × 8 MiB).
+
+## Examples
+
+- [x] `examples/edge-demo`: `edge-demo run` checks every feature
+      against the real binary (55 checks, ~4 s; CI runs both body modes).
+      Manual walkthrough and docker-compose topology (proxy + 3 backends +
+      Prometheus) verified by hand 2026-09-30.
+- [x] `examples/embed-core`: ferryman-edge-core in an axum service, 8 tests.
 
 ## Releases
 

@@ -1,0 +1,26 @@
+health_interval_secs = 2
+default_cooldown_secs = 2
+tenant_rps = 5
+
+[tls]
+cert_path = "/app/certs/server.crt"
+key_path = "/app/certs/server.key"
+client_ca_path = "/app/certs/ca.crt"
+
+[jwt]
+jwks_path = "/app/certs/jwt-signing.pub"
+issuer = "https://issuer.demo.local"
+audience = "ferryman-edge"
+
+[[routes]]
+prefix = "/orders"
+upstream = "http://orders:9101"
+
+[[routes]]
+prefix = "/inventory"
+upstream = "http://inventory:9102"
+cooldown_secs = 2
+
+[[routes]]
+prefix = "/payments"
+upstream = "http://payments:9103"
