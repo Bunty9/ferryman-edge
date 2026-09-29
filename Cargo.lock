@@ -585,6 +585,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferryman-edge-demo"
+version = "0.0.0"
+
+[[package]]
+name = "ferryman-edge-embed-example"
+version = "0.0.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

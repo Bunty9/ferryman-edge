@@ -27,3 +27,6 @@ benches/results/
 
 # mdBook output
 book/book/
+
+# edge-demo generated PKI, tokens, config and logs
+examples/edge-demo/.demo/

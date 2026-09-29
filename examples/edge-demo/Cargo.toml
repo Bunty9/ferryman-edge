@@ -1,0 +1,18 @@
+[package]
+name = "ferryman-edge-demo"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Runnable end-to-end walkthrough of the ferryman-edge proxy: PKI, tokens, config, sample upstreams, every feature exercised."
+
+[[bin]]
+name = "backend"
+path = "src/bin/backend.rs"
+
+[[bin]]
+name = "edge-demo"
+path = "src/bin/edge-demo/main.rs"
+
+[dependencies]

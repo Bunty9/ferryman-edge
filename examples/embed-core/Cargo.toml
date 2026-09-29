@@ -1,0 +1,10 @@
+[package]
+name = "ferryman-edge-embed-example"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Protect your own axum service with ferryman-edge-core: mTLS, JWT middleware, per-tenant rate limiting, hot cert reload."
+
+[dependencies]

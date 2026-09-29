@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/server",
+    "examples/edge-demo",
+    "examples/embed-core",
 ]
 
 [workspace.package]
@@ -69,6 +71,10 @@ thiserror = "2"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+
+# Examples only (examples/*, publish = false)
+axum = "0.8"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 # dev-dependencies that any workspace member may opt in to via
 # `[dev-dependencies]` + `workspace = true`.
