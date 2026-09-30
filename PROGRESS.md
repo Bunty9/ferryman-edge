@@ -110,6 +110,9 @@
 
 - v0.1.0 (2026-09-28): `ferryman-edge-core` and `ferryman-edge` on
   crates.io; GitHub release from tag `v0.1.0`.
+- v0.1.1 (2026-09-30): first release through crates.io Trusted Publishing
+  (`release.yml`, environment `release`); crates.io records GitHub
+  provenance (repo, run id, commit) instead of a user token.
 
 ## Done
 

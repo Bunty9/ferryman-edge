@@ -38,6 +38,9 @@ short period"); new crates refill about one per 10 minutes. Publishing
 core and then the proxy needed two waits. Later version bumps of existing
 crates use a separate, looser limit.
 
+v0.1.1 (2026-09-30) was the first release published by the release
+workflow through Trusted Publishing. Nothing was published from a laptop.
+
 ## Decisions taken
 
 - Names: `ferryman-edge-core` (library) and `ferryman-edge` (proxy). The
