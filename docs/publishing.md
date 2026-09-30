@@ -46,6 +46,33 @@ crates use a separate, looser limit.
 - The proxy crate's library API (`serve`, `AppState`, `proxy`, `reload`) is
   documented as not semver-stable; it exists for the binary and its tests.
 
+## How releases are published: Trusted Publishing
+
+Starting with 0.1.1, releases are published by CI, not from a laptop. Pushing a
+`v*` tag runs
+[`.github/workflows/release.yml`](https://github.com/Bunty9/ferryman-edge/blob/main/.github/workflows/release.yml):
+
+1. **verify:** the tag must equal the workspace version, and `CHANGELOG.md`
+   must have that version's section. Tests run in both body modes, then
+   `cargo publish --workspace --dry-run`.
+2. **publish** (GitHub environment `release`, which only accepts `v*`
+   tags): `rust-lang/crates-io-auth-action` swaps the job's GitHub OIDC
+   token for a crates.io token that lives 30 minutes and is revoked when
+   the job ends. `cargo publish --workspace` then publishes core, then
+   the proxy. The job finishes by creating the GitHub release from the
+   CHANGELOG section.
+
+The trust is configured on both sides:
+
+| Where | Setting |
+| --- | --- |
+| crates.io, each crate → Settings → Trusted Publishing | owner `Bunty9`, repository `ferryman-edge`, workflow `release.yml`, environment `release` |
+| GitHub → Settings → Environments → `release` | deployment tags: `v*` only |
+
+Renaming `release.yml`, or the environment, breaks publishing until the
+crates.io config is updated to match. No `CARGO_REGISTRY_TOKEN` secret
+exists or is needed.
+
 ## Release checklist
 
 ```bash
@@ -56,28 +83,22 @@ git status --short && gh run list --limit 1
 
 # 2. Bump [workspace.package] version AND the version on the
 #    ferryman-edge-core dependency in crates/server/Cargo.toml.
-#    Move CHANGELOG "Unreleased" entries under the new version.
+#    Move CHANGELOG "Unreleased" entries under a "## [X.Y.Z] — date" heading
+#    and add the compare link at the bottom.
 
-# 3. Full local gate (both feature sets).
+# 3. Local gate (CI repeats it; this just saves a round trip).
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features ferryman-edge/boxed_body -- -D warnings
 cargo test --workspace
-cargo test --workspace --features ferryman-edge/boxed_body
-cargo deny check
-
-# 4. Inspect what ships, then rehearse.
-cargo package -p ferryman-edge-core --list
-cargo package -p ferryman-edge --list
 cargo publish --workspace --dry-run
 
-# 5. Commit, tag, push.
-git commit -am "release: vX.Y.Z"
-git tag -a vX.Y.Z -m "vX.Y.Z"
-git push origin main --follow-tags
+# 4. Commit and push; wait for CI on main to go green.
+git commit -am "release: vX.Y.Z" && git push origin main
 
-# 6. Publish (irreversible: a version can be yanked, never deleted or reused).
-cargo publish --workspace
+# 5. Tag and push the tag. This publishes: irreversible, since a version
+#    can be yanked but never deleted or reused.
+git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
+gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')"
 ```
 
 After publishing:
@@ -89,22 +110,18 @@ After publishing:
   provider.
 - `cargo install ferryman-edge` on a clean machine and run the
   README quick start.
-- Add the crates.io and docs.rs badges back to `README.md`.
-- Create a GitHub release from the tag with the CHANGELOG section.
 
 ## If something goes wrong
 
-- Bad release: `cargo yank --version X.Y.Z ferryman-edge` (and core
-  if needed), fix, publish X.Y.Z+1. Yanking stops new lockfiles from
-  picking it; it does not delete it.
-- Core published but server failed: fix server and publish only it
-  (`cargo publish -p ferryman-edge`); don't re-bump core.
-- Leaked secret in a package: yank it, rotate the secret, and contact
+- **The verify job fails** (e.g. tag/version mismatch): nothing was
+  published. Delete the tag (`git push origin :refs/tags/vX.Y.Z && git tag -d vX.Y.Z`),
+  fix, and tag again.
+- **The publish job fails after core went out:** re-running it would fail
+  on the already-published core, so publish only the proxy:
+  `cargo publish -p ferryman-edge` locally, with an API token scoped to
+  `publish-update` for that crate. Don't re-bump core.
+- **Bad release:** `cargo yank --version X.Y.Z ferryman-edge` (and core
+  if needed), fix, and release X.Y.Z+1. Yanking stops new lockfiles from
+  picking it up; it does not delete it.
+- **Leaked secret in a package:** yank it, rotate the secret, and contact
   crates.io support — yanked crates stay downloadable.
-
-## Later: automate
-
-Once releases become routine, a tag-triggered GitHub Actions job running
-`cargo publish --workspace` with a scoped crates.io token (secret
-`CARGO_REGISTRY_TOKEN`, `publish-update` scope limited to these two crates)
-removes the local token from the loop. Not set up yet.

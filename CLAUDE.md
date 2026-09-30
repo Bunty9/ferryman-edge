@@ -94,13 +94,17 @@ absolute or they break in the book. Build locally with
 
 ## Releasing
 
-Both crates share one version; publish core before server
-(`cargo publish --workspace` orders it). Full checklist and open decisions
-in `docs/publishing.md`. Never run a real `cargo publish` without an
-explicit request — it is irreversible. `cargo publish --workspace
---dry-run` is safe. When bumping, change `[workspace.package] version`
-and the `version` on server's `ferryman-edge-core` dependency together,
-and update `CHANGELOG.md`.
+Both crates share one version. Publishing is done by
+`.github/workflows/release.yml` on a `v*` tag push, through crates.io
+Trusted Publishing (OIDC; environment `release`); there is no registry
+token secret. The crates.io trusted-publisher config pins the workflow
+filename `release.yml` and environment `release` — renaming either breaks
+publishing. Pushing a `v*` tag publishes irreversibly: never push one
+without an explicit request. `cargo publish --workspace --dry-run` is
+safe. When bumping, change `[workspace.package] version` and the
+`version` on server's `ferryman-edge-core` dependency together, and add a
+`## [X.Y.Z]` section to `CHANGELOG.md` (the release job requires it and
+uses it as the GitHub release notes). Checklist: `docs/publishing.md`.
 
 ## Commits
 

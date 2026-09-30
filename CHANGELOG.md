@@ -7,6 +7,29 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-09-30
+
+No code changes in either crate.
+
+### Added
+- Reference examples, built and run in CI:
+  [`examples/edge-demo`](https://github.com/Bunty9/ferryman-edge/tree/main/examples/edge-demo)
+  (the proxy in front of sample services, 55 end-to-end checks, and a
+  docker-compose topology with Prometheus) and
+  [`examples/embed-core`](https://github.com/Bunty9/ferryman-edge/tree/main/examples/embed-core)
+  (ferryman-edge-core inside an axum service).
+- Project guide at https://bunty9.github.io/ferryman-edge/ (now the crates'
+  homepage).
+
+### Changed
+- Releases are published from CI through crates.io Trusted Publishing
+  (OIDC); no long-lived API token is used.
+- READMEs: install section, crates.io / docs.rs badges.
+
+### Fixed
+- Docker image: builder pinned to bookworm to match the distroless runtime's
+  glibc; `.dockerignore` keeps `target/` and keys out of the build context.
+
 ## [0.1.0] — 2026-09-28
 
 ### Added
@@ -26,5 +49,6 @@ Both crates share one version. Format follows
 - Prometheus metrics (requests, auth failures, rate limiting, TLS
   handshakes, breaker state, upstream health).
 
-[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Bunty9/ferryman-edge/releases/tag/v0.1.0

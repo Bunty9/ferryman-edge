@@ -1,0 +1,71 @@
+name: release
+
+# Publishes both crates to crates.io when a version tag is pushed, using
+# crates.io Trusted Publishing: GitHub's OIDC token is exchanged for a
+# crates.io token that lives 30 minutes and is revoked when the job ends.
+# No long-lived CARGO_REGISTRY_TOKEN secret exists anywhere.
+#
+# crates.io side (per crate, Settings → Trusted Publishing): owner Bunty9,
+# repository ferryman-edge, workflow release.yml, environment release.
+# GitHub side: environment "release" only accepts tags matching v*.
+#
+# Cut a release: bump [workspace.package] version (and server's
+# ferryman-edge-core dependency), move CHANGELOG entries under the new
+# version, merge to main, then `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag matches the workspace version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "ferryman-edge-core") | .version')
+          [ "v$version" = "$GITHUB_REF_NAME" ] || {
+            echo "tag $GITHUB_REF_NAME does not match workspace version $version"; exit 1; }
+          grep -q "^## \[$version\]" CHANGELOG.md || {
+            echo "CHANGELOG.md has no section for $version"; exit 1; }
+      - name: Tests (both body modes)
+        run: |
+          cargo test --workspace
+          cargo test --workspace --features ferryman-edge/boxed_body
+      - name: Package and verify
+        run: cargo publish --workspace --dry-run
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write   # OIDC token for crates.io Trusted Publishing
+      contents: write   # create the GitHub release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish ferryman-edge-core, then ferryman-edge
+        run: cargo publish --workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: GitHub release from the CHANGELOG section
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[.*\]: / { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md

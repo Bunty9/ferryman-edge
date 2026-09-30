@@ -9,12 +9,12 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.1.1"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Bunty9"]
 repository = "https://github.com/Bunty9/ferryman-edge"
-homepage = "https://github.com/Bunty9/ferryman-edge"
+homepage = "https://bunty9.github.io/ferryman-edge/"
 keywords = ["mtls", "reverse-proxy", "jwt", "rustls", "rate-limit"]
 categories = ["network-programming", "web-programming::http-server", "authentication"]
 
