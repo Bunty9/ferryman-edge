@@ -42,6 +42,10 @@ Both crates share one version. Format follows
   get a clear `501` instead of being silently forwarded as plain requests.
   The check runs before route lookup, so unrouted paths also get 501.
   `edge-demo` now runs 56 checks.
+- The JWT public key is reloaded on SIGUSR1 (previously only read at boot, so
+  IdP key rotation needed a restart). The boot-time path is re-read, the token
+  cache is invalidated, and a bad file keeps the old key. Adds
+  `JwtVerifier::reload_key`. Single key: no overlap window.
 
 ## [0.1.1] — 2026-09-30
 

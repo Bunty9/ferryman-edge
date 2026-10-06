@@ -16,7 +16,7 @@ are resolved against the process working directory.
 | `[tls] cert_path` | — | yes | Server certificate chain, PEM (leaf first, then intermediates). |
 | `[tls] key_path` | — | yes | Server private key, PEM (PKCS#8, PKCS#1 or SEC1). |
 | `[tls] client_ca_path` | — | yes | Client CA bundle, PEM. Every client cert must chain to one of these. |
-| `[jwt] jwks_path` | — | no | RSA public key, PEM, used for RS256 verification. |
+| `[jwt] jwks_path` | — | yes (contents) | RSA public key, PEM, used for RS256 verification. The path itself is read at boot; SIGUSR1 re-reads the file at that path. |
 | `[jwt] issuer` | unset | no | Required `iss`. Unset = not checked. |
 | `[jwt] audience` | unset | no | Required `aud`. Unset = not checked; tokens carrying any `aud` are then rejected. |
 | `[[routes]] prefix` | — | yes | Path prefix, matched on a segment boundary. Longest prefix wins. |
@@ -95,7 +95,13 @@ table` with the cause. Live connections keep the TLS config they
 handshook with; new connections get the new one. Breaker state carries
 over for routes whose prefix, upstream and cooldown did not change.
 
-Not reloaded: the JWT key and claims settings, `tenant_rps`,
+The JWT public key reloads too (`JWT key reloaded` / `JWT key reload
+failed; keeping old key`). A successful reload clears the verification
+cache. There is a single key and no overlap window: tokens signed by the
+old key are rejected immediately after the reload, so rotate at the IdP
+accordingly (switch signing, then replace the file and signal).
+
+Not reloaded: the JWT `issuer` / `audience`, `tenant_rps`,
 `health_interval_secs`, bind addresses. Restart for those.
 
 Use `pidof`, not `pgrep -x`: the binary name is longer than the 15-char

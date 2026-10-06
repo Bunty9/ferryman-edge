@@ -36,7 +36,7 @@ SIGUSR1 reloads.
   lock-free breaker), `jwt.rs`, `ratelimit.rs`, `tls.rs` (ReloadingTls),
   `health.rs`, `config.rs`. JWT test keys in `crates/core/tests/fixtures`.
 - `crates/server/src/lib.rs` — accept loop (`serve`) and auth middleware;
-  `proxy.rs` — per-request forwarding; `reload.rs` — SIGUSR1 route reload;
+  `proxy.rs` — per-request forwarding; `reload.rs` — SIGUSR1 route + JWT key reload;
   `main.rs` — boot only.
 - `examples/edge-demo` (`ferryman-edge-demo`, publish = false): `backend`
   sample upstream + `edge-demo` driver (`setup` | `token` | `run`). `run`

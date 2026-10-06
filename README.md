@@ -158,8 +158,9 @@ closes it too. A route reload keeps breaker state for rules whose prefix,
 upstream, and cooldown are unchanged.
 
 SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
-25 s. SIGUSR1 reloads TLS material and the routing table; the JWT settings
-and `tenant_rps` are read once at boot.
+25 s. SIGUSR1 reloads TLS material, the routing table and the JWT public key (read from
+the boot-time path; the token cache is cleared); `issuer` / `audience` and
+`tenant_rps` are read once at boot.
 
 Set `[jwt] issuer` and `audience` for anything beyond local dev — without
 them, any token signed by the issuer key is accepted, whichever service it

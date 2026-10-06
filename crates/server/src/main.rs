@@ -82,9 +82,8 @@ async fn main() -> anyhow::Result<()> {
         &cfg.tls.client_ca_path,
     )?;
 
-    // JWT verifier reads the RSA pub key once at boot. Cache TTL == 5 min,
-    // capacity == 10k. Stable across reloads — re-init if the issuer key
-    // rotates (not wired to SIGUSR1; that reloads TLS + routes only).
+    // JWT verifier: RSA pub key read at boot and re-read from the same path
+    // on SIGUSR1. Cache TTL == 5 min, capacity == 10k (cleared on key reload).
     let jwks_pem = std::fs::read(&cfg.jwt.jwks_path)?;
     let mut verifier = JwtVerifier::new(&jwks_pem)?;
     if let Some(iss) = &cfg.jwt.issuer {
@@ -94,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         verifier = verifier.with_audience(aud);
     }
     let jwt: Arc<JwtVerifier> = Arc::new(verifier);
+    reload::spawn_jwt_reload(cfg.jwt.jwks_path.clone().into(), jwt.clone());
 
     // Per-tenant rate limiter, keyed by `Claims::sub`. `None` when
     // `tenant_rps == 0` — rate limiting is disabled outright rather than

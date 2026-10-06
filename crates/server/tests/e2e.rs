@@ -41,6 +41,15 @@ const JWT_PUB_PEM: &[u8] = include_bytes!(concat!(
     "/../core/tests/fixtures/jwt-test-pub.pem"
 ));
 
+const JWT_OTHER_PRIV_PEM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../core/tests/fixtures/jwt-test-other-priv.pem"
+));
+const JWT_OTHER_PUB_PEM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../core/tests/fixtures/jwt-test-other-pub.pem"
+));
+
 fn install_crypto_provider() {
     // rustls needs a process-wide default provider; installing more than
     // once is a no-op error we don't care about.
@@ -139,6 +148,10 @@ impl TestCerts {
 // ----- JWT ---------------------------------------------------------------
 
 fn mint_jwt(sub: &str, ttl_secs: i64, scope: &str) -> String {
+    mint_jwt_with(JWT_PRIV_PEM, sub, ttl_secs, scope)
+}
+
+fn mint_jwt_with(key_pem: &[u8], sub: &str, ttl_secs: i64, scope: &str) -> String {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -152,7 +165,7 @@ fn mint_jwt(sub: &str, ttl_secs: i64, scope: &str) -> String {
     encode(
         &Header::new(Algorithm::RS256),
         &claims,
-        &EncodingKey::from_rsa_pem(JWT_PRIV_PEM).unwrap(),
+        &EncodingKey::from_rsa_pem(key_pem).unwrap(),
     )
     .unwrap()
 }
@@ -241,6 +254,7 @@ struct Harness {
     upstream_addr: SocketAddr,
     proxy_addr: SocketAddr,
     tls: Arc<ReloadingTls>,
+    jwt: Arc<JwtVerifier>,
 }
 
 impl Harness {
@@ -289,7 +303,7 @@ impl Harness {
         let state = Arc::new(AppState {
             tls: tls.clone(),
             table,
-            jwt,
+            jwt: jwt.clone(),
             limiter,
             client,
         });
@@ -303,6 +317,7 @@ impl Harness {
             upstream_addr,
             proxy_addr,
             tls,
+            jwt,
         }
     }
 
@@ -890,6 +905,33 @@ async fn tls_hot_reload_swaps_the_cert() {
     let after = fetch_peer_leaf_der(h.proxy_addr, &h.certs).await;
 
     assert_ne!(before, after);
+}
+
+// ----- JWT key reload ----------------------------------------------------------
+
+#[tokio::test]
+async fn jwt_key_reload_rotates_the_accepted_key() {
+    let h = Harness::new(0).await;
+    let client = h.client();
+    let old = mint_jwt("tenant-a", 3600, "read");
+    let new = mint_jwt_with(JWT_OTHER_PRIV_PEM, "tenant-a", 3600, "read");
+    let status = |t: String| {
+        let req = client
+            .get(h.url("/svc-a/hello"))
+            .header("authorization", format!("Bearer {t}"));
+        async move { req.send().await.unwrap().status() }
+    };
+
+    assert_eq!(status(old.clone()).await, 200); // cached under the old key
+    assert_eq!(status(new.clone()).await, 401);
+
+    h.jwt.reload_key(JWT_OTHER_PUB_PEM).unwrap();
+    assert_eq!(status(old.clone()).await, 401);
+    assert_eq!(status(new.clone()).await, 200);
+
+    assert!(h.jwt.reload_key(b"not a pem").is_err());
+    assert_eq!(status(new).await, 200);
+    assert_eq!(status(old).await, 401);
 }
 
 // ----- configurable [limits] -------------------------------------------------
