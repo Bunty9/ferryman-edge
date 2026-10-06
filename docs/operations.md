@@ -19,7 +19,7 @@ are resolved against the process working directory.
 | `[jwt] jwks_path` | — | yes (contents) | RSA public key, PEM, used for RS256 verification. The path itself is read at boot; SIGUSR1 re-reads the file at that path. |
 | `[jwt] issuer` | unset | no | Required `iss`. Unset = not checked. |
 | `[jwt] audience` | unset | no | Required `aud`. Unset = not checked; tokens carrying any `aud` are then rejected. |
-| `[[routes]] prefix` | — | yes | Path prefix, matched on a segment boundary. Longest prefix wins. |
+| `[[routes]] prefix` | — | yes | Path prefix, matched on a segment boundary. Longest prefix wins; if two rules have the same prefix, the first one wins lookup and its `health_path` / `health_disabled` apply. Prefixes match the raw, undecoded request path and are not access control: every route shares the same mTLS + JWT + rate-limit policy, so do not rely on prefixes to separate privileges (normalised matching is planned before any per-route policy). |
 | `[[routes]] upstream` | — | yes | `http://host:port` of the backend. Must have an authority. |
 | `[[routes]] cooldown_secs` | `default_cooldown_secs` | yes | Per-route breaker cooldown, must be ≥ 1. |
 | `[[routes]] health_path` | `/health` | yes | Path the health checker probes on this upstream. Must start with `/`, no `?` or `#`. |

@@ -25,7 +25,7 @@ publishes each crate with `cargo publish -p`; locally
   need repo-level fixtures, including test-only private keys that secret
   scanners would flag in a published crate; they run in CI from the repo.
   The packages contain only `src/`, the manifest, README and licenses.
-- The server's path dependency on core carries `version = "0.1.0"`, which
+- The server's path dependency on core carries the shared version (`0.1.2` now), which
   is what crates.io uses.
 - `cargo publish --workspace --dry-run` passes: both crates package and
   build in isolation, with server resolved against core through a temporary

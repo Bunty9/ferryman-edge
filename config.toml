@@ -2,7 +2,7 @@
 #
 # mTLS terminate -> JWT verify (RS256, moka-cached) -> per-tenant rate limit
 # (governor, keyed by Claims.sub) -> prefix-longest-match routing with the
-# P2 circuit breaker. Reload TLS + routes atomically with:
+# P2 circuit breaker. Reload TLS, routes and the JWT key with:
 #   kill -USR1 $(pidof ferryman-edge-server)
 
 health_interval_secs = 5

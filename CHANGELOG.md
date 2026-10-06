@@ -7,6 +7,8 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-10-06
+
 ### Security
 - Harden dot-segment path validation (port of ferryman 0.2.3's check): more
   encoded and alternative separator forms are rejected with 400.
@@ -94,6 +96,7 @@ No code changes in either crate.
 - Prometheus metrics (requests, auth failures, rate limiting, TLS
   handshakes, breaker state, upstream health).
 
-[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Bunty9/ferryman-edge/releases/tag/v0.1.0

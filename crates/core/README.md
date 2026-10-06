@@ -11,11 +11,11 @@ wires these behind a `tokio-rustls` acceptor.
 | Module | What it gives you |
 | --- | --- |
 | `tls` | `build_mtls_config` (rustls 0.23 + aws-lc-rs, required client certs, ALPN h2/http1.1) and `ReloadingTls`, which swaps cert/key/client-CA atomically on `SIGUSR1` or `reload()` |
-| `jwt` | `JwtVerifier`: RS256 with a 10k-entry / 5-minute moka cache; `exp` re-checked on cache hits, `nbf` enforced, optional `iss` / `aud` |
+| `jwt` | `JwtVerifier`: RS256 with a 10k-entry / 5-minute moka cache; `exp` re-checked on cache hits, `nbf` enforced, optional `iss` / `aud`; `reload_key` swaps the public key and clears the cache |
 | `ratelimit` | Per-tenant GCRA limiter (`governor`), `0` rps = disabled, `spawn_gc` to bound per-tenant state |
 | `route` | `RouteTable` with segment-boundary longest-prefix matching and a lock-free Closed / Open / HalfOpen circuit breaker per upstream |
 | `health` | Active `/health` probe loop feeding the breaker |
-| `config` | TOML schema and `build_table` |
+| `config` | TOML schema (`parse_config`, `ConfigExt` with `[limits]`, per-route `health_path` / `health_disabled`), `build_table` / `build_table_ext` |
 
 ```rust
 use ferryman_edge_core::{build_limiter, check, JwtVerifier};

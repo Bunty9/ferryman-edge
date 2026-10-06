@@ -61,7 +61,7 @@ Cloudflare Pingora team to reply.
 | --------------------- | --------------------------------------------------------- |
 | Async runtime         | `tokio` 1.47 (full)                                       |
 | HTTP server           | `hyper` 1.5 + `hyper-util`                                |
-| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26                       |
+| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26 |
 | AuthN                 | `jsonwebtoken` 9 + `moka` 0.12 (`future` cache, 10k × 5min) |
 | Rate limit            | `governor` 0.7 (keyed GCRA)                               |
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |
@@ -133,8 +133,8 @@ Every request passes the same gates, in order:
 | Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
 | Body ≤ 8 MiB (default; `max_request_body_bytes`) | `413` | |
-| Client body read within 30 s (collected mode; read before route lookup) | `408` slow client, `400` body error | |
-| Upstream round trip within 30 s, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
+| Client body read within 30 s by default (collected mode; read before route lookup) | `408` slow client, `400` body error | |
+| Upstream round trip within 30 s by default, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
 
 On the way through, the proxy strips hop-by-hop headers (both directions,
 including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
@@ -158,9 +158,15 @@ closes it too. A route reload keeps breaker state for rules whose prefix,
 upstream, and cooldown are unchanged.
 
 SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
-25 s. SIGUSR1 reloads TLS material, the routing table and the JWT public key (read from
-the boot-time path; the token cache is cleared); `issuer` / `audience` and
-`tenant_rps` are read once at boot.
+25 s. SIGUSR1 reloads TLS material, the routing table (including per-route
+`health_path` / `health_disabled`) and the JWT public key (read from the
+boot-time path; the token cache is cleared). `[limits]`, `issuer` /
+`audience`, `tenant_rps` and `health_interval_secs` are read once at boot.
+
+Route prefixes match the raw, undecoded request path and are not access
+control: every route shares the same mTLS + JWT + rate-limit policy, so do
+not rely on prefixes to separate privileges. Normalised matching is planned
+before any per-route policy.
 
 Set `[jwt] issuer` and `audience` for anything beyond local dev — without
 them, any token signed by the issuer key is accepted, whichever service it
@@ -179,7 +185,7 @@ forwarding. Both builds enforce the request body cap (8 MiB by default, configur
 chunked upload with no `Content-Length` that exceeds it is cut mid-stream
 and answered `413`, without counting against the upstream's breaker.
 Streaming mode has no separate body-read deadline: a slow upload runs
-inside the upstream's 30 s budget and ends as `504`.
+inside the upstream budget (`upstream_timeout_secs`, default 30 s) and ends as `504`.
 
 Estimates from the design spec (not yet measured here): `boxed` adds ~200 µs per request at 10 MB; `collected`
 adds ~80 µs at 1 KB but allocates ~`req_size`. For an internal proxy

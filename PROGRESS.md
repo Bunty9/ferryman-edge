@@ -87,6 +87,20 @@
 - [x] `cargo deny check` clean (4 advisories cleared by `cargo update`,
       `rustls-pemfile` replaced by `rustls-pki-types` PEM API).
 
+## 0.1.2 patch (prepared on branch `edge-0.1.2`, not yet released)
+
+- [x] CI gates (MSRV 1.88, doctests, semver-checks), `SECURITY.md`,
+      unused-dependency cleanup.
+- [x] Hardened dot-segment path validation (400 `bad path`).
+- [x] `Upgrade` (other than h2c) and `CONNECT` answered 501 before lookup.
+- [x] `[limits]` table (boot-only) and per-route `health_path` /
+      `health_disabled` (reloaded on SIGUSR1); `health_interval_secs = 0`
+      rejected.
+- [x] JWT public key reloaded on SIGUSR1 (no overlap window).
+- [x] Release workflow split into verify, attest, publish, release.
+- [x] Version bumped to 0.1.2, CHANGELOG section dated; tag and publish
+      are separate, explicit steps.
+
 ## Next sprint — Phase 3: numbers + deploy
 
 - [ ] mTLS-capable load generator (e.g. a small hyper/rustls client or

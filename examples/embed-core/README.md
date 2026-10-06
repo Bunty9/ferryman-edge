@@ -24,7 +24,8 @@ What you give up by embedding:
 - **A separate trust boundary**: a bug in your handlers now runs in the
   process that holds the TLS private key.
 - **Hot route reload**: only certificates reload (`SIGUSR1`, or
-  `ReloadingTls::reload()`).
+  `ReloadingTls::reload()`); the JWT key reloads via
+  `JwtVerifier::reload_key` (call it yourself).
 
 ## The middleware, to copy
 
