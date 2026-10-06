@@ -183,8 +183,8 @@ policy, because the backends trust `x-ferryman-tenant`.
 `compose/ferryman.toml` is the container version of the config: container
 paths under `/app/certs`, service names as upstreams, and the same issuer
 and audience as the demo tokens. Re-running `setup` regenerates the PKI, so
-restart `edge` afterwards: the JWT key is read at boot, and SIGUSR1 only
-reloads TLS material and routes.
+send `edge` a SIGUSR1 (or restart it) afterwards: SIGUSR1 reloads TLS
+material, routes and the JWT key.
 
 ## Adapting this to your project
 
@@ -194,8 +194,10 @@ reloads TLS material and routes.
   Renew by replacing the files and sending `SIGUSR1`.
 - **JWT**: point `[jwt] jwks_path` at your identity provider's RSA public key
   (PEM, RS256) and **set `issuer` and `audience`**; without them any token
-  signed by that key is accepted for any service. The key is read at boot; a
-  rotation needs a restart (SIGUSR1 reloads TLS and routes only).
+  signed by that key is accepted for any service. SIGUSR1 re-reads the key from the
+  boot-time path and clears the token cache. There is no overlap window:
+  tokens signed by the old key fail right after the reload, so rotate at the
+  IdP accordingly.
 - **Backends**: read `x-ferryman-tenant` as the caller identity and do not
   re-authenticate. That is only safe when the proxy is the only thing that can
   reach them (private network, no published ports). If clients can reach a backend directly they can forge the

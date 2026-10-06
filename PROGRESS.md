@@ -93,8 +93,8 @@
       k6 with client certs) for the 50k rps / p99 < 8 ms targets.
 - [ ] TLS handshake p99 with the 4-intermediate chain, client on a separate host.
 - [ ] Fly.io 2-region deploy with certs from secrets + reload screencast.
-- [ ] Optional: reload the JWT key and `tenant_rps` on SIGUSR1 (both
-      are boot-time only today).
+- [x] Reload the JWT key on SIGUSR1 (done in 0.1.2).
+- [ ] Optional: reload `tenant_rps` on SIGUSR1 (boot-time only today).
 - [ ] Optional: global in-flight body-bytes budget (today bounded per
       connection: 64 streams × 8 MiB).
 

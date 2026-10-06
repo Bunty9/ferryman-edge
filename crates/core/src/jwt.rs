@@ -103,8 +103,11 @@ impl JwtVerifier {
                 }
                 return Some(claims);
             }
-            // Verified under a replaced key: treat as a miss.
-            self.cache.invalidate(token).await;
+            // Verified under another key: a miss. Evict only if older; a
+            // newer entry (we hold a stale snapshot) belongs to the new key.
+            if g < gen {
+                self.cache.invalidate(token).await;
+            }
         }
         let TokenData { claims, .. } = decode::<Claims>(token, &key.0, &self.validation).ok()?;
         self.cache
@@ -118,8 +121,8 @@ impl JwtVerifier {
     /// dropped. Issuer, audience and leeway are unchanged.
     pub fn reload_key(&self, pem: &[u8]) -> anyhow::Result<()> {
         let new = DecodingKey::from_rsa_pem(pem)?;
-        let gen = self.key.load().1 + 1;
-        self.key.store(Arc::new((new, gen)));
+        // rcu makes the generation bump atomic across concurrent reloads.
+        self.key.rcu(|cur| Arc::new((new.clone(), cur.1 + 1)));
         self.cache.invalidate_all();
         Ok(())
     }
@@ -297,6 +300,23 @@ mod tests {
         assert!(v.reload_key(b"garbage").is_err());
         assert!(v.verify(&b).await.is_some());
         assert!(v.verify(&a).await.is_none());
+    }
+
+    #[test]
+    fn concurrent_reloads_bump_generation_atomically() {
+        let v = Arc::new(JwtVerifier::new(PUB_PEM).unwrap());
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let v = v.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        v.reload_key(OTHER_PUB_PEM).unwrap();
+                    }
+                })
+            })
+            .collect();
+        hs.into_iter().for_each(|h| h.join().unwrap());
+        assert_eq!(v.key.load().1, 80);
     }
 
     #[tokio::test]
