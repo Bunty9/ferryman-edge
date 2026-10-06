@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-/// Shared upstream client. One instance for the whole process — its
-/// internal pool multiplexes HTTP/2 streams to each upstream.
+/// Shared upstream client. One instance for the whole process; its pool
+/// keeps idle HTTP/1.1 connections to each upstream (outbound is always
+/// HTTP/1.1).
 pub type UpstreamClient = Client<HttpConnector, proxy::Body>;
 
 /// Everything a connection/request needs, built once at boot.

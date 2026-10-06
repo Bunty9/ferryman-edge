@@ -23,13 +23,11 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
-    "MPL-2.0",
     "CC0-1.0",
-    "OpenSSL",
-    # webpki-roots (Mozilla CA bundle data), pulled in by reqwest's rustls-tls.
+    # webpki-roots (Mozilla CA bundle data), pulled in by metrics-exporter-prometheus
+    # (server) and by reqwest rustls-tls (dev-deps, examples).
     "CDLA-Permissive-2.0",
 ]
 

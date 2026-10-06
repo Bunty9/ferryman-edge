@@ -60,8 +60,8 @@ Cloudflare Pingora team to reply.
 | Layer                 | Crate / Tool                                              |
 | --------------------- | --------------------------------------------------------- |
 | Async runtime         | `tokio` 1.47 (full)                                       |
-| HTTP server           | `hyper` 1.5 + `hyper-util` + `tower-http`                 |
-| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26 + `rustls-pemfile` 2 + `rustls-pki-types` |
+| HTTP server           | `hyper` 1.5 + `hyper-util`                                |
+| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26                       |
 | AuthN                 | `jsonwebtoken` 9 + `moka` 0.12 (`future` cache, 10k × 5min) |
 | Rate limit            | `governor` 0.7 (keyed GCRA)                               |
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |

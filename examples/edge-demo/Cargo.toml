@@ -22,7 +22,7 @@ clap = { workspace = true }
 http-body-util = { workspace = true }
 jsonwebtoken = { workspace = true }
 rcgen = { workspace = true }
-reqwest = { workspace = true, features = ["http2"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls", "http2"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

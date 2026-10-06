@@ -49,8 +49,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the aws-lc-rs default crypto provider for rustls before any
-    // ServerConfig is built. Required because we disabled `rustls`'s default
-    // features (no ring) at the workspace level.
+    // ServerConfig is built. Both the aws-lc-rs and ring provider features of
+    // rustls end up enabled through dependencies, so rustls cannot pick a
+    // process default on its own; install it explicitly.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install aws-lc-rs crypto provider"))?;
@@ -112,8 +113,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(health_loop(shared.clone(), interval));
     reload::spawn_reload(args.config.clone(), shared.clone());
 
-    // Shared hyper upstream client. Single instance across the process — its
-    // internal pool multiplexes HTTP/2 streams to each upstream.
+    // Shared hyper upstream client. Single instance across the process; its
+    // pool keeps idle HTTP/1.1 connections to each upstream (outbound is
+    // always HTTP/1.1, whatever the client spoke).
     let client: UpstreamClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
     let state = Arc::new(AppState {

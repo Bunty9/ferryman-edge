@@ -39,6 +39,48 @@ jobs:
       - name: cargo nextest (boxed_body)
         run: cargo nextest run --workspace --no-fail-fast --features ferryman-edge/boxed_body
 
+  # nextest does not run doctests.
+  doctest:
+    name: doctests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --doc
+        run: cargo test --doc --workspace
+
+  # Blocking: public API must stay semver-compatible with the last release
+  # on crates.io (action default baseline = registry). Checks both published
+  # crates; the examples are publish = false and skipped.
+  semver:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # The action installs its own toolchain (rust-toolchain input, default stable).
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+
+  # Blocking: the declared rust-version (1.88) must really build, tests and
+  # benches included. rust-toolchain.toml pins stable, hence RUSTUP_TOOLCHAIN.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.88"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
