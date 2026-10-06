@@ -260,6 +260,10 @@ impl Harness {
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
             ),
             (
+                "/probe".to_string(),
+                Upstream::new(format!("http://{down_addr}").parse().unwrap(), 1),
+            ),
+            (
                 "/down".to_string(),
                 Upstream::new(format!("http://{down_addr}").parse().unwrap(), 30),
             ),
@@ -720,8 +724,9 @@ async fn dot_segment_variants_are_rejected_and_legit_paths_pass() {
         "/svc-a/%00",
         "/svc-a/%u002e",
     ] {
-        let (status, _) = raw_get(&h, p, Some(&token)).await;
+        let (status, rest) = raw_get(&h, p, Some(&token)).await;
         assert!(status.contains(" 400"), "{p}: {status}");
+        assert!(rest.ends_with("bad path"), "{p}: {rest}");
         // auth runs first
         let (status, _) = raw_get(&h, p, None).await;
         assert!(status.contains(" 401"), "{p} without token: {status}");
@@ -738,6 +743,25 @@ async fn dot_segment_variants_are_rejected_and_legit_paths_pass() {
         let want = format!("x-echo-path: {p}\r\n");
         assert!(rest.contains(&want), "{p}: {rest}");
     }
+}
+
+/// A 400 bad path must not consume the half-open probe slot: the bad-path
+/// check runs before `RouteTable::lookup`. If it ran after, the 400 request
+/// would take the probe and the next normal request would see 503, not 502.
+#[tokio::test]
+async fn bad_path_does_not_consume_half_open_probe() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "{s}"); // breaker opens
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await; // cooldown (1s) elapsed
+    let (s, rest) = raw_get(&h, "/probe/..%2fx", Some(&token)).await;
+    assert!(
+        s.contains(" 400") && rest.ends_with("bad path"),
+        "{s} {rest}"
+    );
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "probe slot was consumed: {s}");
 }
 
 /// A client that completes the mTLS handshake and then sends nothing must

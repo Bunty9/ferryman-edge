@@ -116,15 +116,9 @@ fn plain(status: u16, msg: &'static [u8]) -> anyhow::Result<Response<Body>> {
         .body(text_body(Bytes::from_static(msg)))?)
 }
 
-/// True if `path` could be read as a dot segment by a normalising
-/// upstream. `/`, `\`, `%2f` and `%5c` all count as separators, a `;param`
-/// suffix is ignored per piece (Tomcat), and a piece that is `.` or `..`
-/// (also `%2e`-encoded, any case) is rejected. Encoded separators inside an
-/// otherwise ordinary segment (`group%2Fproject`) are allowed. Also rejected:
-/// `%00`, `%u`/`%U` (non-standard) and double-encoded dot/slash (`%252e`,
-/// `%252f`, `%255c`). Detection only; the forwarded path is never rewritten.
-/// Not covered: overlong UTF-8 (`%c0%ae`) and Windows trailing-dot/space
-/// trimming.
+/// True if `path` could be read as a dot segment (`.`/`..`) by a normalising
+/// upstream, under the separator and encoding variants exercised by the tests
+/// below. Detection only; the forwarded path is never rewritten.
 fn bad_path(path: &str) -> bool {
     let b = path.as_bytes();
     let (mut start, mut i) = (0, 0);
@@ -152,7 +146,8 @@ fn bad_path(path: &str) -> bool {
     false
 }
 
-/// `.` or `..` after dropping a `;...` suffix and decoding `%2e`.
+/// `.` or `..` once parameters and encodings handled by `bad_path` are
+/// accounted for.
 fn dot_piece(piece: &[u8]) -> bool {
     let end = piece.iter().position(|&c| c == b';').unwrap_or(piece.len());
     let b = &piece[..end];
