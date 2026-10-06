@@ -10,8 +10,7 @@ Both crates share one version. Format follows
 ## [0.1.2] — 2026-10-06
 
 ### Security
-- Harden dot-segment path validation (port of ferryman 0.2.3's check): more
-  encoded and alternative separator forms are rejected with 400.
+- Harden dot-segment path validation (port of ferryman 0.2.3's check).
 
 ### Added
 - Config: `[limits]` table (`max_request_body_bytes`, `request_body_timeout_secs`,
@@ -19,7 +18,9 @@ Both crates share one version. Format follows
   `first_request_timeout_secs`, `h2_max_concurrent_streams`,
   `shutdown_drain_secs`; defaults unchanged, boot-only) and per-route
   `health_path` / `health_disabled`, via new `parse_config`, `ConfigExt`,
-  `Limits`, `RouteExt`, `build_table_ext`, `Upstream::with_health`.
+  `Limits`, `RouteExt`, `build_table_ext`, `Upstream::with_health`,
+  `Upstream::health_path()`, `Upstream::health_disabled()`, and
+  `reload::spawn_jwt_reload`.
   `health_path` changes the probed path; `health_disabled` skips the active
   probe (the breaker is then driven by requests only).
   `health_interval_secs = 0` is now rejected at load (it previously

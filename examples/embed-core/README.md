@@ -23,9 +23,10 @@ What you give up by embedding:
   upstreams, and you have none.
 - **A separate trust boundary**: a bug in your handlers now runs in the
   process that holds the TLS private key.
-- **Hot route reload**: only certificates reload (`SIGUSR1`, or
-  `ReloadingTls::reload()`); the JWT key reloads via
-  `JwtVerifier::reload_key` (call it yourself).
+- **Hot route reload**: there is no route table in embed mode, so there
+  are no routes to reload. The TLS certificate (`ReloadingTls`, via
+  `SIGUSR1` or `ReloadingTls::reload()`) and the JWT key
+  (`JwtVerifier::reload_key`, call it yourself) can be reloaded.
 
 ## The middleware, to copy
 

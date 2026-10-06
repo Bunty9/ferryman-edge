@@ -103,7 +103,7 @@ fn plain(status: u16, msg: &'static [u8]) -> anyhow::Result<Response<Body>> {
 }
 
 /// True if `path` could be read as a dot segment (`.`/`..`) by a normalising
-/// upstream, under the separator and encoding variants exercised by the tests
+/// upstream, under the variants exercised by the tests
 /// below. Detection only; the forwarded path is never rewritten.
 fn bad_path(path: &str) -> bool {
     let b = path.as_bytes();

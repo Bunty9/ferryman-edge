@@ -126,7 +126,7 @@ Every request passes the same gates, in order:
 
 | Gate | Reject with | Metric |
 | --- | --- | --- |
-| TLS handshake, client cert must chain to `client_ca_path` (10 s timeout) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
+| TLS handshake, client cert must chain to `client_ca_path` (10 s by default; `tls_handshake_timeout_secs`) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
 | `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
 | Per-tenant GCRA limit keyed by `sub` (`tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
 | No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
@@ -142,7 +142,8 @@ including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
 upstream, replaces `x-forwarded-for` with the peer IP (dropping client-sent
 `Forwarded` / `X-Real-IP`), sets `x-forwarded-proto: https`, and downgrades
 the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
-(`h2` or `http/1.1`). A connection with no request within 10 s of the
+(`h2` or `http/1.1`). A connection with no request within 10 s (default;
+`first_request_timeout_secs`) of the
 handshake is closed (this also covers a stalled h2 preface); h2 connections
 then get keep-alive pings and a 64-stream cap.
 
@@ -155,12 +156,14 @@ caused by the client's own body (size cap, disconnect). The active health
 checker (`GET <upstream>/health` every `health_interval_secs`; per-route
 `health_path` / `health_disabled` change or skip the probe) opens and
 closes it too. A route reload keeps breaker state for rules whose prefix,
-upstream, and cooldown are unchanged.
+upstream, cooldown, and health settings (`health_path` / `health_disabled`,
+compared by effective value) are unchanged.
 
 SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
-25 s. SIGUSR1 reloads TLS material, the routing table (including per-route
-`health_path` / `health_disabled`) and the JWT public key (read from the
-boot-time path; the token cache is cleared). `[limits]`, `issuer` /
+25 s by default (`shutdown_drain_secs`). SIGUSR1 reloads TLS material, the
+routing table (including per-route `health_path` / `health_disabled`) and
+the JWT public key (read from the boot-time path; the token cache is
+cleared). `[limits]`, `issuer` /
 `audience`, `tenant_rps` and `health_interval_secs` are read once at boot.
 
 Route prefixes match the raw, undecoded request path and are not access

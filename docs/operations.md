@@ -43,12 +43,15 @@ CLI / environment:
 All keys are optional; the defaults are the values earlier releases
 hard-coded. **Every `[limits]` key is read at boot only**: SIGUSR1 does not
 change them, restart the process to apply a change. Invalid values (zero, or
-above the maximum) abort startup.
+above the maximum) abort startup. On SIGUSR1 an invalid `[limits]` value (or
+`health_interval_secs = 0`) makes the whole route reload fail, keeping the
+old table; a valid but changed `[limits]` value is silently ignored until
+restart (no log line).
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `max_request_body_bytes` | `8388608` (8 MiB) | 1 to 1073741824 | Largest client request body; larger gets 413. |
-| `request_body_timeout_secs` | `30` | 1 to 86400 | Deadline for reading the client body; exceeded gets 408. |
+| `request_body_timeout_secs` | `30` | 1 to 86400 | Deadline for reading the client body; exceeded gets 408. Collected (default) mode only; under `boxed_body` the upload runs inside `upstream_timeout_secs`. |
 | `upstream_timeout_secs` | `30` | 1 to 86400 | Upstream round trip, starting once the request body is ready; exceeded gets 504. |
 | `tls_handshake_timeout_secs` | `10` | 1 to 86400 | mTLS handshake deadline. |
 | `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request; also the HTTP/1 header-read timeout. |
@@ -93,7 +96,9 @@ that fails to parse or load keeps the old config and logs
 `mTLS reload failed; keeping old` or `route reload failed; keeping old
 table` with the cause. Live connections keep the TLS config they
 handshook with; new connections get the new one. Breaker state carries
-over for routes whose prefix, upstream and cooldown did not change.
+over for routes whose prefix, upstream, cooldown and health settings
+(`health_path` / `health_disabled`, compared by effective value) did not
+change.
 
 The JWT public key reloads too (`JWT key reloaded` / `JWT key reload
 failed; keeping old key`). A successful reload clears the verification
@@ -102,7 +107,10 @@ old key are rejected immediately after the reload, so rotate at the IdP
 accordingly (switch signing, then replace the file and signal).
 
 Not reloaded: the JWT `issuer` / `audience`, `tenant_rps`,
-`health_interval_secs`, bind addresses. Restart for those.
+`health_interval_secs`, every `[limits]` key, bind addresses. Restart for
+those. An invalid `[limits]` value (or `health_interval_secs = 0`) in the
+file fails the whole route reload (old table kept); a valid but changed
+`[limits]` value is ignored without a log line.
 
 Use `pidof`, not `pgrep -x`: the binary name is longer than the 15-char
 kernel `comm`, so `pgrep -x ferryman-edge-server` never matches.
@@ -110,7 +118,7 @@ kernel `comm`, so `pgrep -x ferryman-edge-server` never matches.
 ## Shutdown
 
 SIGTERM or SIGINT stops accepting, lets in-flight connections finish for up
-to 25 s, then exits. `fly.toml` sends SIGINT with a 30 s kill timeout.
+to 25 s by default (`shutdown_drain_secs`), then exits. `fly.toml` sends SIGINT with a 30 s kill timeout.
 
 ## Metrics
 
