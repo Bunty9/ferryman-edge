@@ -28,6 +28,11 @@ Both crates share one version. Format follows
 - `SECURITY.md`: supported versions and private vulnerability reporting.
 
 ### Changed
+- Release workflow split into verify, attest, publish and release jobs:
+  the `.crate` files get build provenance (`gh attestation verify`), publish
+  skips crates already on crates.io so a failed run can simply be re-run, and
+  `contents: write` is held only by the release job. Actions are pinned by
+  SHA (also the CI doctest job).
 - Dependency cleanup: removed unused `tower`, `tower-http`, `tokio-util`,
   `url`, `thiserror`, `parking_lot`, `tokio-rustls`, `hyper`, `hyper-util`
   and `rustls-pki-types` declarations, plus reqwest's unused `json` feature
