@@ -78,8 +78,9 @@ curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
 The upstreams in `config.toml` (`localhost:8001`, `localhost:8002`) must
 serve `GET /health` with a 2xx, or the health checker keeps their breaker
 open and requests get `503` (set a route's `health_path`, or
-`health_disabled = true`, if the upstream has no such endpoint). The proxy forwards the full path, prefix
-included (`/svc-a/hello` reaches the upstream as `/svc-a/hello`).
+`health_disabled = true`, if the upstream has no such endpoint). The proxy
+forwards the full path, prefix included (`/svc-a/hello` reaches the
+upstream as `/svc-a/hello`).
 
 ## Hot reload
 
@@ -119,7 +120,7 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 | `ferryman_tls_handshake_seconds` | summary | — |
 | `ferryman_tls_handshake_failures_total` | counter | — |
 | `ferryman_circuit_state` | gauge | `upstream`; 0 closed, 1 open, 2 half-open |
-| `ferryman_upstream_alive` | gauge | `upstream`; last health probe result |
+| `ferryman_upstream_alive` | gauge | `upstream`; last health probe result. Absent for `health_disabled` routes; a value set before a reload that disables probing persists until restart, so exclude disabled upstreams from alerts on it |
 
 `upstream` is `host:port`.
 

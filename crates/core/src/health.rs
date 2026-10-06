@@ -89,6 +89,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn loop_skips_disabled_upstream() {
+        use crate::route::{RouteTable, Upstream};
+        // Closed port: a probe would fail and open the breaker.
+        let uri: http::Uri = "http://127.0.0.1:1".parse().unwrap();
+        let up = Upstream::new(uri, 30).with_health(None, true);
+        let table: SharedTable = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            RouteTable::new(vec![("/".into(), up)]),
+        ));
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            health_loop(table.clone(), Duration::from_secs(60)),
+        )
+        .await;
+        assert!(table.load().rules[0].1.is_routable());
+    }
+
     #[test]
     fn disabled_upstream_is_not_probed() {
         let uri: http::Uri = "http://localhost:8001".parse().unwrap();
