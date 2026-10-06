@@ -128,6 +128,10 @@ jobs:
   # because cargo publish runs dependency build scripts. Idempotent: a crate
   # whose exact version is already on crates.io is skipped, so re-running
   # after a partial failure resumes instead of failing on "already exists".
+  # Any other API answer (429, 5xx, ...) fails the job rather than guessing.
+  # --no-verify: verify already packaged and built this exact commit with
+  # --locked, and skipping the rebuild keeps dependency build scripts out of
+  # the job that holds the crates.io token.
   publish:
     needs: [verify, attest]
     runs-on: ubuntu-latest
@@ -153,13 +157,18 @@ jobs:
             | jq -r '.packages[] | select(.name == "ferryman-edge-core") | .version')
           # ferryman-edge depends on ferryman-edge-core: core goes first.
           for crate in ferryman-edge-core ferryman-edge; do
-            if curl -fsS -A "ferryman-edge-release (github.com/Bunty9/ferryman-edge)" \
-                "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
-              echo "$crate $version is already on crates.io, skipping"
-            else
-              echo "publishing $crate $version"
-              cargo publish -p "$crate" --locked
-            fi
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "ferryman-edge-release (github.com/Bunty9/ferryman-edge)" \
+              "https://crates.io/api/v1/crates/${crate}/${version}")
+            case "$code" in
+              200) echo "$crate $version is already on crates.io, skipping" ;;
+              404)
+                echo "publishing $crate $version"
+                cargo publish -p "$crate" --locked --no-verify ;;
+              *)
+                echo "::error::crates.io returned HTTP $code for $crate $version"
+                exit 1 ;;
+            esac
           done
 
   # Creates (or, on a re-run, updates) the GitHub release. No checkout, no

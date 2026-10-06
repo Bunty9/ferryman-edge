@@ -72,7 +72,10 @@ Starting with 0.1.1, releases are published by CI, not from a laptop. Pushing a
    a crates.io token that lives 30 minutes and is revoked when the job
    ends. Then, for `ferryman-edge-core` and then `ferryman-edge`: skip the
    crate if `crates.io/api/v1/crates/<name>/<version>` already exists,
-   otherwise `cargo publish -p <name> --locked`. This is idempotent, so
+   if it returns 404 run `cargo publish -p <name> --locked --no-verify`, and
+   fail on any other status (429, 5xx). `--no-verify` is safe because verify
+   already built the same commit, and it keeps dependency build scripts out
+   of the job holding the crates.io token. This is idempotent, so
    re-running the job after a partial failure just finishes the job.
 4. **release** (`contents: write` only; no checkout, no cargo): creates the
    GitHub release from the CHANGELOG section and attaches the `.crate`
@@ -154,12 +157,15 @@ After publishing:
 - **The verify job fails** (e.g. tag/version mismatch): nothing was
   published. Delete the tag (`git push origin :refs/tags/vX.Y.Z && git tag -d vX.Y.Z`),
   fix, and tag again.
-- **The publish job fails after core went out** (or any other partial
-  failure, e.g. a crates.io outage or rate limit): re-run the failed jobs
-  from the Actions page. The publish step skips crates already on
-  crates.io and publishes the rest. Don't re-bump the version.
-- **The release job fails:** re-run it; it creates the release, or uploads
-  to the one that already exists.
+- **The publish job fails after core went out** (a crates.io outage, a
+  rate limit, or an API error such as HTTP 429/5xx on the existence check):
+  use "Re-run failed jobs" on the run. The publish step skips crates
+  already on crates.io and publishes the rest; re-running is safe. Don't
+  re-bump the version. The `.crate` and release-notes artifacts are kept
+  for 7 days, so re-run `publish` / `release` within that window; after
+  that, push a new patch version instead.
+- **The release job fails:** same, "Re-run failed jobs"; it creates the
+  release, or uploads to the one that already exists.
 - **Bad release:** `cargo yank --version X.Y.Z ferryman-edge` (and core
   if needed), fix, and release X.Y.Z+1. Yanking stops new lockfiles from
   picking it up; it does not delete it.
