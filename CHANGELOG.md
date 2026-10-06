@@ -24,6 +24,12 @@ Both crates share one version. Format follows
 - Docs: corrected the README stack table and comments about the crypto
   provider and upstream HTTP version.
 
+### Fixed
+- Upgrade/WebSocket (`Upgrade` other than `h2c`) and `CONNECT` requests now
+  get a clear `501` instead of being silently forwarded as plain requests.
+  The check runs before route lookup, so unrouted paths also get 501.
+  `edge-demo` now runs 56 checks.
+
 ## [0.1.1] — 2026-09-30
 
 No code changes in either crate.

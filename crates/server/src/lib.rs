@@ -204,6 +204,7 @@ async fn route_request(
     // Strip hop-by-hop headers *before* stamping: a client could otherwise
     // send `Connection: x-ferryman-tenant` and have the strip delete the
     // stamped value.
+    let upgrade = proxy::wants_upgrade(&req);
     proxy::strip_hop_by_hop(req.headers_mut());
     // Stamp the tenant for the upstream; discard whatever the client sent
     // to close the obvious spoofing hole.
@@ -212,7 +213,15 @@ async fn route_request(
         req.headers_mut().insert("x-ferryman-tenant", v);
     }
 
-    match proxy::handle(state.table.clone(), state.client.clone(), req, peer.ip()).await {
+    match proxy::handle_checked(
+        state.table.clone(),
+        state.client.clone(),
+        req,
+        peer.ip(),
+        upgrade,
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(?e, "unhandled proxy error");

@@ -686,13 +686,24 @@ async fn oversized_chunked_upload_is_413_and_does_not_trip_breaker() {
 
 /// Send one raw HTTP/1.1 GET (path verbatim) and return (status line, headers+body).
 async fn raw_get(h: &Harness, path: &str, token: Option<&str>) -> (String, String) {
+    raw_get_with(h, path, token, "").await
+}
+
+/// `raw_get` plus extra header lines (each ending in `\r\n`).
+async fn raw_get_with(
+    h: &Harness,
+    path: &str,
+    token: Option<&str>,
+    extra: &str,
+) -> (String, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
     let auth = token
         .map(|t| format!("authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
-    let req = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n{auth}connection: close\r\n\r\n");
+    let req =
+        format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n{auth}{extra}connection: close\r\n\r\n");
     tls.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(
@@ -760,6 +771,55 @@ async fn bad_path_does_not_consume_half_open_probe() {
         s.contains(" 400") && rest.ends_with("bad path"),
         "{s} {rest}"
     );
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "probe slot was consumed: {s}");
+}
+
+const WS: &str = "upgrade: websocket\r\nconnection: upgrade\r\n";
+
+/// Upgrade requests get 501 (the proxy cannot splice them) and never reach
+/// the upstream; `Upgrade: h2c` is exempt and proxied normally. 501 comes
+/// before route lookup, so an unrouted path gets it too.
+#[tokio::test]
+async fn upgrade_requests_get_501_but_h2c_is_proxied() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+
+    let (s, rest) = raw_get_with(&h, "/svc-a/ws", Some(&token), WS).await;
+    assert!(s.contains(" 501"), "{s}");
+    assert!(
+        rest.ends_with("protocol upgrades are not supported"),
+        "{rest}"
+    );
+    assert!(!rest.to_ascii_lowercase().contains("x-upstream"), "{rest}");
+
+    let (s, _) = raw_get_with(&h, "/nowhere", Some(&token), WS).await;
+    assert!(s.contains(" 501"), "{s}");
+
+    let (s, rest) = raw_get_with(
+        &h,
+        "/svc-a/hello",
+        Some(&token),
+        "upgrade: H2C\r\nconnection: upgrade, http2-settings\r\n",
+    )
+    .await;
+    assert!(s.contains(" 200"), "{s}");
+    assert!(
+        rest.to_ascii_lowercase().contains("x-upstream: yes"),
+        "{rest}"
+    );
+}
+
+/// Like the bad-path test: a 501 must not take the half-open probe slot.
+#[tokio::test]
+async fn upgrade_does_not_consume_half_open_probe() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "{s}"); // breaker opens
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await; // cooldown (1s) elapsed
+    let (s, _) = raw_get_with(&h, "/probe/x", Some(&token), WS).await;
+    assert!(s.contains(" 501"), "{s}");
     let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
     assert!(s.contains(" 502"), "probe slot was consumed: {s}");
 }

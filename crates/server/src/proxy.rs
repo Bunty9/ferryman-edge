@@ -182,13 +182,44 @@ fn error_chain<'a>(
     std::iter::successors(Some(e), |c| c.source())
 }
 
-/// Handle a single inbound request. Hop-by-hop headers are already stripped
-/// by the caller (before it stamps `x-ferryman-tenant`).
+/// True for a protocol-upgrade request (`Upgrade` other than `h2c`) or CONNECT.
+///
+/// Upgrades (WebSocket etc.) need both hops spliced together, which this
+/// proxy doesn't do; say so instead of forwarding a mangled plain GET.
+/// `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
+/// like curl --http2 or Java's HttpClient send it on every plain request.
+/// HTTP/2 (extended) CONNECT arrives as method CONNECT too.
+///
+/// Must be called *before* `strip_hop_by_hop`, which removes `Upgrade`.
+pub(crate) fn wants_upgrade<B>(req: &Request<B>) -> bool {
+    req.method() == http::Method::CONNECT
+        || req
+            .headers()
+            .get(http::header::UPGRADE)
+            .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"))
+}
+
+/// Handle a single inbound request. Hop-by-hop headers are expected to be
+/// stripped by the caller (before it stamps `x-ferryman-tenant`); this entry
+/// point detects upgrades from whatever headers are still present.
 pub async fn handle(
     table: SharedTable,
     client: Client<HttpConnector, Body>,
     req: Request<Incoming>,
     peer_ip: IpAddr,
+) -> Result<Response<Body>, anyhow::Error> {
+    let upgrade = wants_upgrade(&req);
+    handle_checked(table, client, req, peer_ip, upgrade).await
+}
+
+/// `handle` with the upgrade check done by the caller, who saw the headers
+/// before they were stripped.
+pub(crate) async fn handle_checked(
+    table: SharedTable,
+    client: Client<HttpConnector, Body>,
+    req: Request<Incoming>,
+    peer_ip: IpAddr,
+    upgrade: bool,
 ) -> Result<Response<Body>, anyhow::Error> {
     let started = std::time::Instant::now();
     let snapshot = table.load();
@@ -198,6 +229,12 @@ pub async fn handle(
     // the breaker's single half-open probe, and a 400 would never report back.
     if bad_path(&path) {
         return plain(400, b"bad path");
+    }
+
+    // Also before `lookup`, for the same reason: a 501 never reports back, so
+    // it must not hold the half-open probe slot. Route-agnostic by design.
+    if upgrade {
+        return plain(501, b"protocol upgrades are not supported");
     }
 
     // Fast rejection for a declared oversized body. `forward_body` below is

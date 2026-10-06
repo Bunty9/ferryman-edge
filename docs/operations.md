@@ -110,6 +110,7 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 | `503` persists | Upstream has no 2xx `/health`, or keeps failing. Check `ferryman_upstream_alive`. |
 | `404 no route` | No prefix matches on a segment boundary (`/svc-a` does not match `/svc-abc`). |
 | `400 bad path` | Path has a `.` or `..` segment (also `%2e`). |
+| `501 protocol upgrades are not supported` | The request has an `Upgrade` header (e.g. WebSocket) other than `h2c`, or uses `CONNECT`. The proxy can't splice connections. It is checked before route lookup, so an unrouted path also gets 501, not 404. |
 | `401` with a token you believe is valid | Expired (60 s leeway), `nbf` in the future, wrong key, or `iss`/`aud` mismatch. `ferryman_auth_failures_total{reason="invalid"}` counts these. |
 | curl exits 56 / handshake failure | No client cert, or it doesn't chain to `client_ca_path`. `ferryman_tls_handshake_failures_total` counts these. |
 | Python client: `CA cert does not include key usage extension` | Root CA generated without extensions; regenerate with the current `gen-test-certs.sh`. |

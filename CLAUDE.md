@@ -53,6 +53,11 @@ SIGUSR1 reloads.
 
 - Hop-by-hop headers are stripped in `lib.rs` *before* `x-ferryman-tenant`
   is stamped; otherwise `Connection: x-ferryman-tenant` deletes it.
+- The 400 bad-path and 501 upgrade/CONNECT checks run in `proxy::handle`
+  *before* `RouteTable::lookup` (a request that returns without reporting
+  back would leak the half-open probe slot). `Upgrade` is stripped as
+  hop-by-hop, so `lib.rs` computes `proxy::wants_upgrade` before stripping
+  and passes it to `handle_checked`; `h2c` is exempt.
 - Only upstream-caused failures may call `Upstream::mark_failed`: transport
   errors, 502–504, response-body errors, and timeouts after the upload
   finished. Client-side failures (body cap, disconnect, slow upload, 408)

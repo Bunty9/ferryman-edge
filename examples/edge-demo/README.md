@@ -24,7 +24,7 @@ any fails (about 5 seconds):
 3. **Identity propagation**: the backend sees `x-ferryman-tenant` equal to the
    JWT `sub` (client-supplied values are discarded), the peer IP in
    `x-forwarded-for`, and `x-forwarded-proto: https`.
-4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected.
+4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected; a WebSocket upgrade is 501.
 5. **Bodies**: 6 MiB passes intact, 9 MiB is 413.
 6. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.
 7. **Circuit breaker + health checks**: kill a backend, watch 503 and the
@@ -100,7 +100,7 @@ edge -o /dev/null -w '%{http_code}\n' \
 #    forwarded_for is our real address although we claim 6.6.6.6
 edge -H "$AUTH" -H 'x-ferryman-tenant: admin' -H 'x-forwarded-for: 6.6.6.6' $P/orders/42
 
-# 4. routing: 404 off a segment boundary; 400 for a `..` segment
+# 4. routing: 404 off a segment boundary; 400 for a `..` segment; 501 for Upgrade
 edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/ordersX
 edge --path-as-is -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/orders/../inventory
 

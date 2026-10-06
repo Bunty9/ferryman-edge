@@ -101,7 +101,7 @@
 ## Examples
 
 - [x] `examples/edge-demo`: `edge-demo run` checks every feature
-      against the real binary (55 checks, ~4 s; CI runs both body modes).
+      against the real binary (56 checks, ~4 s; CI runs both body modes).
       Manual walkthrough and docker-compose topology (proxy + 3 backends +
       Prometheus) verified by hand 2026-09-30.
 - [x] `examples/embed-core`: ferryman-edge-core in an axum service, 8 tests.

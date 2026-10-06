@@ -130,6 +130,7 @@ Every request passes the same gates, in order:
 | `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
 | Per-tenant GCRA limit keyed by `sub` (`tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
 | No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
+| Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
 | Body ≤ 8 MiB | `413` | |
 | Client body read within 30 s (collected mode; read before route lookup) | `408` slow client, `400` body error | |
