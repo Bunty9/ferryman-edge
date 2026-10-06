@@ -7,6 +7,10 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+### Security
+- Harden dot-segment path validation (port of ferryman 0.2.3's check): more
+  encoded and alternative separator forms are rejected with 400.
+
 ### Added
 - `SECURITY.md`: supported versions and private vulnerability reporting.
 

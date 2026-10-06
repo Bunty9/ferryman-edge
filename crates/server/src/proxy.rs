@@ -116,14 +116,56 @@ fn plain(status: u16, msg: &'static [u8]) -> anyhow::Result<Response<Body>> {
         .body(text_body(Bytes::from_static(msg)))?)
 }
 
-/// `.` / `..` segments (also percent-encoded) would let `/svc-a/../svc-b`
-/// match the `/svc-a` route and then be normalised by the upstream into a
-/// different service's path. Reject rather than normalise.
-fn has_dot_segment(path: &str) -> bool {
-    path.split('/').any(|seg| {
-        let seg = seg.to_ascii_lowercase().replace("%2e", ".");
-        seg == "." || seg == ".."
-    })
+/// True if `path` could be read as a dot segment by a normalising
+/// upstream. `/`, `\`, `%2f` and `%5c` all count as separators, a `;param`
+/// suffix is ignored per piece (Tomcat), and a piece that is `.` or `..`
+/// (also `%2e`-encoded, any case) is rejected. Encoded separators inside an
+/// otherwise ordinary segment (`group%2Fproject`) are allowed. Also rejected:
+/// `%00`, `%u`/`%U` (non-standard) and double-encoded dot/slash (`%252e`,
+/// `%252f`, `%255c`). Detection only; the forwarded path is never rewritten.
+/// Not covered: overlong UTF-8 (`%c0%ae`) and Windows trailing-dot/space
+/// trimming.
+fn bad_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    let (mut start, mut i) = (0, 0);
+    while i <= b.len() {
+        let sep = match b[i..] {
+            [] => Some(0),
+            [b'/' | b'\\', ..] => Some(1),
+            [b'%', b'2', b'f' | b'F', ..] | [b'%', b'5', b'c' | b'C', ..] => Some(3),
+            [b'%', b'0', b'0', ..] | [b'%', b'u' | b'U', ..] => return true,
+            [b'%', b'2', b'5', b'2', b'e' | b'E' | b'f' | b'F', ..]
+            | [b'%', b'2', b'5', b'5', b'c' | b'C', ..] => return true,
+            _ => None,
+        };
+        match sep {
+            Some(n) => {
+                if dot_piece(&b[start..i]) {
+                    return true;
+                }
+                i += n.max(1);
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    false
+}
+
+/// `.` or `..` after dropping a `;...` suffix and decoding `%2e`.
+fn dot_piece(piece: &[u8]) -> bool {
+    let end = piece.iter().position(|&c| c == b';').unwrap_or(piece.len());
+    let b = &piece[..end];
+    let (mut i, mut dots) = (0, 0);
+    while i < b.len() {
+        match b[i..] {
+            [b'.', ..] => i += 1,
+            [b'%', b'2', b'e' | b'E', ..] => i += 3,
+            _ => return false,
+        }
+        dots += 1;
+    }
+    matches!(dots, 1 | 2)
 }
 
 /// True when a client-request failure was caused by *our* side of the
@@ -157,7 +199,9 @@ pub async fn handle(
     let snapshot = table.load();
     let path = req.uri().path().to_string();
 
-    if has_dot_segment(&path) {
+    // Must stay before `RouteTable::lookup`: lookup can admit this request as
+    // the breaker's single half-open probe, and a 400 would never report back.
+    if bad_path(&path) {
         return plain(400, b"bad path");
     }
 
@@ -375,21 +419,76 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::has_dot_segment;
+    use super::bad_path;
 
     #[test]
-    fn dot_segments_are_detected() {
-        for bad in [
+    fn dot_segments_are_rejected() {
+        for p in [
             "/svc-a/../svc-b",
             "/svc-a/./x",
             "/svc-a/%2e%2e/svc-b",
             "/svc-a/%2E/x",
+            "/api/../admin",
+            "/api/%2e%2e/admin",
+            "/api/..%2fadmin",
+            "/api/./../admin",
+            "/api/..",
+            "/api/%2E%2E/x",
+            "/api/%2e%2E/x",
+            "/api/.%2e/x",
+            "/api/..;/admin",
+            "/api/.;x/y",
+            "/api/%2e%2e;/x",
+            "/api/..%5cx",
+            "/api/..%5Cx",
+            "/api/a\\..\\b",
+            "/api/%2e/x",
             "/..",
+            "/api/a%2f..",
+            "/api/%2e%2e%2f",
+            "/api/..%00",
+            "/api/.%00.",
+            "/api/%u002e%u002e",
+            "/api/%U002e",
+            "/api/%252e%252e",
+            "/api/%252E",
+            "/api/%252f",
+            "/api/%252F",
+            "/api/%255c",
+            "/api/a%00b",
+            "/api/a%5c..",
+            "/api/a%5C..%5Cb",
         ] {
-            assert!(has_dot_segment(bad), "{bad}");
+            assert!(bad_path(p), "{p}");
         }
-        for ok in ["/svc-a/x", "/svc-a/.hidden", "/svc-a/a..b", "/"] {
-            assert!(!has_dot_segment(ok), "{ok}");
+    }
+
+    #[test]
+    fn legitimate_paths_are_allowed() {
+        for p in [
+            "/svc-a/x",
+            "/svc-a/.hidden",
+            "/svc-a/a..b",
+            "/a..b/",
+            "/.well-known/acme",
+            "/file.tar.gz",
+            "/api/v1.2/x",
+            "/",
+            "/api/...",
+            "/api/a;..",
+            "/api/%2e%2e%2e/x",
+            "/api/%41/x",
+            "/api/.a/x",
+            "/api/a%2/",
+            "/api/v4/projects/group%2Fproject",
+            "/api/queues/%2F/q",
+            "/@scope%2fpkg",
+            "/%2F",
+            "/api/%25",
+            "/api/100%25",
+            "/api/%c0%ae",
+        ] {
+            assert!(!bad_path(p), "{p}");
         }
     }
 }

@@ -680,6 +680,66 @@ async fn oversized_chunked_upload_is_413_and_does_not_trip_breaker() {
     assert_eq!(resp.status(), 200, "breaker must still be closed");
 }
 
+/// Send one raw HTTP/1.1 GET (path verbatim) and return (status line, headers+body).
+async fn raw_get(h: &Harness, path: &str, token: Option<&str>) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let auth = token
+        .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let req = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n{auth}connection: close\r\n\r\n");
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tls.read_to_end(&mut buf),
+    )
+    .await
+    .expect("proxy answered");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (status, rest) = text.split_once("\r\n").unwrap_or((&text, ""));
+    (status.to_string(), rest.to_string())
+}
+
+#[tokio::test]
+async fn dot_segment_variants_are_rejected_and_legit_paths_pass() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+
+    for p in [
+        "/svc-a/..%2fx",
+        "/svc-a/..%2Fx",
+        "/svc-a/..%5cx",
+        "/svc-a/..\\x",
+        "/svc-a/..;/x",
+        "/svc-a/.;x/y",
+        "/svc-a/%252e%252e/x",
+        "/svc-a/%252fx",
+        "/svc-a/%255cx",
+        "/svc-a/%00",
+        "/svc-a/%u002e",
+    ] {
+        let (status, _) = raw_get(&h, p, Some(&token)).await;
+        assert!(status.contains(" 400"), "{p}: {status}");
+        // auth runs first
+        let (status, _) = raw_get(&h, p, None).await;
+        assert!(status.contains(" 401"), "{p} without token: {status}");
+    }
+
+    for p in [
+        "/svc-a/group%2Fproject",
+        "/svc-a/.hidden",
+        "/svc-a/a..b",
+        "/svc-a/x;jsessionid=1",
+    ] {
+        let (status, rest) = raw_get(&h, p, Some(&token)).await;
+        assert!(status.contains(" 200"), "{p}: {status}");
+        let want = format!("x-echo-path: {p}\r\n");
+        assert!(rest.contains(&want), "{p}: {rest}");
+    }
+}
+
 /// A client that completes the mTLS handshake and then sends nothing must
 /// not hold the connection open forever (10s first-request timeout).
 #[tokio::test]
