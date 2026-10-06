@@ -188,7 +188,8 @@ fn error_chain<'a>(
 /// proxy doesn't do; say so instead of forwarding a mangled plain GET.
 /// `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
 /// like curl --http2 or Java's HttpClient send it on every plain request.
-/// HTTP/2 (extended) CONNECT arrives as method CONNECT too.
+/// Plain CONNECT (HTTP/1 or h2) is caught here; h2 extended CONNECT
+/// (`:protocol`) is refused by the h2 layer itself, which doesn't enable it.
 ///
 /// Must be called *before* `strip_hop_by_hop`, which removes `Upgrade`.
 pub(crate) fn wants_upgrade<B>(req: &Request<B>) -> bool {
@@ -451,7 +452,26 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::bad_path;
+    use super::{bad_path, wants_upgrade};
+
+    #[test]
+    fn upgrade_detection() {
+        let get = |u: Option<&str>| {
+            let mut b = http::Request::get("/");
+            if let Some(u) = u {
+                b = b.header("upgrade", u);
+            }
+            b.body(()).unwrap()
+        };
+        assert!(wants_upgrade(
+            &http::Request::connect("example.com:443").body(()).unwrap()
+        ));
+        assert!(wants_upgrade(&get(Some("h2c, websocket"))));
+        assert!(wants_upgrade(&get(Some("websocket"))));
+        assert!(!wants_upgrade(&get(Some("h2c"))));
+        assert!(!wants_upgrade(&get(Some("H2C"))));
+        assert!(!wants_upgrade(&get(None)));
+    }
 
     #[test]
     fn dot_segments_are_rejected() {

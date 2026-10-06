@@ -103,6 +103,7 @@ edge -H "$AUTH" -H 'x-ferryman-tenant: admin' -H 'x-forwarded-for: 6.6.6.6' $P/o
 # 4. routing: 404 off a segment boundary; 400 for a `..` segment; 501 for Upgrade
 edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/ordersX
 edge --path-as-is -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/orders/../inventory
+edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" -H 'Upgrade: websocket' -H 'Connection: Upgrade' $P/orders/ws
 
 # 5. bodies: 9 MiB is refused with 413
 head -c 9437184 /dev/zero | edge -o /dev/null -w '%{http_code}\n' -X POST --data-binary @- \
