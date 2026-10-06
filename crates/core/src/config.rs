@@ -185,7 +185,9 @@ impl ConfigExt {
             );
             if let Some(p) = &r.health_path {
                 anyhow::ensure!(
-                    p.starts_with('/') && !p.contains(['?', '#']),
+                    p.starts_with('/')
+                        && !p.contains(['?', '#'])
+                        && p.parse::<http::uri::PathAndQuery>().is_ok(),
                     "route {}: health_path {p:?} must start with '/' and contain no '?' or '#'",
                     r.prefix
                 );
@@ -347,7 +349,7 @@ mod tests {
 
     #[test]
     fn health_path_validation_and_mapping() {
-        for bad in ["healthz", "/h?x=1", "/h#f"] {
+        for bad in ["healthz", "/h?x=1", "/h#f", "/a b", "/a\\u0001b"] {
             let raw = base().replacen(
                 "upstream = \"http://localhost:8001\"",
                 &format!("upstream = \"http://localhost:8001\"\nhealth_path = \"{bad}\""),

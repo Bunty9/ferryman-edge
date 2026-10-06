@@ -202,8 +202,8 @@ impl RouteTable {
                 p == prefix
                     && prev.uri == up.uri
                     && prev.cooldown_secs == up.cooldown_secs
-                    && prev.health_path == up.health_path
-                    && prev.health_disabled == up.health_disabled
+                    && prev.health_path() == up.health_path()
+                    && prev.health_disabled() == up.health_disabled()
             }) {
                 *up = prev.clone();
             }
@@ -329,6 +329,29 @@ mod tests {
         off.inherit_breakers(&old);
         assert!(off.rules[0].1.health_disabled());
         assert!(off.lookup("/svc-a").is_some());
+    }
+
+    #[test]
+    fn reload_inherits_when_health_effectively_unchanged() {
+        let a = upstream(30);
+        let old = RouteTable::new(vec![("/svc-a".to_string(), a.clone())]);
+        a.mark_failed();
+        let mut explicit = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            upstream(30).with_health(Some("/health".into()), false),
+        )]);
+        explicit.inherit_breakers(&old);
+        assert!(explicit.lookup("/svc-a").is_none(), "None == Some(/health)");
+
+        let b = upstream(30).with_health(Some("/ready".into()), true);
+        let old = RouteTable::new(vec![("/svc-a".to_string(), b.clone())]);
+        b.mark_failed();
+        let mut same = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            upstream(30).with_health(Some("/ready".into()), true),
+        )]);
+        same.inherit_breakers(&old);
+        assert!(same.lookup("/svc-a").is_none(), "unchanged custom health");
     }
 
     #[test]
