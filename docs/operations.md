@@ -22,6 +22,8 @@ are resolved against the process working directory.
 | `[[routes]] prefix` | — | yes | Path prefix, matched on a segment boundary. Longest prefix wins. |
 | `[[routes]] upstream` | — | yes | `http://host:port` of the backend. Must have an authority. |
 | `[[routes]] cooldown_secs` | `default_cooldown_secs` | yes | Per-route breaker cooldown, must be ≥ 1. |
+| `[[routes]] health_path` | `/health` | yes | Path the health checker probes on this upstream. Must start with `/`, no `?` or `#`. |
+| `[[routes]] health_disabled` | `false` | yes | `true` skips active probing for this route; only requests drive its breaker. |
 
 Set `issuer` and `audience` in every non-local deployment. Without them the
 proxy accepts any token signed by the issuer key, whichever service it was
@@ -75,7 +77,8 @@ curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
 
 The upstreams in `config.toml` (`localhost:8001`, `localhost:8002`) must
 serve `GET /health` with a 2xx, or the health checker keeps their breaker
-open and requests get `503`. The proxy forwards the full path, prefix
+open and requests get `503` (set a route's `health_path`, or
+`health_disabled = true`, if the upstream has no such endpoint). The proxy forwards the full path, prefix
 included (`/svc-a/hello` reaches the upstream as `/svc-a/hello`).
 
 ## Hot reload
@@ -125,7 +128,7 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 | Symptom | Likely cause |
 | --- | --- |
 | `503 upstream unavailable` right after boot | First health probe ran before the upstream was up; the breaker closes on the next successful probe (≤ `health_interval_secs`). |
-| `503` persists | Upstream has no 2xx `/health`, or keeps failing. Check `ferryman_upstream_alive`. |
+| `503` persists | Upstream has no 2xx `/health`, or keeps failing; a failing probe keeps the breaker open. Check `ferryman_upstream_alive`, then set the route's `health_path` or `health_disabled = true`. A disabled upstream is not probed: after a trip it recovers only via the half-open request let through after `cooldown_secs`. |
 | `404 no route` | No prefix matches on a segment boundary (`/svc-a` does not match `/svc-abc`). |
 | `400 bad path` | Path has a `.` or `..` segment (also `%2e`). |
 | `501 protocol upgrades are not supported` | The request has an `Upgrade` header (e.g. WebSocket) other than `h2c`, or uses `CONNECT`. The proxy can't splice connections. It is checked before route lookup, so an unrouted path also gets 501, not 404. |

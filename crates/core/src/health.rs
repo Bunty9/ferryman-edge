@@ -7,13 +7,18 @@
 use crate::route::SharedTable;
 use std::time::Duration;
 
-/// Builds the `/health` probe URL for an upstream. `http::Uri`'s `Display`
+/// Builds the probe URL (`path`, e.g. `/health`) for an upstream. `http::Uri`'s `Display`
 /// renders an empty path as `/` (e.g. `http://localhost:8001` becomes
 /// `http://localhost:8001/`), so a naive `format!("{uri}/health")` produces
 /// a double slash. Trim any trailing `/` from the base first.
-fn health_url(uri: &http::Uri) -> String {
+fn health_url(uri: &http::Uri, path: &str) -> String {
     let base = uri.to_string();
-    format!("{}/health", base.trim_end_matches('/'))
+    format!("{}{path}", base.trim_end_matches('/'))
+}
+
+/// Upstreams with `health_disabled` are never probed; requests drive their breaker.
+fn should_probe(up: &crate::route::Upstream) -> bool {
+    !up.health_disabled()
 }
 
 /// Runs forever. Cancel by aborting the spawned task.
@@ -34,7 +39,10 @@ pub async fn health_loop(table: SharedTable, interval: Duration) {
         ticker.tick().await;
         let current = table.load_full();
         for (_, up) in &current.rules {
-            let url = health_url(&up.uri);
+            if !should_probe(up) {
+                continue;
+            }
+            let url = health_url(&up.uri, up.health_path());
             let host = up
                 .uri
                 .authority()
@@ -60,12 +68,32 @@ mod tests {
     #[test]
     fn no_double_slash_for_bare_authority() {
         let uri: http::Uri = "http://localhost:8001".parse().unwrap();
-        assert_eq!(health_url(&uri), "http://localhost:8001/health");
+        assert_eq!(health_url(&uri, "/health"), "http://localhost:8001/health");
     }
 
     #[test]
     fn preserves_non_root_path() {
         let uri: http::Uri = "http://localhost:8001/base".parse().unwrap();
-        assert_eq!(health_url(&uri), "http://localhost:8001/base/health");
+        assert_eq!(
+            health_url(&uri, "/health"),
+            "http://localhost:8001/base/health"
+        );
+    }
+
+    #[test]
+    fn custom_path() {
+        let uri: http::Uri = "http://localhost:8001/base/".parse().unwrap();
+        assert_eq!(
+            health_url(&uri, "/ready"),
+            "http://localhost:8001/base/ready"
+        );
+    }
+
+    #[test]
+    fn disabled_upstream_is_not_probed() {
+        let uri: http::Uri = "http://localhost:8001".parse().unwrap();
+        let up = crate::route::Upstream::new(uri, 30);
+        assert!(should_probe(&up));
+        assert!(!should_probe(&up.with_health(None, true)));
     }
 }

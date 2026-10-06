@@ -18,6 +18,8 @@ Both crates share one version. Format follows
   `shutdown_drain_secs`; defaults unchanged, boot-only) and per-route
   `health_path` / `health_disabled`, via new `parse_config`, `ConfigExt`,
   `Limits`, `RouteExt`, `build_table_ext`, `Upstream::with_health`.
+  `health_path` changes the probed path; `health_disabled` skips the active
+  probe (the breaker is then driven by requests only).
   `health_interval_secs = 0` is now rejected at load (it previously
   panicked the health task).
 - `ferryman_edge::serve_with` and `proxy::handle_with` take `Limits`; `serve` and

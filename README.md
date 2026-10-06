@@ -152,7 +152,8 @@ A transport error, a 502–504, or a timeout opens it — under `boxed_body` a
 timeout only counts if the client had finished uploading; after `cooldown_secs` exactly one request is let through
 as the probe. A plain `500` does not trip it, and neither does a failure
 caused by the client's own body (size cap, disconnect). The active health
-checker (`GET <upstream>/health` every `health_interval_secs`) opens and
+checker (`GET <upstream>/health` every `health_interval_secs`; per-route
+`health_path` / `health_disabled` change or skip the probe) opens and
 closes it too. A route reload keeps breaker state for rules whose prefix,
 upstream, and cooldown are unchanged.
 
