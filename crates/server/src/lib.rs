@@ -84,7 +84,11 @@ pub async fn serve_with(
     let mut http = auto::Builder::new(TokioExecutor::new());
     http.http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(Duration::from_secs(limits.first_request_timeout_secs));
+        // hyper adds this to `now()` unchecked; cap unvalidated library
+        // limits at parse_config's maximum so it cannot overflow.
+        .header_read_timeout(Duration::from_secs(
+            limits.first_request_timeout_secs.min(86_400),
+        ));
     http.http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(H2_KEEPALIVE_INTERVAL)

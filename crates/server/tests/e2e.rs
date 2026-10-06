@@ -989,6 +989,24 @@ async fn configured_first_request_timeout_closes_silent_client() {
 }
 
 #[tokio::test]
+async fn huge_first_request_timeout_does_not_panic_h1_connections() {
+    // Library callers can pass unvalidated limits; hyper adds the header
+    // read timeout to `now()` without overflow checks.
+    let mut limits = Limits::default();
+    limits.first_request_timeout_secs = u64::MAX;
+    let h = Harness::with_limits(0, limits).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let resp = h
+        .client_http1_only()
+        .get(h.url("/svc-a/hello"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("h1 connection task survived");
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
 async fn configured_cap_applies_to_chunked_uploads() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

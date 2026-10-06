@@ -11,6 +11,10 @@ Both crates share one version. Format follows
 
 ### Security
 - Harden dot-segment path validation (port of ferryman 0.2.3's check).
+  Migration: more request paths that resolve to `.` or `..` segments are now
+  answered `400 bad path` before routing. Encoded slashes inside an ordinary
+  segment are still allowed. Clients that relied on such paths reaching an
+  upstream must change.
 
 ### Added
 - Config: `[limits]` table (`max_request_body_bytes`, `request_body_timeout_secs`,
@@ -28,6 +32,10 @@ Both crates share one version. Format follows
 - `ferryman_edge::serve_with` and `proxy::handle_with` take `Limits`; `serve` and
   `handle` keep the old behaviour via `Limits::default()`. The server applies
   `[limits]` at boot.
+- The JWT public key is reloaded on SIGUSR1 (previously only read at boot, so
+  IdP key rotation needed a restart). The boot-time path is re-read, the token
+  cache is invalidated, and a bad file keeps the old key. Adds
+  `JwtVerifier::reload_key`. Single key: no overlap window.
 - `SECURITY.md`: supported versions and private vulnerability reporting.
 
 ### Changed
@@ -50,10 +58,6 @@ Both crates share one version. Format follows
   get a clear `501` instead of being silently forwarded as plain requests.
   The check runs before route lookup, so unrouted paths also get 501.
   `edge-demo` now runs 56 checks.
-- The JWT public key is reloaded on SIGUSR1 (previously only read at boot, so
-  IdP key rotation needed a restart). The boot-time path is re-read, the token
-  cache is invalidated, and a bad file keeps the old key. Adds
-  `JwtVerifier::reload_key`. Single key: no overlap window.
 
 ## [0.1.1] — 2026-09-30
 
