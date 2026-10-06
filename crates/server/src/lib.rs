@@ -61,6 +61,9 @@ pub async fn serve(
     serve_with(listener, state, Limits::default(), shutdown).await
 }
 
+/// Limits should come from `parse_config` (or satisfy its ranges): a 0
+/// timeout makes every request or connection time out immediately.
+///
 /// Accept loop. Runs until `shutdown` resolves, then stops accepting new
 /// connections, lets in-flight ones finish (bounded by
 /// `limits.shutdown_drain_secs`), and returns.

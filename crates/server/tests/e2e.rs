@@ -945,3 +945,53 @@ async fn configured_first_request_timeout_closes_silent_client() {
     assert_eq!(n, 0, "expected EOF");
     assert!(started.elapsed() < std::time::Duration::from_secs(4));
 }
+
+#[tokio::test]
+async fn configured_cap_applies_to_chunked_uploads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut limits = Limits::default();
+    limits.max_request_body_bytes = 1024;
+    let h = Harness::with_limits(0, limits).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let (mut rd, mut wr) = tokio::io::split(tls);
+
+    let head = format!(
+        "POST /svc-a/upload HTTP/1.1\r\nhost: localhost\r\n\
+         authorization: Bearer {token}\r\ntransfer-encoding: chunked\r\n\r\n"
+    );
+    // The proxy may answer and stop reading before we finish; ignore write
+    // errors from that point on.
+    let writer = tokio::spawn(async move {
+        wr.write_all(head.as_bytes()).await?;
+        let chunk = vec![b'x'; 1024];
+        let frame = format!("{:x}\r\n", chunk.len());
+        for _ in 0..2 {
+            // 2 KiB total, over the 1 KiB cap
+            wr.write_all(frame.as_bytes()).await?;
+            wr.write_all(&chunk).await?;
+            wr.write_all(b"\r\n").await?;
+        }
+        wr.write_all(b"0\r\n\r\n").await?;
+        std::io::Result::Ok(())
+    });
+
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(20), rd.read(&mut buf))
+        .await
+        .expect("proxy answered")
+        .unwrap();
+    let status_line = String::from_utf8_lossy(&buf[..n]);
+    assert!(status_line.starts_with("HTTP/1.1 413"), "{status_line}");
+    writer.abort();
+
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/hello"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must still be closed");
+}

@@ -199,7 +199,8 @@ pub async fn handle(
 }
 
 /// `handle` with explicit [`Limits`] (body cap, body-read and upstream
-/// timeouts).
+/// timeouts). Limits should come from `parse_config` (or satisfy its ranges):
+/// a 0 timeout makes every request time out immediately.
 pub async fn handle_with(
     table: SharedTable,
     client: Client<HttpConnector, Body>,
@@ -294,7 +295,11 @@ pub(crate) async fn handle_checked(
 
     // The upstream's budget starts now: round trip plus (collected mode)
     // the response body.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(limits.upstream_timeout_secs);
+    // Unvalidated library limits must not panic: fall back to ~30 years out.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(Duration::from_secs(limits.upstream_timeout_secs))
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30));
     let fwd = Request::from_parts(parts, fwd_body);
 
     // host:port, so two upstreams on one host stay distinct series.

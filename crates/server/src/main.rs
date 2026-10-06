@@ -2,7 +2,7 @@
 //!
 //! This binary is arg parsing + boot: load config, build the mTLS/JWT/route
 //! primitives, spin up background tasks (health checker, SIGUSR1 reload,
-//! rate-limiter GC), then hand off to `ferryman_edge::serve` for the
+//! rate-limiter GC), then hand off to `ferryman_edge::serve_with` for the
 //! accept loop and per-request pipeline.
 
 use arc_swap::ArcSwap;
@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Resolves on SIGTERM or SIGINT (fly.toml uses `kill_signal = "SIGINT"`,
-/// `kill_timeout = 30`) so `serve` can start its own bounded drain.
+/// `kill_timeout = 30`) so `serve_with` can start its own bounded drain.
 async fn shutdown_signal() {
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {

@@ -132,7 +132,7 @@ Every request passes the same gates, in order:
 | No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
 | Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
-| Body ≤ 8 MiB | `413` | |
+| Body ≤ 8 MiB (default; `max_request_body_bytes`) | `413` | |
 | Client body read within 30 s (collected mode; read before route lookup) | `408` slow client, `400` body error | |
 | Upstream round trip within 30 s, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
 
@@ -173,7 +173,7 @@ P4 makes three decisions worth defending in a hiring loop.
 Cargo feature `boxed_body` swaps the upstream client to
 `http_body_util::BoxBody` and streams request and response bodies. With it
 off, the proxy collects each body once into a `Full<Bytes>` before
-forwarding. Both builds enforce the 8 MiB request cap; under streaming, a
+forwarding. Both builds enforce the request body cap (8 MiB by default, configurable via `[limits]`); under streaming, a
 chunked upload with no `Content-Length` that exceeds it is cut mid-stream
 and answered `413`, without counting against the upstream's breaker.
 Streaming mode has no separate body-read deadline: a slow upload runs
