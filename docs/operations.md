@@ -36,10 +36,28 @@ CLI / environment:
 | `--metrics-bind` | `FERRYMAN_EDGE_METRICS_BIND` | `0.0.0.0:9090` |
 | — | `RUST_LOG` | `info` (JSON logs to stdout) |
 
-Fixed limits (constants in `crates/server/src`): 8 MiB request body, 30 s
-client-body read, 30 s upstream round trip, 10 s TLS handshake, 10 s to the
-first request on a new connection, 64 concurrent h2 streams per connection,
-25 s shutdown drain.
+### `[limits]`
+
+All keys are optional; the defaults are the values earlier releases
+hard-coded. **Every `[limits]` key is read at boot only**: SIGUSR1 does not
+change them, restart the process to apply a change. Invalid values (zero, or
+above the maximum) abort startup.
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `max_request_body_bytes` | `8388608` (8 MiB) | 1 to 1073741824 | Largest client request body; larger gets 413. |
+| `request_body_timeout_secs` | `30` | 1 to 86400 | Deadline for reading the client body; exceeded gets 408. |
+| `upstream_timeout_secs` | `30` | 1 to 86400 | Upstream round trip, starting once the request body is ready; exceeded gets 504. |
+| `tls_handshake_timeout_secs` | `10` | 1 to 86400 | mTLS handshake deadline. |
+| `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request; also the HTTP/1 header-read timeout. |
+| `h2_max_concurrent_streams` | `64` | at least 1 | Concurrent h2 streams per connection. In collected mode, per-connection body memory is up to this times `max_request_body_bytes`. |
+| `shutdown_drain_secs` | `25` | 1 to 86400 | How long in-flight connections get to finish after a shutdown signal. |
+
+Slowloris trade-off: `first_request_timeout_secs` (and the HTTP/1 header
+timeout it also sets) and `tls_handshake_timeout_secs` bound how long an
+unauthenticated or silent client can hold a connection slot. Raising them
+widens that window; raise them only for slow, trusted networks. Keep
+`shutdown_drain_secs` below your orchestrator's kill timeout.
 
 ## Local run
 

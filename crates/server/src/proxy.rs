@@ -16,7 +16,7 @@
 //! `lib.rs` before a request reaches `handle` — by the time we're here the
 //! caller is authenticated and within quota.
 
-use ferryman_edge_core::SharedTable;
+use ferryman_edge_core::{Limits, SharedTable};
 use http::{HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Bytes;
@@ -36,20 +36,6 @@ pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = Full<Bytes>;
 #[cfg(feature = "boxed_body")]
 pub type Body = http_body_util::combinators::BoxBody<Bytes, BoxErr>;
-
-/// Upper bound on a forwarded request body. Chosen as a round number well
-/// above any expected JSON payload for this proxy's target traffic; bump if
-/// upstreams start accepting large uploads.
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-
-/// Wall-clock budget for the upstream round trip, starting once the request
-/// body is ready to send.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Budget for receiving the client's body (collected mode). Separate from
-/// `UPSTREAM_TIMEOUT` so a slow client can't make a healthy upstream look
-/// timed out.
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -209,8 +195,20 @@ pub async fn handle(
     req: Request<Incoming>,
     peer_ip: IpAddr,
 ) -> Result<Response<Body>, anyhow::Error> {
+    handle_with(table, client, req, peer_ip, &Limits::default()).await
+}
+
+/// `handle` with explicit [`Limits`] (body cap, body-read and upstream
+/// timeouts).
+pub async fn handle_with(
+    table: SharedTable,
+    client: Client<HttpConnector, Body>,
+    req: Request<Incoming>,
+    peer_ip: IpAddr,
+    limits: &Limits,
+) -> Result<Response<Body>, anyhow::Error> {
     let upgrade = wants_upgrade(&req);
-    handle_checked(table, client, req, peer_ip, upgrade).await
+    handle_checked(table, client, req, peer_ip, upgrade, limits).await
 }
 
 /// `handle` with the upgrade check done by the caller, who saw the headers
@@ -221,7 +219,9 @@ pub(crate) async fn handle_checked(
     req: Request<Incoming>,
     peer_ip: IpAddr,
     upgrade: bool,
+    limits: &Limits,
 ) -> Result<Response<Body>, anyhow::Error> {
+    let max_body = limits.max_request_body_bytes as usize;
     let started = std::time::Instant::now();
     let snapshot = table.load();
     let path = req.uri().path().to_string();
@@ -245,7 +245,7 @@ pub(crate) async fn handle_checked(
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+        .is_some_and(|len| len > limits.max_request_body_bytes)
     {
         return plain(413, b"payload too large");
     }
@@ -256,8 +256,9 @@ pub(crate) async fn handle_checked(
     // has its own deadline so a slow uploader can't eat into (and then be
     // blamed as) the upstream's time budget.
     let (mut parts, body) = req.into_parts();
+    let body_timeout = Duration::from_secs(limits.request_body_timeout_secs);
     let (fwd_body, upload_done) =
-        match tokio::time::timeout(BODY_READ_TIMEOUT, forward_body(body)).await {
+        match tokio::time::timeout(body_timeout, forward_body(body, max_body)).await {
             Ok(Ok(b)) => b,
             Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
                 return plain(413, b"payload too large");
@@ -293,7 +294,7 @@ pub(crate) async fn handle_checked(
 
     // The upstream's budget starts now: round trip plus (collected mode)
     // the response body.
-    let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(limits.upstream_timeout_secs);
     let fwd = Request::from_parts(parts, fwd_body);
 
     // host:port, so two upstreams on one host stay distinct series.
@@ -389,8 +390,8 @@ pub(crate) async fn handle_checked(
 type UploadDone = Arc<AtomicBool>;
 
 #[cfg(not(feature = "boxed_body"))]
-async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
-    match Limited::new(body, MAX_BODY_BYTES).collect().await {
+async fn forward_body(body: Incoming, max_body: usize) -> anyhow::Result<(Body, UploadDone)> {
+    match Limited::new(body, max_body).collect().await {
         Ok(collected) => Ok((
             Full::new(collected.to_bytes()),
             Arc::new(AtomicBool::new(true)),
@@ -402,12 +403,12 @@ async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
     }
 }
 
-// A chunked upload with no Content-Length that exceeds MAX_BODY_BYTES is cut
+// A chunked upload with no Content-Length that exceeds the body cap is cut
 // mid-stream by `Limited`; `is_client_body_error` maps that to 413 (or 400
 // for a client disconnect) and keeps it off the breaker.
 #[cfg(feature = "boxed_body")]
-async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
-    let inner = Limited::new(body, MAX_BODY_BYTES);
+async fn forward_body(body: Incoming, max_body: usize) -> anyhow::Result<(Body, UploadDone)> {
+    let inner = Limited::new(body, max_body);
     // hyper never polls a body that already reports end-of-stream (e.g. a
     // GET), so seed the flag rather than waiting for a poll.
     let done: UploadDone = Arc::new(AtomicBool::new(hyper::body::Body::is_end_stream(&inner)));

@@ -8,8 +8,10 @@
 //! production. JWTs are signed with the same RSA fixture keypair
 //! `ferryman-edge-core`'s own tests use.
 
-use ferryman_edge::{reload, serve, AppState, UpstreamClient};
-use ferryman_edge_core::{build_limiter, Claims, JwtVerifier, ReloadingTls, RouteTable, Upstream};
+use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
+use ferryman_edge_core::{
+    build_limiter, Claims, JwtVerifier, Limits, ReloadingTls, RouteTable, Upstream,
+};
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -188,6 +190,9 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    if path.starts_with("/slow") {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
     let body = req.into_body().collect().await.unwrap().to_bytes();
     Ok(Response::builder()
         .header("x-echo-xff", xff)
@@ -240,6 +245,10 @@ struct Harness {
 
 impl Harness {
     async fn new(tenant_rps: u32) -> Self {
+        Self::with_limits(tenant_rps, Limits::default()).await
+    }
+
+    async fn with_limits(tenant_rps: u32, limits: Limits) -> Self {
         install_crypto_provider();
         let certs = TestCerts::generate();
         let upstream_addr = spawn_upstream().await;
@@ -257,6 +266,10 @@ impl Harness {
         let table = RouteTable::new(vec![
             (
                 "/svc-a".to_string(),
+                Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/slow".to_string(),
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
             ),
             (
@@ -283,7 +296,7 @@ impl Harness {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, state, std::future::pending()));
+        tokio::spawn(serve_with(listener, state, limits, std::future::pending()));
 
         Self {
             certs,
@@ -877,4 +890,58 @@ async fn tls_hot_reload_swaps_the_cert() {
     let after = fetch_peer_leaf_der(h.proxy_addr, &h.certs).await;
 
     assert_ne!(before, after);
+}
+
+// ----- configurable [limits] -------------------------------------------------
+
+#[tokio::test]
+async fn configured_body_cap_is_enforced() {
+    let mut limits = Limits::default();
+    limits.max_request_body_bytes = 1024;
+    let h = Harness::with_limits(0, limits).await;
+    let client = h.client();
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let post = |n: usize| {
+        client
+            .post(h.url("/svc-a/echo"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(vec![b'z'; n])
+            .send()
+    };
+    assert_eq!(post(1024).await.unwrap().status(), 200);
+    assert_eq!(post(2048).await.unwrap().status(), 413);
+}
+
+#[tokio::test]
+async fn configured_upstream_timeout_gives_504() {
+    let mut limits = Limits::default();
+    limits.upstream_timeout_secs = 1;
+    let h = Harness::with_limits(0, limits).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let resp = h
+        .client()
+        .get(h.url("/slow/x"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504);
+}
+
+#[tokio::test]
+async fn configured_first_request_timeout_closes_silent_client() {
+    use tokio::io::AsyncReadExt;
+
+    let mut limits = Limits::default();
+    limits.first_request_timeout_secs = 1;
+    let h = Harness::with_limits(0, limits).await;
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut buf))
+        .await
+        .expect("server closed the idle connection")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF");
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
 }

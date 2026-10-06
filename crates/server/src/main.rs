@@ -7,7 +7,7 @@
 
 use arc_swap::ArcSwap;
 use clap::Parser;
-use ferryman_edge::{reload, serve, AppState, UpstreamClient};
+use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
 use ferryman_edge_core::{
     build_limiter, build_table_ext, health_loop, parse_config, spawn_gc, JwtVerifier, Limiter,
     ReloadingTls, SharedTable,
@@ -68,7 +68,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let raw = std::fs::read_to_string(&args.config)?;
-    // Limits are validated here; applying them is wired separately.
     let (cfg, ext) = parse_config(&raw)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
 
@@ -131,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, "ferryman-edge-server listening (mTLS)");
 
-    serve(listener, state, shutdown_signal()).await;
+    serve_with(listener, state, ext.limits.clone(), shutdown_signal()).await;
     Ok(())
 }
 

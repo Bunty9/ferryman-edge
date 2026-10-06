@@ -17,7 +17,7 @@
 pub mod proxy;
 pub mod reload;
 
-use ferryman_edge_core::{check, Claims, JwtVerifier, Limiter, ReloadingTls, SharedTable};
+use ferryman_edge_core::{check, Claims, JwtVerifier, Limiter, Limits, ReloadingTls, SharedTable};
 use http::{HeaderValue, Request, Response};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -49,34 +49,43 @@ pub struct AppState {
     pub client: UpstreamClient,
 }
 
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(25);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
-/// Each stream may buffer up to `proxy::MAX_BODY_BYTES` in collected mode,
-/// so this bounds per-connection body memory (64 × 8 MiB).
-// ponytail: per-connection bound only; add a global in-flight-bytes
-// semaphore if many clients trickling large bodies becomes a real threat.
-const H2_MAX_CONCURRENT_STREAMS: u32 = 64;
 
-/// Accept loop. Runs until `shutdown` resolves, then stops accepting new
-/// connections, lets in-flight ones finish (bounded by `SHUTDOWN_DRAIN`),
-/// and returns.
+/// [`serve_with`] using [`Limits::default`].
 pub async fn serve(
     listener: TcpListener,
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()>,
 ) {
+    serve_with(listener, state, Limits::default(), shutdown).await
+}
+
+/// Accept loop. Runs until `shutdown` resolves, then stops accepting new
+/// connections, lets in-flight ones finish (bounded by
+/// `limits.shutdown_drain_secs`), and returns.
+///
+/// Each h2 stream may buffer up to `limits.max_request_body_bytes` in
+/// collected mode, so `h2_max_concurrent_streams` bounds per-connection body
+/// memory.
+// ponytail: per-connection bound only; add a global in-flight-bytes
+// semaphore if many clients trickling large bodies becomes a real threat.
+pub async fn serve_with(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    limits: Limits,
+    shutdown: impl Future<Output = ()>,
+) {
+    let limits = Arc::new(limits);
     let graceful = GracefulShutdown::new();
     let mut http = auto::Builder::new(TokioExecutor::new());
     http.http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT);
+        .header_read_timeout(Duration::from_secs(limits.first_request_timeout_secs));
     http.http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
-        .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+        .max_concurrent_streams(limits.h2_max_concurrent_streams);
 
     tokio::pin!(shutdown);
     loop {
@@ -88,8 +97,9 @@ pub async fn serve(
                         let state = state.clone();
                         let http = http.clone();
                         let watcher = graceful.watcher();
+                        let limits = limits.clone();
                         tokio::spawn(async move {
-                            handle_conn(stream, peer, state, http, watcher).await;
+                            handle_conn(stream, peer, state, http, watcher, limits).await;
                         });
                     }
                     Err(e) => {
@@ -106,7 +116,7 @@ pub async fn serve(
     tracing::info!("shutdown signal received; draining connections");
     tokio::select! {
         _ = graceful.shutdown() => tracing::info!("all connections drained"),
-        _ = tokio::time::sleep(SHUTDOWN_DRAIN) => {
+        _ = tokio::time::sleep(Duration::from_secs(limits.shutdown_drain_secs)) => {
             tracing::warn!("graceful shutdown timed out; dropping remaining connections");
         }
     }
@@ -118,23 +128,24 @@ async fn handle_conn(
     state: Arc<AppState>,
     http: auto::Builder<TokioExecutor>,
     watcher: Watcher,
+    limits: Arc<Limits>,
 ) {
     let acceptor = TlsAcceptor::from(state.tls.current());
     let started = Instant::now();
-    let tls_stream =
-        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                metrics::counter!("ferryman_tls_handshake_failures_total").increment(1);
-                tracing::debug!(?peer, ?e, "tls handshake failed");
-                return;
-            }
-            Err(_) => {
-                metrics::counter!("ferryman_tls_handshake_failures_total").increment(1);
-                tracing::debug!(?peer, "tls handshake timed out");
-                return;
-            }
-        };
+    let handshake_timeout = Duration::from_secs(limits.tls_handshake_timeout_secs);
+    let tls_stream = match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            metrics::counter!("ferryman_tls_handshake_failures_total").increment(1);
+            tracing::debug!(?peer, ?e, "tls handshake failed");
+            return;
+        }
+        Err(_) => {
+            metrics::counter!("ferryman_tls_handshake_failures_total").increment(1);
+            tracing::debug!(?peer, "tls handshake timed out");
+            return;
+        }
+    };
     metrics::histogram!("ferryman_tls_handshake_seconds").record(started.elapsed().as_secs_f64());
 
     // ALPN already decided the protocol. Pinning it skips the auto
@@ -148,10 +159,12 @@ async fn handle_conn(
     let io = TokioIo::new(tls_stream);
     let seen_request = Arc::new(AtomicBool::new(false));
     let seen = seen_request.clone();
+    let first_request_timeout = Duration::from_secs(limits.first_request_timeout_secs);
     let svc = service_fn(move |req| {
         seen.store(true, Ordering::Release);
         let state = state.clone();
-        async move { Ok::<_, Infallible>(route_request(state, req, peer).await) }
+        let limits = limits.clone();
+        async move { Ok::<_, Infallible>(route_request(state, req, peer, &limits).await) }
     });
 
     let conn = watcher.watch(http.serve_connection(io, svc).into_owned());
@@ -159,7 +172,7 @@ async fn handle_conn(
     // keep-alive pings, which only start after it, have a timer; a client
     // that completes TLS and then goes silent would hold the connection
     // forever. Drop it if no request arrives in time.
-    let first_request = tokio::time::sleep(HEADER_READ_TIMEOUT);
+    let first_request = tokio::time::sleep(first_request_timeout);
     tokio::pin!(conn, first_request);
     let result = tokio::select! {
         r = &mut conn => r,
@@ -181,6 +194,7 @@ async fn route_request(
     state: Arc<AppState>,
     mut req: Request<Incoming>,
     peer: SocketAddr,
+    limits: &Limits,
 ) -> Response<proxy::Body> {
     let claims = match authenticate(&state.jwt, &req).await {
         Ok(c) => c,
@@ -219,6 +233,7 @@ async fn route_request(
         req,
         peer.ip(),
         upgrade,
+        limits,
     )
     .await
     {

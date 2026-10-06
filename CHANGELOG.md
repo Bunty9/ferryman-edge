@@ -20,6 +20,9 @@ Both crates share one version. Format follows
   `Limits`, `RouteExt`, `build_table_ext`, `Upstream::with_health`.
   `health_interval_secs = 0` is now rejected at load (it previously
   panicked the health task).
+- `ferryman_edge::serve_with` and `proxy::handle_with` take `Limits`; `serve` and
+  `handle` keep the old behaviour via `Limits::default()`. The server applies
+  `[limits]` at boot.
 - `SECURITY.md`: supported versions and private vulnerability reporting.
 
 ### Changed
