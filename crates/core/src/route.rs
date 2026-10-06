@@ -56,6 +56,8 @@ pub struct Upstream {
     state: Arc<AtomicU8>,
     last_transition_unix: Arc<AtomicU64>,
     pub cooldown_secs: u64,
+    health_path: Option<String>,
+    health_disabled: bool,
 }
 
 impl Upstream {
@@ -65,7 +67,27 @@ impl Upstream {
             state: Arc::new(AtomicU8::new(CLOSED)),
             last_transition_unix: Arc::new(AtomicU64::new(0)),
             cooldown_secs,
+            health_path: None,
+            health_disabled: false,
         }
+    }
+
+    /// Set the health-probe path (`None` = `/health`) and whether probing
+    /// is disabled for this upstream.
+    pub fn with_health(mut self, path: Option<String>, disabled: bool) -> Self {
+        self.health_path = path;
+        self.health_disabled = disabled;
+        self
+    }
+
+    /// Health-probe path, `/health` unless configured.
+    pub fn health_path(&self) -> &str {
+        self.health_path.as_deref().unwrap_or("/health")
+    }
+
+    /// Whether active health probing is disabled for this upstream.
+    pub fn health_disabled(&self) -> bool {
+        self.health_disabled
     }
 
     /// Whether this upstream should receive the current request. Closed is
@@ -170,14 +192,18 @@ impl RouteTable {
     }
 
     /// Carry circuit-breaker state across a reload: every rule whose prefix,
-    /// upstream URI, and cooldown are unchanged reuses the old `Upstream`
+    /// upstream URI, cooldown, and health settings are unchanged reuses the old `Upstream`
     /// (and so its shared breaker atomics). Without this a SIGUSR1 during an
     /// incident would reset every breaker to Closed and send full traffic at
     /// dead backends.
     pub fn inherit_breakers(&mut self, old: &RouteTable) {
         for (prefix, up) in &mut self.rules {
             if let Some((_, prev)) = old.rules.iter().find(|(p, prev)| {
-                p == prefix && prev.uri == up.uri && prev.cooldown_secs == up.cooldown_secs
+                p == prefix
+                    && prev.uri == up.uri
+                    && prev.cooldown_secs == up.cooldown_secs
+                    && prev.health_path() == up.health_path()
+                    && prev.health_disabled() == up.health_disabled()
             }) {
                 *up = prev.clone();
             }
@@ -277,6 +303,55 @@ mod tests {
             moved.lookup("/svc-a").is_some(),
             "new upstream starts closed"
         );
+    }
+
+    #[test]
+    fn reload_does_not_inherit_across_changed_health_settings() {
+        let a = upstream(30);
+        let old = RouteTable::new(vec![("/svc-a".to_string(), a.clone())]);
+        a.mark_failed();
+
+        let mut changed = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            upstream(30).with_health(Some("/ready".into()), false),
+        )]);
+        changed.inherit_breakers(&old);
+        assert!(
+            changed.lookup("/svc-a").is_some(),
+            "changed rule starts closed"
+        );
+        assert_eq!(changed.rules[0].1.health_path(), "/ready");
+
+        let mut off = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            upstream(30).with_health(None, true),
+        )]);
+        off.inherit_breakers(&old);
+        assert!(off.rules[0].1.health_disabled());
+        assert!(off.lookup("/svc-a").is_some());
+    }
+
+    #[test]
+    fn reload_inherits_when_health_effectively_unchanged() {
+        let a = upstream(30);
+        let old = RouteTable::new(vec![("/svc-a".to_string(), a.clone())]);
+        a.mark_failed();
+        let mut explicit = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            upstream(30).with_health(Some("/health".into()), false),
+        )]);
+        explicit.inherit_breakers(&old);
+        assert!(explicit.lookup("/svc-a").is_none(), "None == Some(/health)");
+
+        let b = upstream(30).with_health(Some("/ready".into()), true);
+        let old = RouteTable::new(vec![("/svc-a".to_string(), b.clone())]);
+        b.mark_failed();
+        let mut same = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            upstream(30).with_health(Some("/ready".into()), true),
+        )]);
+        same.inherit_breakers(&old);
+        assert!(same.lookup("/svc-a").is_none(), "unchanged custom health");
     }
 
     #[test]

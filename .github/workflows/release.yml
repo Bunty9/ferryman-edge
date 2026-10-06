@@ -5,67 +5,196 @@ name: release
 # crates.io token that lives 30 minutes and is revoked when the job ends.
 # No long-lived CARGO_REGISTRY_TOKEN secret exists anywhere.
 #
-# crates.io side (per crate, Settings → Trusted Publishing): owner Bunty9,
+# crates.io side (per crate, Settings -> Trusted Publishing): owner Bunty9,
 # repository ferryman-edge, workflow release.yml, environment release.
 # GitHub side: environment "release" only accepts tags matching v*.
+# Renaming this file or the environment breaks publishing.
 #
 # Cut a release: bump [workspace.package] version (and server's
 # ferryman-edge-core dependency), move CHANGELOG entries under the new
 # version, merge to main, then `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
+#
+# Jobs: verify -> attest -> publish -> release. The only job with
+# `contents: write` (release) never holds an OIDC token, and the jobs that
+# hold `id-token: write` (attest, publish) never run cargo with write scope
+# over the repo. There is deliberately no workflow_dispatch trigger: a manual
+# run has no tag to verify and nothing to dry-run, and an unintended manual
+# run must never be able to reach the publish job.
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  # Runs cargo (build scripts, proc macros, tests = arbitrary third-party
+  # code), so it only gets `contents: read` and no persisted credentials.
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Tag matches the workspace version
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+
+      - name: Tag points at a commit on main
         run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME (commit $GITHUB_SHA) is not an ancestor of origin/main"
+            exit 1
+          fi
+
+      - name: Tag matches the workspace version, CHANGELOG has a section
+        run: |
+          set -euo pipefail
           version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "ferryman-edge-core") | .version')
-          [ "v$version" = "$GITHUB_REF_NAME" ] || {
-            echo "tag $GITHUB_REF_NAME does not match workspace version $version"; exit 1; }
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
           grep -q "^## \[$version\]" CHANGELOG.md || {
-            echo "CHANGELOG.md has no section for $version"; exit 1; }
-      - name: Tests (both body modes)
-        run: |
-          cargo test --workspace
-          cargo test --workspace --features ferryman-edge/boxed_body
-      - name: Package and verify
-        run: cargo publish --workspace --dry-run
-
-  publish:
-    needs: verify
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      id-token: write   # OIDC token for crates.io Trusted Publishing
-      contents: write   # create the GitHub release
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-      - name: Publish ferryman-edge-core, then ferryman-edge
-        run: cargo publish --workspace
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: GitHub release from the CHANGELOG section
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version="${GITHUB_REF_NAME#v}"
+            echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          # Notes are extracted here, before anything irreversible, and
+          # reused by the release job.
           awk -v v="$version" '
             $0 ~ "^## \\[" v "\\]" { on = 1; next }
             on && /^## \[/ { exit }
             on && /^\[.*\]: / { exit }
             on { print }
-          ' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+          ' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || {
+            echo "::error::CHANGELOG section for $version is empty"; exit 1; }
+
+      - name: Tests (both body modes)
+        run: |
+          set -euo pipefail
+          cargo test --workspace --locked
+          cargo test --workspace --locked --features ferryman-edge/boxed_body
+
+      # Packages and builds each crate in isolation (server resolved against
+      # core through a temporary registry), like `cargo publish --dry-run`.
+      # Explicit -p: --workspace would also package the publish = false examples.
+      - name: Package both crates
+        run: cargo package -p ferryman-edge-core -p ferryman-edge --locked
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crates
+          path: target/package/*.crate
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  # Build provenance for the packaged .crate files. The only job (with
+  # publish) holding `id-token: write`; it checks out nothing and runs no
+  # cargo or repo code. `publish` needs it, so nothing irreversible happens
+  # unless attestation succeeded. cargo publish re-packages from the same
+  # commit; the attested file is the one verify built, which is what a
+  # reviewer can compare against the crates.io download.
+  attest:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crates
+          path: dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.crate
+
+  # `id-token: write` mints the crates.io token; `contents: read` only,
+  # because cargo publish runs dependency build scripts. Idempotent: a crate
+  # whose exact version is already on crates.io is skipped, so re-running
+  # after a partial failure resumes instead of failing on "already exists".
+  # Any other API answer (429, 5xx, ...) fails the job rather than guessing.
+  # --no-verify: verify already packaged and built this exact commit with
+  # --locked, and skipping the rebuild keeps dependency build scripts out of
+  # the job that holds the crates.io token.
+  publish:
+    needs: [verify, attest]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write   # OIDC token for crates.io Trusted Publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish ferryman-edge-core, then ferryman-edge (idempotent)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "ferryman-edge-core") | .version')
+          # ferryman-edge depends on ferryman-edge-core: core goes first.
+          for crate in ferryman-edge-core ferryman-edge; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "ferryman-edge-release (github.com/Bunty9/ferryman-edge)" \
+              "https://crates.io/api/v1/crates/${crate}/${version}")
+            case "$code" in
+              200) echo "$crate $version is already on crates.io, skipping" ;;
+              404)
+                echo "publishing $crate $version"
+                cargo publish -p "$crate" --locked --no-verify ;;
+              *)
+                echo "::error::crates.io returned HTTP $code for $crate $version"
+                exit 1 ;;
+            esac
+          done
+
+  # Creates (or, on a re-run, updates) the GitHub release. No checkout, no
+  # cargo, no repo code; the only job with `contents: write`.
+  release:
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-notes
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crates
+          path: dist
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists, uploading assets"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/*.crate
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --notes-file release-notes.md dist/*.crate
+          fi

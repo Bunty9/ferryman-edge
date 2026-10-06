@@ -16,12 +16,14 @@ are resolved against the process working directory.
 | `[tls] cert_path` | — | yes | Server certificate chain, PEM (leaf first, then intermediates). |
 | `[tls] key_path` | — | yes | Server private key, PEM (PKCS#8, PKCS#1 or SEC1). |
 | `[tls] client_ca_path` | — | yes | Client CA bundle, PEM. Every client cert must chain to one of these. |
-| `[jwt] jwks_path` | — | no | RSA public key, PEM, used for RS256 verification. |
+| `[jwt] jwks_path` | — | yes (contents) | RSA public key, PEM, used for RS256 verification. The path itself is read at boot; SIGUSR1 re-reads the file at that path. |
 | `[jwt] issuer` | unset | no | Required `iss`. Unset = not checked. |
 | `[jwt] audience` | unset | no | Required `aud`. Unset = not checked; tokens carrying any `aud` are then rejected. |
-| `[[routes]] prefix` | — | yes | Path prefix, matched on a segment boundary. Longest prefix wins. |
+| `[[routes]] prefix` | — | yes | Path prefix, matched on a segment boundary. Longest prefix wins; if two rules have the same prefix, the first one wins lookup and its `health_path` / `health_disabled` apply. Prefixes match the raw, undecoded request path and are not access control: every route shares the same mTLS + JWT + rate-limit policy, so do not rely on prefixes to separate privileges (normalised matching is planned before any per-route policy). |
 | `[[routes]] upstream` | — | yes | `http://host:port` of the backend. Must have an authority. |
 | `[[routes]] cooldown_secs` | `default_cooldown_secs` | yes | Per-route breaker cooldown, must be ≥ 1. |
+| `[[routes]] health_path` | `/health` | yes | Path the health checker probes on this upstream. Must start with `/`, no `?` or `#`. |
+| `[[routes]] health_disabled` | `false` | yes | `true` skips active probing for this route; only requests drive its breaker. |
 
 Set `issuer` and `audience` in every non-local deployment. Without them the
 proxy accepts any token signed by the issuer key, whichever service it was
@@ -36,10 +38,31 @@ CLI / environment:
 | `--metrics-bind` | `FERRYMAN_EDGE_METRICS_BIND` | `0.0.0.0:9090` |
 | — | `RUST_LOG` | `info` (JSON logs to stdout) |
 
-Fixed limits (constants in `crates/server/src`): 8 MiB request body, 30 s
-client-body read, 30 s upstream round trip, 10 s TLS handshake, 10 s to the
-first request on a new connection, 64 concurrent h2 streams per connection,
-25 s shutdown drain.
+### `[limits]`
+
+All keys are optional; the defaults are the values earlier releases
+hard-coded. **Every `[limits]` key is read at boot only**: SIGUSR1 does not
+change them, restart the process to apply a change. Invalid values (zero, or
+above the maximum) abort startup. On SIGUSR1 an invalid `[limits]` value (or
+`health_interval_secs = 0`) makes the whole route reload fail, keeping the
+old table; a valid but changed `[limits]` value is silently ignored until
+restart (no log line).
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `max_request_body_bytes` | `8388608` (8 MiB) | 1 to 1073741824 | Largest client request body; larger gets 413. |
+| `request_body_timeout_secs` | `30` | 1 to 86400 | Deadline for reading the client body; exceeded gets 408. Collected (default) mode only; under `boxed_body` the upload runs inside `upstream_timeout_secs`. |
+| `upstream_timeout_secs` | `30` | 1 to 86400 | Upstream round trip, starting once the request body is ready; exceeded gets 504. |
+| `tls_handshake_timeout_secs` | `10` | 1 to 86400 | mTLS handshake deadline. |
+| `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request; also the HTTP/1 header-read timeout. |
+| `h2_max_concurrent_streams` | `64` | at least 1 | Concurrent h2 streams per connection. In collected mode, per-connection body memory is up to this times `max_request_body_bytes`. |
+| `shutdown_drain_secs` | `25` | 1 to 86400 | How long in-flight connections get to finish after a shutdown signal. |
+
+Slowloris trade-off: `first_request_timeout_secs` (and the HTTP/1 header
+timeout it also sets) and `tls_handshake_timeout_secs` bound how long an
+unauthenticated or silent client can hold a connection slot. Raising them
+widens that window; raise them only for slow, trusted networks. Keep
+`shutdown_drain_secs` below your orchestrator's kill timeout.
 
 ## Local run
 
@@ -57,8 +80,10 @@ curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
 
 The upstreams in `config.toml` (`localhost:8001`, `localhost:8002`) must
 serve `GET /health` with a 2xx, or the health checker keeps their breaker
-open and requests get `503`. The proxy forwards the full path, prefix
-included (`/svc-a/hello` reaches the upstream as `/svc-a/hello`).
+open and requests get `503` (set a route's `health_path`, or
+`health_disabled = true`, if the upstream has no such endpoint). The proxy
+forwards the full path, prefix included (`/svc-a/hello` reaches the
+upstream as `/svc-a/hello`).
 
 ## Hot reload
 
@@ -71,10 +96,21 @@ that fails to parse or load keeps the old config and logs
 `mTLS reload failed; keeping old` or `route reload failed; keeping old
 table` with the cause. Live connections keep the TLS config they
 handshook with; new connections get the new one. Breaker state carries
-over for routes whose prefix, upstream and cooldown did not change.
+over for routes whose prefix, upstream, cooldown and health settings
+(`health_path` / `health_disabled`, compared by effective value) did not
+change.
 
-Not reloaded: the JWT key and claims settings, `tenant_rps`,
-`health_interval_secs`, bind addresses. Restart for those.
+The JWT public key reloads too (`JWT key reloaded` / `JWT key reload
+failed; keeping old key`). A successful reload clears the verification
+cache. There is a single key and no overlap window: tokens signed by the
+old key are rejected immediately after the reload, so rotate at the IdP
+accordingly (switch signing, then replace the file and signal).
+
+Not reloaded: the JWT `issuer` / `audience`, `tenant_rps`,
+`health_interval_secs`, every `[limits]` key, bind addresses. Restart for
+those. An invalid `[limits]` value (or `health_interval_secs = 0`) in the
+file fails the whole route reload (old table kept); a valid but changed
+`[limits]` value is ignored without a log line.
 
 Use `pidof`, not `pgrep -x`: the binary name is longer than the 15-char
 kernel `comm`, so `pgrep -x ferryman-edge-server` never matches.
@@ -82,7 +118,7 @@ kernel `comm`, so `pgrep -x ferryman-edge-server` never matches.
 ## Shutdown
 
 SIGTERM or SIGINT stops accepting, lets in-flight connections finish for up
-to 25 s, then exits. `fly.toml` sends SIGINT with a 30 s kill timeout.
+to 25 s by default (`shutdown_drain_secs`), then exits. `fly.toml` sends SIGINT with a 30 s kill timeout.
 
 ## Metrics
 
@@ -98,7 +134,7 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 | `ferryman_tls_handshake_seconds` | summary | — |
 | `ferryman_tls_handshake_failures_total` | counter | — |
 | `ferryman_circuit_state` | gauge | `upstream`; 0 closed, 1 open, 2 half-open |
-| `ferryman_upstream_alive` | gauge | `upstream`; last health probe result |
+| `ferryman_upstream_alive` | gauge | `upstream`; last health probe result. Absent for `health_disabled` routes; a value set before a reload that disables probing persists until restart, so exclude disabled upstreams from alerts on it |
 
 `upstream` is `host:port`.
 
@@ -107,9 +143,10 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 | Symptom | Likely cause |
 | --- | --- |
 | `503 upstream unavailable` right after boot | First health probe ran before the upstream was up; the breaker closes on the next successful probe (≤ `health_interval_secs`). |
-| `503` persists | Upstream has no 2xx `/health`, or keeps failing. Check `ferryman_upstream_alive`. |
+| `503` persists | Upstream has no 2xx `/health`, or keeps failing; a failing probe keeps the breaker open. Check `ferryman_upstream_alive`, then set the route's `health_path` or `health_disabled = true`. A disabled upstream is not probed: after a trip it recovers only via the half-open request let through after `cooldown_secs`. |
 | `404 no route` | No prefix matches on a segment boundary (`/svc-a` does not match `/svc-abc`). |
 | `400 bad path` | Path has a `.` or `..` segment (also `%2e`). |
+| `501 protocol upgrades are not supported` | The request has an `Upgrade` header (e.g. WebSocket) other than `h2c`, or uses `CONNECT`. The proxy can't splice connections. It is checked before route lookup, so an unrouted path also gets 501, not 404. |
 | `401` with a token you believe is valid | Expired (60 s leeway), `nbf` in the future, wrong key, or `iss`/`aud` mismatch. `ferryman_auth_failures_total{reason="invalid"}` counts these. |
 | curl exits 56 / handshake failure | No client cert, or it doesn't chain to `client_ca_path`. `ferryman_tls_handshake_failures_total` counts these. |
 | Python client: `CA cert does not include key usage extension` | Root CA generated without extensions; regenerate with the current `gen-test-certs.sh`. |

@@ -16,7 +16,7 @@
 //! `lib.rs` before a request reaches `handle` — by the time we're here the
 //! caller is authenticated and within quota.
 
-use ferryman_edge_core::SharedTable;
+use ferryman_edge_core::{Limits, SharedTable};
 use http::{HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Bytes;
@@ -36,20 +36,6 @@ pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = Full<Bytes>;
 #[cfg(feature = "boxed_body")]
 pub type Body = http_body_util::combinators::BoxBody<Bytes, BoxErr>;
-
-/// Upper bound on a forwarded request body. Chosen as a round number well
-/// above any expected JSON payload for this proxy's target traffic; bump if
-/// upstreams start accepting large uploads.
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-
-/// Wall-clock budget for the upstream round trip, starting once the request
-/// body is ready to send.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Budget for receiving the client's body (collected mode). Separate from
-/// `UPSTREAM_TIMEOUT` so a slow client can't make a healthy upstream look
-/// timed out.
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -116,14 +102,51 @@ fn plain(status: u16, msg: &'static [u8]) -> anyhow::Result<Response<Body>> {
         .body(text_body(Bytes::from_static(msg)))?)
 }
 
-/// `.` / `..` segments (also percent-encoded) would let `/svc-a/../svc-b`
-/// match the `/svc-a` route and then be normalised by the upstream into a
-/// different service's path. Reject rather than normalise.
-fn has_dot_segment(path: &str) -> bool {
-    path.split('/').any(|seg| {
-        let seg = seg.to_ascii_lowercase().replace("%2e", ".");
-        seg == "." || seg == ".."
-    })
+/// True if `path` could be read as a dot segment (`.`/`..`) by a normalising
+/// upstream, under the variants exercised by the tests
+/// below. Detection only; the forwarded path is never rewritten.
+fn bad_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    let (mut start, mut i) = (0, 0);
+    while i <= b.len() {
+        let sep = match b[i..] {
+            [] => Some(0),
+            [b'/' | b'\\', ..] => Some(1),
+            [b'%', b'2', b'f' | b'F', ..] | [b'%', b'5', b'c' | b'C', ..] => Some(3),
+            [b'%', b'0', b'0', ..] | [b'%', b'u' | b'U', ..] => return true,
+            [b'%', b'2', b'5', b'2', b'e' | b'E' | b'f' | b'F', ..]
+            | [b'%', b'2', b'5', b'5', b'c' | b'C', ..] => return true,
+            _ => None,
+        };
+        match sep {
+            Some(n) => {
+                if dot_piece(&b[start..i]) {
+                    return true;
+                }
+                i += n.max(1);
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    false
+}
+
+/// `.` or `..` once parameters and encodings handled by `bad_path` are
+/// accounted for.
+fn dot_piece(piece: &[u8]) -> bool {
+    let end = piece.iter().position(|&c| c == b';').unwrap_or(piece.len());
+    let b = &piece[..end];
+    let (mut i, mut dots) = (0, 0);
+    while i < b.len() {
+        match b[i..] {
+            [b'.', ..] => i += 1,
+            [b'%', b'2', b'e' | b'E', ..] => i += 3,
+            _ => return false,
+        }
+        dots += 1;
+    }
+    matches!(dots, 1 | 2)
 }
 
 /// True when a client-request failure was caused by *our* side of the
@@ -145,20 +168,75 @@ fn error_chain<'a>(
     std::iter::successors(Some(e), |c| c.source())
 }
 
-/// Handle a single inbound request. Hop-by-hop headers are already stripped
-/// by the caller (before it stamps `x-ferryman-tenant`).
+/// True for a protocol-upgrade request (`Upgrade` other than `h2c`) or CONNECT.
+///
+/// Upgrades (WebSocket etc.) need both hops spliced together, which this
+/// proxy doesn't do; say so instead of forwarding a mangled plain GET.
+/// `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
+/// like curl --http2 or Java's HttpClient send it on every plain request.
+/// Plain CONNECT (HTTP/1 or h2) is caught here; h2 extended CONNECT
+/// (`:protocol`) is refused by the h2 layer itself, which doesn't enable it.
+///
+/// Must be called *before* `strip_hop_by_hop`, which removes `Upgrade`.
+pub(crate) fn wants_upgrade<B>(req: &Request<B>) -> bool {
+    req.method() == http::Method::CONNECT
+        || req
+            .headers()
+            .get(http::header::UPGRADE)
+            .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"))
+}
+
+/// Handle a single inbound request. Hop-by-hop headers are expected to be
+/// stripped by the caller (before it stamps `x-ferryman-tenant`); this entry
+/// point detects upgrades from whatever headers are still present.
 pub async fn handle(
     table: SharedTable,
     client: Client<HttpConnector, Body>,
     req: Request<Incoming>,
     peer_ip: IpAddr,
 ) -> Result<Response<Body>, anyhow::Error> {
+    handle_with(table, client, req, peer_ip, &Limits::default()).await
+}
+
+/// `handle` with explicit [`Limits`] (body cap, body-read and upstream
+/// timeouts). Limits should come from `parse_config` (or satisfy its ranges):
+/// a 0 timeout makes every request time out immediately.
+pub async fn handle_with(
+    table: SharedTable,
+    client: Client<HttpConnector, Body>,
+    req: Request<Incoming>,
+    peer_ip: IpAddr,
+    limits: &Limits,
+) -> Result<Response<Body>, anyhow::Error> {
+    let upgrade = wants_upgrade(&req);
+    handle_checked(table, client, req, peer_ip, upgrade, limits).await
+}
+
+/// `handle` with the upgrade check done by the caller, who saw the headers
+/// before they were stripped.
+pub(crate) async fn handle_checked(
+    table: SharedTable,
+    client: Client<HttpConnector, Body>,
+    req: Request<Incoming>,
+    peer_ip: IpAddr,
+    upgrade: bool,
+    limits: &Limits,
+) -> Result<Response<Body>, anyhow::Error> {
+    let max_body = limits.max_request_body_bytes as usize;
     let started = std::time::Instant::now();
     let snapshot = table.load();
     let path = req.uri().path().to_string();
 
-    if has_dot_segment(&path) {
+    // Must stay before `RouteTable::lookup`: lookup can admit this request as
+    // the breaker's single half-open probe, and a 400 would never report back.
+    if bad_path(&path) {
         return plain(400, b"bad path");
+    }
+
+    // Also before `lookup`, for the same reason: a 501 never reports back, so
+    // it must not hold the half-open probe slot. Route-agnostic by design.
+    if upgrade {
+        return plain(501, b"protocol upgrades are not supported");
     }
 
     // Fast rejection for a declared oversized body. `forward_body` below is
@@ -168,7 +246,7 @@ pub async fn handle(
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+        .is_some_and(|len| len > limits.max_request_body_bytes)
     {
         return plain(413, b"payload too large");
     }
@@ -179,8 +257,9 @@ pub async fn handle(
     // has its own deadline so a slow uploader can't eat into (and then be
     // blamed as) the upstream's time budget.
     let (mut parts, body) = req.into_parts();
+    let body_timeout = Duration::from_secs(limits.request_body_timeout_secs);
     let (fwd_body, upload_done) =
-        match tokio::time::timeout(BODY_READ_TIMEOUT, forward_body(body)).await {
+        match tokio::time::timeout(body_timeout, forward_body(body, max_body)).await {
             Ok(Ok(b)) => b,
             Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
                 return plain(413, b"payload too large");
@@ -216,7 +295,11 @@ pub async fn handle(
 
     // The upstream's budget starts now: round trip plus (collected mode)
     // the response body.
-    let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
+    // Unvalidated library limits must not panic: fall back to ~30 years out.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(Duration::from_secs(limits.upstream_timeout_secs))
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30));
     let fwd = Request::from_parts(parts, fwd_body);
 
     // host:port, so two upstreams on one host stay distinct series.
@@ -312,8 +395,8 @@ pub async fn handle(
 type UploadDone = Arc<AtomicBool>;
 
 #[cfg(not(feature = "boxed_body"))]
-async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
-    match Limited::new(body, MAX_BODY_BYTES).collect().await {
+async fn forward_body(body: Incoming, max_body: usize) -> anyhow::Result<(Body, UploadDone)> {
+    match Limited::new(body, max_body).collect().await {
         Ok(collected) => Ok((
             Full::new(collected.to_bytes()),
             Arc::new(AtomicBool::new(true)),
@@ -325,12 +408,12 @@ async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
     }
 }
 
-// A chunked upload with no Content-Length that exceeds MAX_BODY_BYTES is cut
+// A chunked upload with no Content-Length that exceeds the body cap is cut
 // mid-stream by `Limited`; `is_client_body_error` maps that to 413 (or 400
 // for a client disconnect) and keeps it off the breaker.
 #[cfg(feature = "boxed_body")]
-async fn forward_body(body: Incoming) -> anyhow::Result<(Body, UploadDone)> {
-    let inner = Limited::new(body, MAX_BODY_BYTES);
+async fn forward_body(body: Incoming, max_body: usize) -> anyhow::Result<(Body, UploadDone)> {
+    let inner = Limited::new(body, max_body);
     // hyper never polls a body that already reports end-of-stream (e.g. a
     // GET), so seed the flag rather than waiting for a poll.
     let done: UploadDone = Arc::new(AtomicBool::new(hyper::body::Body::is_end_stream(&inner)));
@@ -375,21 +458,95 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::has_dot_segment;
+    use super::{bad_path, wants_upgrade};
 
     #[test]
-    fn dot_segments_are_detected() {
-        for bad in [
+    fn upgrade_detection() {
+        let get = |u: Option<&str>| {
+            let mut b = http::Request::get("/");
+            if let Some(u) = u {
+                b = b.header("upgrade", u);
+            }
+            b.body(()).unwrap()
+        };
+        assert!(wants_upgrade(
+            &http::Request::connect("example.com:443").body(()).unwrap()
+        ));
+        assert!(wants_upgrade(&get(Some("h2c, websocket"))));
+        assert!(wants_upgrade(&get(Some("websocket"))));
+        assert!(!wants_upgrade(&get(Some("h2c"))));
+        assert!(!wants_upgrade(&get(Some("H2C"))));
+        assert!(!wants_upgrade(&get(None)));
+    }
+
+    #[test]
+    fn dot_segments_are_rejected() {
+        for p in [
             "/svc-a/../svc-b",
             "/svc-a/./x",
             "/svc-a/%2e%2e/svc-b",
             "/svc-a/%2E/x",
+            "/api/../admin",
+            "/api/%2e%2e/admin",
+            "/api/..%2fadmin",
+            "/api/./../admin",
+            "/api/..",
+            "/api/%2E%2E/x",
+            "/api/%2e%2E/x",
+            "/api/.%2e/x",
+            "/api/..;/admin",
+            "/api/.;x/y",
+            "/api/%2e%2e;/x",
+            "/api/..%5cx",
+            "/api/..%5Cx",
+            "/api/a\\..\\b",
+            "/api/%2e/x",
             "/..",
+            "/api/a%2f..",
+            "/api/%2e%2e%2f",
+            "/api/..%00",
+            "/api/.%00.",
+            "/api/%u002e%u002e",
+            "/api/%U002e",
+            "/api/%252e%252e",
+            "/api/%252E",
+            "/api/%252f",
+            "/api/%252F",
+            "/api/%255c",
+            "/api/a%00b",
+            "/api/a%5c..",
+            "/api/a%5C..%5Cb",
         ] {
-            assert!(has_dot_segment(bad), "{bad}");
+            assert!(bad_path(p), "{p}");
         }
-        for ok in ["/svc-a/x", "/svc-a/.hidden", "/svc-a/a..b", "/"] {
-            assert!(!has_dot_segment(ok), "{ok}");
+    }
+
+    #[test]
+    fn legitimate_paths_are_allowed() {
+        for p in [
+            "/svc-a/x",
+            "/svc-a/.hidden",
+            "/svc-a/a..b",
+            "/a..b/",
+            "/.well-known/acme",
+            "/file.tar.gz",
+            "/api/v1.2/x",
+            "/",
+            "/api/...",
+            "/api/a;..",
+            "/api/%2e%2e%2e/x",
+            "/api/%41/x",
+            "/api/.a/x",
+            "/api/a%2/",
+            "/api/v4/projects/group%2Fproject",
+            "/api/queues/%2F/q",
+            "/@scope%2fpkg",
+            "/%2F",
+            "/api/%25",
+            "/api/100%25",
+            "/api/%c0%ae",
+        ] {
+            assert!(!bad_path(p), "{p}");
         }
     }
 }

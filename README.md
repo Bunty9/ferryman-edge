@@ -60,8 +60,8 @@ Cloudflare Pingora team to reply.
 | Layer                 | Crate / Tool                                              |
 | --------------------- | --------------------------------------------------------- |
 | Async runtime         | `tokio` 1.47 (full)                                       |
-| HTTP server           | `hyper` 1.5 + `hyper-util` + `tower-http`                 |
-| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26 + `rustls-pemfile` 2 + `rustls-pki-types` |
+| HTTP server           | `hyper` 1.5 + `hyper-util`                                |
+| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26 |
 | AuthN                 | `jsonwebtoken` 9 + `moka` 0.12 (`future` cache, 10k × 5min) |
 | Rate limit            | `governor` 0.7 (keyed GCRA)                               |
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |
@@ -126,14 +126,15 @@ Every request passes the same gates, in order:
 
 | Gate | Reject with | Metric |
 | --- | --- | --- |
-| TLS handshake, client cert must chain to `client_ca_path` (10 s timeout) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
+| TLS handshake, client cert must chain to `client_ca_path` (10 s by default; `tls_handshake_timeout_secs`) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
 | `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
 | Per-tenant GCRA limit keyed by `sub` (`tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
 | No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
+| Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
-| Body ≤ 8 MiB | `413` | |
-| Client body read within 30 s (collected mode; read before route lookup) | `408` slow client, `400` body error | |
-| Upstream round trip within 30 s, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
+| Body ≤ 8 MiB (default; `max_request_body_bytes`) | `413` | |
+| Client body read within 30 s by default (collected mode; read before route lookup) | `408` slow client, `400` body error | |
+| Upstream round trip within 30 s by default, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
 
 On the way through, the proxy strips hop-by-hop headers (both directions,
 including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
@@ -141,7 +142,8 @@ including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
 upstream, replaces `x-forwarded-for` with the peer IP (dropping client-sent
 `Forwarded` / `X-Real-IP`), sets `x-forwarded-proto: https`, and downgrades
 the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
-(`h2` or `http/1.1`). A connection with no request within 10 s of the
+(`h2` or `http/1.1`). A connection with no request within 10 s (default;
+`first_request_timeout_secs`) of the
 handshake is closed (this also covers a stalled h2 preface); h2 connections
 then get keep-alive pings and a 64-stream cap.
 
@@ -151,13 +153,23 @@ A transport error, a 502–504, or a timeout opens it — under `boxed_body` a
 timeout only counts if the client had finished uploading; after `cooldown_secs` exactly one request is let through
 as the probe. A plain `500` does not trip it, and neither does a failure
 caused by the client's own body (size cap, disconnect). The active health
-checker (`GET <upstream>/health` every `health_interval_secs`) opens and
+checker (`GET <upstream>/health` every `health_interval_secs`; per-route
+`health_path` / `health_disabled` change or skip the probe) opens and
 closes it too. A route reload keeps breaker state for rules whose prefix,
-upstream, and cooldown are unchanged.
+upstream, cooldown, and health settings (`health_path` / `health_disabled`,
+compared by effective value) are unchanged.
 
 SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
-25 s. SIGUSR1 reloads TLS material and the routing table; the JWT settings
-and `tenant_rps` are read once at boot.
+25 s by default (`shutdown_drain_secs`). SIGUSR1 reloads TLS material, the
+routing table (including per-route `health_path` / `health_disabled`) and
+the JWT public key (read from the boot-time path; the token cache is
+cleared). `[limits]`, `issuer` /
+`audience`, `tenant_rps` and `health_interval_secs` are read once at boot.
+
+Route prefixes match the raw, undecoded request path and are not access
+control: every route shares the same mTLS + JWT + rate-limit policy, so do
+not rely on prefixes to separate privileges. Normalised matching is planned
+before any per-route policy.
 
 Set `[jwt] issuer` and `audience` for anything beyond local dev — without
 them, any token signed by the issuer key is accepted, whichever service it
@@ -172,11 +184,11 @@ P4 makes three decisions worth defending in a hiring loop.
 Cargo feature `boxed_body` swaps the upstream client to
 `http_body_util::BoxBody` and streams request and response bodies. With it
 off, the proxy collects each body once into a `Full<Bytes>` before
-forwarding. Both builds enforce the 8 MiB request cap; under streaming, a
+forwarding. Both builds enforce the request body cap (8 MiB by default, configurable via `[limits]`); under streaming, a
 chunked upload with no `Content-Length` that exceeds it is cut mid-stream
 and answered `413`, without counting against the upstream's breaker.
 Streaming mode has no separate body-read deadline: a slow upload runs
-inside the upstream's 30 s budget and ends as `504`.
+inside the upstream budget (`upstream_timeout_secs`, default 30 s) and ends as `504`.
 
 Estimates from the design spec (not yet measured here): `boxed` adds ~200 µs per request at 10 MB; `collected`
 adds ~80 µs at 1 KB but allocates ~`req_size`. For an internal proxy

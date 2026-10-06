@@ -8,8 +8,10 @@
 //! production. JWTs are signed with the same RSA fixture keypair
 //! `ferryman-edge-core`'s own tests use.
 
-use ferryman_edge::{reload, serve, AppState, UpstreamClient};
-use ferryman_edge_core::{build_limiter, Claims, JwtVerifier, ReloadingTls, RouteTable, Upstream};
+use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
+use ferryman_edge_core::{
+    build_limiter, Claims, JwtVerifier, Limits, ReloadingTls, RouteTable, Upstream,
+};
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -37,6 +39,15 @@ const JWT_PRIV_PEM: &[u8] = include_bytes!(concat!(
 const JWT_PUB_PEM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../core/tests/fixtures/jwt-test-pub.pem"
+));
+
+const JWT_OTHER_PRIV_PEM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../core/tests/fixtures/jwt-test-other-priv.pem"
+));
+const JWT_OTHER_PUB_PEM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../core/tests/fixtures/jwt-test-other-pub.pem"
 ));
 
 fn install_crypto_provider() {
@@ -137,6 +148,10 @@ impl TestCerts {
 // ----- JWT ---------------------------------------------------------------
 
 fn mint_jwt(sub: &str, ttl_secs: i64, scope: &str) -> String {
+    mint_jwt_with(JWT_PRIV_PEM, sub, ttl_secs, scope)
+}
+
+fn mint_jwt_with(key_pem: &[u8], sub: &str, ttl_secs: i64, scope: &str) -> String {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,7 +165,7 @@ fn mint_jwt(sub: &str, ttl_secs: i64, scope: &str) -> String {
     encode(
         &Header::new(Algorithm::RS256),
         &claims,
-        &EncodingKey::from_rsa_pem(JWT_PRIV_PEM).unwrap(),
+        &EncodingKey::from_rsa_pem(key_pem).unwrap(),
     )
     .unwrap()
 }
@@ -188,6 +203,9 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    if path.starts_with("/slow") {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
     let body = req.into_body().collect().await.unwrap().to_bytes();
     Ok(Response::builder()
         .header("x-echo-xff", xff)
@@ -236,10 +254,15 @@ struct Harness {
     upstream_addr: SocketAddr,
     proxy_addr: SocketAddr,
     tls: Arc<ReloadingTls>,
+    jwt: Arc<JwtVerifier>,
 }
 
 impl Harness {
     async fn new(tenant_rps: u32) -> Self {
+        Self::with_limits(tenant_rps, Limits::default()).await
+    }
+
+    async fn with_limits(tenant_rps: u32, limits: Limits) -> Self {
         install_crypto_provider();
         let certs = TestCerts::generate();
         let upstream_addr = spawn_upstream().await;
@@ -260,6 +283,14 @@ impl Harness {
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
             ),
             (
+                "/slow".to_string(),
+                Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/probe".to_string(),
+                Upstream::new(format!("http://{down_addr}").parse().unwrap(), 1),
+            ),
+            (
                 "/down".to_string(),
                 Upstream::new(format!("http://{down_addr}").parse().unwrap(), 30),
             ),
@@ -272,20 +303,21 @@ impl Harness {
         let state = Arc::new(AppState {
             tls: tls.clone(),
             table,
-            jwt,
+            jwt: jwt.clone(),
             limiter,
             client,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, state, std::future::pending()));
+        tokio::spawn(serve_with(listener, state, limits, std::future::pending()));
 
         Self {
             certs,
             upstream_addr,
             proxy_addr,
             tls,
+            jwt,
         }
     }
 
@@ -680,6 +712,146 @@ async fn oversized_chunked_upload_is_413_and_does_not_trip_breaker() {
     assert_eq!(resp.status(), 200, "breaker must still be closed");
 }
 
+/// Send one raw HTTP/1.1 GET (path verbatim) and return (status line, headers+body).
+async fn raw_get(h: &Harness, path: &str, token: Option<&str>) -> (String, String) {
+    raw_get_with(h, path, token, "").await
+}
+
+/// `raw_get` plus extra header lines (each ending in `\r\n`).
+async fn raw_get_with(
+    h: &Harness,
+    path: &str,
+    token: Option<&str>,
+    extra: &str,
+) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let auth = token
+        .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let req =
+        format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n{auth}{extra}connection: close\r\n\r\n");
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tls.read_to_end(&mut buf),
+    )
+    .await
+    .expect("proxy answered");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (status, rest) = text.split_once("\r\n").unwrap_or((&text, ""));
+    (status.to_string(), rest.to_string())
+}
+
+#[tokio::test]
+async fn dot_segment_variants_are_rejected_and_legit_paths_pass() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+
+    for p in [
+        "/svc-a/..%2fx",
+        "/svc-a/..%2Fx",
+        "/svc-a/..%5cx",
+        "/svc-a/..\\x",
+        "/svc-a/..;/x",
+        "/svc-a/.;x/y",
+        "/svc-a/%252e%252e/x",
+        "/svc-a/%252fx",
+        "/svc-a/%255cx",
+        "/svc-a/%00",
+        "/svc-a/%u002e",
+    ] {
+        let (status, rest) = raw_get(&h, p, Some(&token)).await;
+        assert!(status.contains(" 400"), "{p}: {status}");
+        assert!(rest.ends_with("bad path"), "{p}: {rest}");
+        // auth runs first
+        let (status, _) = raw_get(&h, p, None).await;
+        assert!(status.contains(" 401"), "{p} without token: {status}");
+    }
+
+    for p in [
+        "/svc-a/group%2Fproject",
+        "/svc-a/.hidden",
+        "/svc-a/a..b",
+        "/svc-a/x;jsessionid=1",
+    ] {
+        let (status, rest) = raw_get(&h, p, Some(&token)).await;
+        assert!(status.contains(" 200"), "{p}: {status}");
+        let want = format!("x-echo-path: {p}\r\n");
+        assert!(rest.contains(&want), "{p}: {rest}");
+    }
+}
+
+/// A 400 bad path must not consume the half-open probe slot: the bad-path
+/// check runs before `RouteTable::lookup`. If it ran after, the 400 request
+/// would take the probe and the next normal request would see 503, not 502.
+#[tokio::test]
+async fn bad_path_does_not_consume_half_open_probe() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "{s}"); // breaker opens
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await; // cooldown (1s) elapsed
+    let (s, rest) = raw_get(&h, "/probe/..%2fx", Some(&token)).await;
+    assert!(
+        s.contains(" 400") && rest.ends_with("bad path"),
+        "{s} {rest}"
+    );
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "probe slot was consumed: {s}");
+}
+
+const WS: &str = "upgrade: websocket\r\nconnection: upgrade\r\n";
+
+/// Upgrade requests get 501 (the proxy cannot splice them) and never reach
+/// the upstream; `Upgrade: h2c` is exempt and proxied normally. 501 comes
+/// before route lookup, so an unrouted path gets it too.
+#[tokio::test]
+async fn upgrade_requests_get_501_but_h2c_is_proxied() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+
+    let (s, rest) = raw_get_with(&h, "/svc-a/ws", Some(&token), WS).await;
+    assert!(s.contains(" 501"), "{s}");
+    assert!(
+        rest.ends_with("protocol upgrades are not supported"),
+        "{rest}"
+    );
+    assert!(!rest.to_ascii_lowercase().contains("x-upstream"), "{rest}");
+
+    let (s, _) = raw_get_with(&h, "/nowhere", Some(&token), WS).await;
+    assert!(s.contains(" 501"), "{s}");
+
+    let (s, rest) = raw_get_with(
+        &h,
+        "/svc-a/hello",
+        Some(&token),
+        "upgrade: H2C\r\nconnection: upgrade, http2-settings\r\n",
+    )
+    .await;
+    assert!(s.contains(" 200"), "{s}");
+    assert!(
+        rest.to_ascii_lowercase().contains("x-upstream: yes"),
+        "{rest}"
+    );
+}
+
+/// Like the bad-path test: a 501 must not take the half-open probe slot.
+#[tokio::test]
+async fn upgrade_does_not_consume_half_open_probe() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "{s}"); // breaker opens
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await; // cooldown (1s) elapsed
+    let (s, _) = raw_get_with(&h, "/probe/x", Some(&token), WS).await;
+    assert!(s.contains(" 501"), "{s}");
+    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+    assert!(s.contains(" 502"), "probe slot was consumed: {s}");
+}
+
 /// A client that completes the mTLS handshake and then sends nothing must
 /// not hold the connection open forever (10s first-request timeout).
 #[tokio::test]
@@ -733,4 +905,153 @@ async fn tls_hot_reload_swaps_the_cert() {
     let after = fetch_peer_leaf_der(h.proxy_addr, &h.certs).await;
 
     assert_ne!(before, after);
+}
+
+// ----- JWT key reload ----------------------------------------------------------
+
+#[tokio::test]
+async fn jwt_key_reload_rotates_the_accepted_key() {
+    let h = Harness::new(0).await;
+    let client = h.client();
+    let old = mint_jwt("tenant-a", 3600, "read");
+    let new = mint_jwt_with(JWT_OTHER_PRIV_PEM, "tenant-a", 3600, "read");
+    let status = |t: String| {
+        let req = client
+            .get(h.url("/svc-a/hello"))
+            .header("authorization", format!("Bearer {t}"));
+        async move { req.send().await.unwrap().status() }
+    };
+
+    assert_eq!(status(old.clone()).await, 200); // cached under the old key
+    assert_eq!(status(new.clone()).await, 401);
+
+    h.jwt.reload_key(JWT_OTHER_PUB_PEM).unwrap();
+    assert_eq!(status(old.clone()).await, 401);
+    assert_eq!(status(new.clone()).await, 200);
+
+    assert!(h.jwt.reload_key(b"not a pem").is_err());
+    assert_eq!(status(new).await, 200);
+    assert_eq!(status(old).await, 401);
+}
+
+// ----- configurable [limits] -------------------------------------------------
+
+#[tokio::test]
+async fn configured_body_cap_is_enforced() {
+    let mut limits = Limits::default();
+    limits.max_request_body_bytes = 1024;
+    let h = Harness::with_limits(0, limits).await;
+    let client = h.client();
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let post = |n: usize| {
+        client
+            .post(h.url("/svc-a/echo"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(vec![b'z'; n])
+            .send()
+    };
+    assert_eq!(post(1024).await.unwrap().status(), 200);
+    assert_eq!(post(2048).await.unwrap().status(), 413);
+}
+
+#[tokio::test]
+async fn configured_upstream_timeout_gives_504() {
+    let mut limits = Limits::default();
+    limits.upstream_timeout_secs = 1;
+    let h = Harness::with_limits(0, limits).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let resp = h
+        .client()
+        .get(h.url("/slow/x"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504);
+}
+
+#[tokio::test]
+async fn configured_first_request_timeout_closes_silent_client() {
+    use tokio::io::AsyncReadExt;
+
+    let mut limits = Limits::default();
+    limits.first_request_timeout_secs = 1;
+    let h = Harness::with_limits(0, limits).await;
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut buf))
+        .await
+        .expect("server closed the idle connection")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF");
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
+
+#[tokio::test]
+async fn huge_first_request_timeout_does_not_panic_h1_connections() {
+    // Library callers can pass unvalidated limits; hyper adds the header
+    // read timeout to `now()` without overflow checks.
+    let mut limits = Limits::default();
+    limits.first_request_timeout_secs = u64::MAX;
+    let h = Harness::with_limits(0, limits).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let resp = h
+        .client_http1_only()
+        .get(h.url("/svc-a/hello"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("h1 connection task survived");
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn configured_cap_applies_to_chunked_uploads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut limits = Limits::default();
+    limits.max_request_body_bytes = 1024;
+    let h = Harness::with_limits(0, limits).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let (mut rd, mut wr) = tokio::io::split(tls);
+
+    let head = format!(
+        "POST /svc-a/upload HTTP/1.1\r\nhost: localhost\r\n\
+         authorization: Bearer {token}\r\ntransfer-encoding: chunked\r\n\r\n"
+    );
+    // The proxy may answer and stop reading before we finish; ignore write
+    // errors from that point on.
+    let writer = tokio::spawn(async move {
+        wr.write_all(head.as_bytes()).await?;
+        let chunk = vec![b'x'; 1024];
+        let frame = format!("{:x}\r\n", chunk.len());
+        for _ in 0..2 {
+            // 2 KiB total, over the 1 KiB cap
+            wr.write_all(frame.as_bytes()).await?;
+            wr.write_all(&chunk).await?;
+            wr.write_all(b"\r\n").await?;
+        }
+        wr.write_all(b"0\r\n\r\n").await?;
+        std::io::Result::Ok(())
+    });
+
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(20), rd.read(&mut buf))
+        .await
+        .expect("proxy answered")
+        .unwrap();
+    let status_line = String::from_utf8_lossy(&buf[..n]);
+    assert!(status_line.starts_with("HTTP/1.1 413"), "{status_line}");
+    writer.abort();
+
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/hello"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must still be closed");
 }

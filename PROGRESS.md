@@ -87,21 +87,35 @@
 - [x] `cargo deny check` clean (4 advisories cleared by `cargo update`,
       `rustls-pemfile` replaced by `rustls-pki-types` PEM API).
 
+## 0.1.2 patch (prepared on branch `edge-0.1.2`, not yet released)
+
+- [x] CI gates (MSRV 1.88, doctests, semver-checks), `SECURITY.md`,
+      unused-dependency cleanup.
+- [x] Hardened dot-segment path validation (400 `bad path`).
+- [x] `Upgrade` (other than h2c) and `CONNECT` answered 501 before lookup.
+- [x] `[limits]` table (boot-only) and per-route `health_path` /
+      `health_disabled` (reloaded on SIGUSR1); `health_interval_secs = 0`
+      rejected.
+- [x] JWT public key reloaded on SIGUSR1 (no overlap window).
+- [x] Release workflow split into verify, attest, publish, release.
+- [x] Version bumped to 0.1.2, CHANGELOG section dated; tag and publish
+      are separate, explicit steps.
+
 ## Next sprint — Phase 3: numbers + deploy
 
 - [ ] mTLS-capable load generator (e.g. a small hyper/rustls client or
       k6 with client certs) for the 50k rps / p99 < 8 ms targets.
 - [ ] TLS handshake p99 with the 4-intermediate chain, client on a separate host.
 - [ ] Fly.io 2-region deploy with certs from secrets + reload screencast.
-- [ ] Optional: reload the JWT key and `tenant_rps` on SIGUSR1 (both
-      are boot-time only today).
+- [x] Reload the JWT key on SIGUSR1 (done in 0.1.2).
+- [ ] Optional: reload `tenant_rps` on SIGUSR1 (boot-time only today).
 - [ ] Optional: global in-flight body-bytes budget (today bounded per
       connection: 64 streams × 8 MiB).
 
 ## Examples
 
 - [x] `examples/edge-demo`: `edge-demo run` checks every feature
-      against the real binary (55 checks, ~4 s; CI runs both body modes).
+      against the real binary (56 checks, ~4 s; CI runs both body modes).
       Manual walkthrough and docker-compose topology (proxy + 3 backends +
       Prometheus) verified by hand 2026-09-30.
 - [x] `examples/embed-core`: ferryman-edge-core in an axum service, 8 tests.

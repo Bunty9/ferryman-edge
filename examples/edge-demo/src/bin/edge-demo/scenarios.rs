@@ -528,6 +528,15 @@ async fn routing(d: &mut Demo) -> anyhow::Result<()> {
         line.contains(" 400"),
         line,
     );
+
+    // The proxy can't splice a WebSocket, so it says so instead of
+    // forwarding a mangled GET.
+    let req = format!(
+        "GET /orders/ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        d.edge.token("tenant-routing-ws")?
+    );
+    let line = raw_http1(&d.edge.pki, d.edge.addr, req.as_bytes()).await?;
+    d.check("a WebSocket upgrade gets 501", line.contains(" 501"), line);
     Ok(())
 }
 

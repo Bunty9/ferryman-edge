@@ -24,7 +24,7 @@ any fails (about 5 seconds):
 3. **Identity propagation**: the backend sees `x-ferryman-tenant` equal to the
    JWT `sub` (client-supplied values are discarded), the peer IP in
    `x-forwarded-for`, and `x-forwarded-proto: https`.
-4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected.
+4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected; a WebSocket upgrade is 501.
 5. **Bodies**: 6 MiB passes intact, 9 MiB is 413.
 6. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.
 7. **Circuit breaker + health checks**: kill a backend, watch 503 and the
@@ -100,9 +100,10 @@ edge -o /dev/null -w '%{http_code}\n' \
 #    forwarded_for is our real address although we claim 6.6.6.6
 edge -H "$AUTH" -H 'x-ferryman-tenant: admin' -H 'x-forwarded-for: 6.6.6.6' $P/orders/42
 
-# 4. routing: 404 off a segment boundary; 400 for a `..` segment
+# 4. routing: 404 off a segment boundary; 400 for a `..` segment; 501 for Upgrade
 edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/ordersX
 edge --path-as-is -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/orders/../inventory
+edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" -H 'Upgrade: websocket' -H 'Connection: Upgrade' $P/orders/ws
 
 # 5. bodies: 9 MiB is refused with 413
 head -c 9437184 /dev/zero | edge -o /dev/null -w '%{http_code}\n' -X POST --data-binary @- \
@@ -182,8 +183,8 @@ policy, because the backends trust `x-ferryman-tenant`.
 `compose/ferryman.toml` is the container version of the config: container
 paths under `/app/certs`, service names as upstreams, and the same issuer
 and audience as the demo tokens. Re-running `setup` regenerates the PKI, so
-restart `edge` afterwards: the JWT key is read at boot, and SIGUSR1 only
-reloads TLS material and routes.
+send `edge` a SIGUSR1 (or restart it) afterwards: SIGUSR1 reloads TLS
+material, routes and the JWT key.
 
 ## Adapting this to your project
 
@@ -193,8 +194,10 @@ reloads TLS material and routes.
   Renew by replacing the files and sending `SIGUSR1`.
 - **JWT**: point `[jwt] jwks_path` at your identity provider's RSA public key
   (PEM, RS256) and **set `issuer` and `audience`**; without them any token
-  signed by that key is accepted for any service. The key is read at boot; a
-  rotation needs a restart (SIGUSR1 reloads TLS and routes only).
+  signed by that key is accepted for any service. SIGUSR1 re-reads the key from the
+  boot-time path and clears the token cache. There is no overlap window:
+  tokens signed by the old key fail right after the reload, so rotate at the
+  IdP accordingly.
 - **Backends**: read `x-ferryman-tenant` as the caller identity and do not
   re-authenticate. That is only safe when the proxy is the only thing that can
   reach them (private network, no published ports). If clients can reach a backend directly they can forge the

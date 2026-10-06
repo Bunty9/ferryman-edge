@@ -13,8 +13,10 @@
 //! expired seconds after being cached would keep verifying for up to 5
 //! more minutes.
 
+use arc_swap::ArcSwap;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, TokenData, Validation};
 use moka::future::Cache;
+use std::sync::Arc;
 
 /// Minimal claims surface — extend as needed. `sub` is the tenant key used
 /// by the rate limiter.
@@ -34,9 +36,12 @@ fn now_secs() -> u64 {
 }
 
 pub struct JwtVerifier {
-    key: DecodingKey,
+    /// Current key plus its generation (bumped by `reload_key`).
+    key: ArcSwap<(DecodingKey, u64)>,
     validation: Validation,
-    cache: Cache<String, Claims>,
+    /// Values carry the key generation they were verified under, so an
+    /// insert racing `reload_key`'s `invalidate_all` can never be served.
+    cache: Cache<String, (Claims, u64)>,
 }
 
 impl JwtVerifier {
@@ -44,7 +49,7 @@ impl JwtVerifier {
     /// and a 10k-entry LRU cache with a 5-minute TTL.
     pub fn new(jwks_pem: &[u8]) -> anyhow::Result<Self> {
         Ok(Self {
-            key: DecodingKey::from_rsa_pem(jwks_pem)?,
+            key: ArcSwap::from_pointee((DecodingKey::from_rsa_pem(jwks_pem)?, 0)),
             validation: {
                 let mut v = Validation::new(Algorithm::RS256);
                 // Checked once at decode; a token is only cached after it
@@ -87,15 +92,39 @@ impl JwtVerifier {
     /// repeated invocations within the TTL window, provided the token's own
     /// `exp` (plus leeway) hasn't passed since it was cached.
     pub async fn verify(&self, token: &str) -> Option<Claims> {
-        if let Some(claims) = self.cache.get(token).await {
-            if (claims.exp as u64) < now_secs().saturating_sub(self.validation.leeway) {
-                return None;
+        // One snapshot for decode and for the cache entry: a reload between
+        // the two must not label an old-key result with the new generation.
+        let key = self.key.load_full();
+        let gen = key.1;
+        if let Some((claims, g)) = self.cache.get(token).await {
+            if g == gen {
+                if (claims.exp as u64) < now_secs().saturating_sub(self.validation.leeway) {
+                    return None;
+                }
+                return Some(claims);
             }
-            return Some(claims);
+            // Verified under another key: a miss. Evict only if older; a
+            // newer entry (we hold a stale snapshot) belongs to the new key.
+            if g < gen {
+                self.cache.invalidate(token).await;
+            }
         }
-        let TokenData { claims, .. } = decode::<Claims>(token, &self.key, &self.validation).ok()?;
-        self.cache.insert(token.to_string(), claims.clone()).await;
+        let TokenData { claims, .. } = decode::<Claims>(token, &key.0, &self.validation).ok()?;
+        self.cache
+            .insert(token.to_string(), (claims.clone(), gen))
+            .await;
         Some(claims)
+    }
+
+    /// Replace the public key (SIGUSR1 rotation). The PEM is parsed first; on
+    /// error the old key stays. Cached verifications under the old key are
+    /// dropped. Issuer, audience and leeway are unchanged.
+    pub fn reload_key(&self, pem: &[u8]) -> anyhow::Result<()> {
+        let new = DecodingKey::from_rsa_pem(pem)?;
+        // rcu makes the generation bump atomic across concurrent reloads.
+        self.key.rcu(|cur| Arc::new((new.clone(), cur.1 + 1)));
+        self.cache.invalidate_all();
+        Ok(())
     }
 }
 
@@ -247,5 +276,56 @@ mod tests {
         // even though it's well within the 5-minute cache TTL.
         tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
         assert!(verifier.verify(&token).await.is_none());
+    }
+
+    const OTHER_PUB_PEM: &[u8] = include_bytes!("../tests/fixtures/jwt-test-other-pub.pem");
+
+    fn claims() -> Claims {
+        Claims {
+            sub: "t".into(),
+            exp: now_secs() as usize + 3600,
+            scope: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_key_rejects_old_accepts_new_and_keeps_key_on_error() {
+        let v = JwtVerifier::new(PUB_PEM).unwrap();
+        let a = sign(PRIV_PEM, &claims());
+        let b = sign(OTHER_PRIV_PEM, &claims());
+        assert!(v.verify(&a).await.is_some()); // now cached
+        v.reload_key(OTHER_PUB_PEM).unwrap();
+        assert!(v.verify(&a).await.is_none());
+        assert!(v.verify(&b).await.is_some());
+        assert!(v.reload_key(b"garbage").is_err());
+        assert!(v.verify(&b).await.is_some());
+        assert!(v.verify(&a).await.is_none());
+    }
+
+    #[test]
+    fn concurrent_reloads_bump_generation_atomically() {
+        let v = Arc::new(JwtVerifier::new(PUB_PEM).unwrap());
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let v = v.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        v.reload_key(OTHER_PUB_PEM).unwrap();
+                    }
+                })
+            })
+            .collect();
+        hs.into_iter().for_each(|h| h.join().unwrap());
+        assert_eq!(v.key.load().1, 80);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cache_entry_is_not_served() {
+        // Simulates the race: an old-key verify inserts after invalidate_all.
+        let v = JwtVerifier::new(PUB_PEM).unwrap();
+        let a = sign(PRIV_PEM, &claims());
+        v.reload_key(OTHER_PUB_PEM).unwrap();
+        v.cache.insert(a.clone(), (claims(), 0)).await;
+        assert!(v.verify(&a).await.is_none());
     }
 }

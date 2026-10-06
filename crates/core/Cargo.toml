@@ -21,22 +21,16 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { workspace = true }
 http = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 arc-swap = { workspace = true }
-parking_lot = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
 toml = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 
 # P4 stack additions
 rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { workspace = true }
 governor = { workspace = true }

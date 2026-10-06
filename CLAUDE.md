@@ -35,9 +35,9 @@ SIGUSR1 reloads.
 - `crates/core` — primitives, no HTTP serving: `route.rs` (RouteTable +
   lock-free breaker), `jwt.rs`, `ratelimit.rs`, `tls.rs` (ReloadingTls),
   `health.rs`, `config.rs`. JWT test keys in `crates/core/tests/fixtures`.
-- `crates/server/src/lib.rs` — accept loop (`serve`) and auth middleware;
-  `proxy.rs` — per-request forwarding; `reload.rs` — SIGUSR1 route reload;
-  `main.rs` — boot only.
+- `crates/server/src/lib.rs` — accept loop (`serve` / `serve_with`) and
+  auth middleware; `proxy.rs` — per-request forwarding; `reload.rs` —
+  SIGUSR1 route + JWT key reload; `main.rs` — boot only.
 - `examples/edge-demo` (`ferryman-edge-demo`, publish = false): `backend`
   sample upstream + `edge-demo` driver (`setup` | `token` | `run`). `run`
   spawns the real proxy binary and checks every feature; CI runs it for
@@ -53,6 +53,12 @@ SIGUSR1 reloads.
 
 - Hop-by-hop headers are stripped in `lib.rs` *before* `x-ferryman-tenant`
   is stamped; otherwise `Connection: x-ferryman-tenant` deletes it.
+- The 400 bad-path and 501 upgrade/CONNECT checks run in `proxy::handle_checked`
+  (called by `handle` and `handle_with`)
+  *before* `RouteTable::lookup` (a request that returns without reporting
+  back would leak the half-open probe slot). `Upgrade` is stripped as
+  hop-by-hop, so `lib.rs` computes `proxy::wants_upgrade` before stripping
+  and passes it to `handle_checked`; `h2c` is exempt.
 - Only upstream-caused failures may call `Upstream::mark_failed`: transport
   errors, 502–504, response-body errors, and timeouts after the upload
   finished. Client-side failures (body cap, disconnect, slow upload, 408)
@@ -95,15 +101,16 @@ absolute or they break in the book. Build locally with
 ## Releasing
 
 Both crates share one version. Publishing is done by
-`.github/workflows/release.yml` on a `v*` tag push, through crates.io
-Trusted Publishing (OIDC; environment `release`); there is no registry
-token secret. The crates.io trusted-publisher config pins the workflow
-filename `release.yml` and environment `release` — renaming either breaks
-publishing. Pushing a `v*` tag publishes irreversibly: never push one
-without an explicit request. `cargo publish --workspace --dry-run` is
+`.github/workflows/release.yml` (jobs verify, attest, publish, release; the
+publish job is idempotent, so a failed run is recovered by re-running it)
+on a `v*` tag push, through crates.io Trusted Publishing (OIDC; environment
+`release`); there is no registry token secret. The crates.io
+trusted-publisher config pins the workflow filename `release.yml` and
+environment `release` — renaming either breaks publishing. Pushing a `v*`
+tag publishes irreversibly: never push one without an explicit request. `cargo publish --workspace --dry-run` is
 safe. When bumping, change `[workspace.package] version` and the
 `version` on server's `ferryman-edge-core` dependency together, and add a
-`## [X.Y.Z]` section to `CHANGELOG.md` (the release job requires it and
+`## [X.Y.Z]` section to `CHANGELOG.md` (the verify job requires it and
 uses it as the GitHub release notes). Checklist: `docs/publishing.md`.
 
 ## Commits

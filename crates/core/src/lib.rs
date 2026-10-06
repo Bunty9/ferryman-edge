@@ -24,7 +24,10 @@ pub mod ratelimit;
 pub mod route;
 pub mod tls;
 
-pub use config::{build_table, ConfigToml, JwtToml, RouteToml, TlsToml};
+pub use config::{
+    build_table, build_table_ext, parse_config, ConfigExt, ConfigToml, JwtToml, Limits, RouteExt,
+    RouteToml, TlsToml,
+};
 pub use health::health_loop;
 pub use jwt::{Claims, JwtVerifier};
 pub use ratelimit::{build_limiter, check, spawn_gc, Limiter};

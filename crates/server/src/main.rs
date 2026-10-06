@@ -2,14 +2,14 @@
 //!
 //! This binary is arg parsing + boot: load config, build the mTLS/JWT/route
 //! primitives, spin up background tasks (health checker, SIGUSR1 reload,
-//! rate-limiter GC), then hand off to `ferryman_edge::serve` for the
+//! rate-limiter GC), then hand off to `ferryman_edge::serve_with` for the
 //! accept loop and per-request pipeline.
 
 use arc_swap::ArcSwap;
 use clap::Parser;
-use ferryman_edge::{reload, serve, AppState, UpstreamClient};
+use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
 use ferryman_edge_core::{
-    build_limiter, build_table, health_loop, spawn_gc, ConfigToml, JwtVerifier, Limiter,
+    build_limiter, build_table_ext, health_loop, parse_config, spawn_gc, JwtVerifier, Limiter,
     ReloadingTls, SharedTable,
 };
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -49,8 +49,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the aws-lc-rs default crypto provider for rustls before any
-    // ServerConfig is built. Required because we disabled `rustls`'s default
-    // features (no ring) at the workspace level.
+    // ServerConfig is built. Both the aws-lc-rs and ring provider features of
+    // rustls are enabled in this build (ring via reqwest's rustls-tls in
+    // ferryman-edge-core), so rustls cannot pick a process default on its
+    // own; install it explicitly.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install aws-lc-rs crypto provider"))?;
@@ -66,11 +68,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let raw = std::fs::read_to_string(&args.config)?;
-    let cfg: ConfigToml = toml::from_str(&raw)?;
+    let (cfg, ext) = parse_config(&raw)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
 
     // Routing table (atomic hot-swap).
-    let table = build_table(&cfg)?;
+    let table = build_table_ext(&cfg, &ext)?;
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 
     // mTLS material + reloading wrapper. SIGUSR1 swaps cert/key/ca atomically.
@@ -80,9 +82,8 @@ async fn main() -> anyhow::Result<()> {
         &cfg.tls.client_ca_path,
     )?;
 
-    // JWT verifier reads the RSA pub key once at boot. Cache TTL == 5 min,
-    // capacity == 10k. Stable across reloads — re-init if the issuer key
-    // rotates (not wired to SIGUSR1; that reloads TLS + routes only).
+    // JWT verifier: RSA pub key read at boot and re-read from the same path
+    // on SIGUSR1. Cache TTL == 5 min, capacity == 10k (cleared on key reload).
     let jwks_pem = std::fs::read(&cfg.jwt.jwks_path)?;
     let mut verifier = JwtVerifier::new(&jwks_pem)?;
     if let Some(iss) = &cfg.jwt.issuer {
@@ -92,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         verifier = verifier.with_audience(aud);
     }
     let jwt: Arc<JwtVerifier> = Arc::new(verifier);
+    reload::spawn_jwt_reload(cfg.jwt.jwks_path.clone().into(), jwt.clone());
 
     // Per-tenant rate limiter, keyed by `Claims::sub`. `None` when
     // `tenant_rps == 0` — rate limiting is disabled outright rather than
@@ -112,8 +114,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(health_loop(shared.clone(), interval));
     reload::spawn_reload(args.config.clone(), shared.clone());
 
-    // Shared hyper upstream client. Single instance across the process — its
-    // internal pool multiplexes HTTP/2 streams to each upstream.
+    // Shared hyper upstream client. Single instance across the process; its
+    // pool keeps idle HTTP/1.1 connections to each upstream (outbound is
+    // always HTTP/1.1, whatever the client spoke).
     let client: UpstreamClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
     let state = Arc::new(AppState {
@@ -127,12 +130,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, "ferryman-edge-server listening (mTLS)");
 
-    serve(listener, state, shutdown_signal()).await;
+    serve_with(listener, state, ext.limits.clone(), shutdown_signal()).await;
     Ok(())
 }
 
 /// Resolves on SIGTERM or SIGINT (fly.toml uses `kill_signal = "SIGINT"`,
-/// `kill_timeout = 30`) so `serve` can start its own bounded drain.
+/// `kill_timeout = 30`) so `serve_with` can start its own bounded drain.
 async fn shutdown_signal() {
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {

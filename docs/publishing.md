@@ -7,8 +7,9 @@ Two crates, one shared version (`[workspace.package] version`):
 | `ferryman-edge-core` | library: TLS reload, JWT verifier, rate limiter, routing + breaker | — |
 | `ferryman-edge` | `cargo install ferryman-edge` → `ferryman-edge-server` binary, plus the (unstable) `serve` library | `ferryman-edge-core` (same version) |
 
-Publish order is always core first, then server. `cargo publish --workspace`
-does this automatically.
+Publish order is always core first, then server (the release workflow
+publishes each crate with `cargo publish -p`; locally
+`cargo publish --workspace` does it in order).
 
 ## What's already set up
 
@@ -24,7 +25,7 @@ does this automatically.
   need repo-level fixtures, including test-only private keys that secret
   scanners would flag in a published crate; they run in CI from the repo.
   The packages contain only `src/`, the manifest, README and licenses.
-- The server's path dependency on core carries `version = "0.1.0"`, which
+- The server's path dependency on core carries the shared version (`0.1.2` now), which
   is what crates.io uses.
 - `cargo publish --workspace --dry-run` passes: both crates package and
   build in isolation, with server resolved against core through a temporary
@@ -55,15 +56,52 @@ Starting with 0.1.1, releases are published by CI, not from a laptop. Pushing a
 `v*` tag runs
 [`.github/workflows/release.yml`](https://github.com/Bunty9/ferryman-edge/blob/main/.github/workflows/release.yml):
 
-1. **verify:** the tag must equal the workspace version, and `CHANGELOG.md`
-   must have that version's section. Tests run in both body modes, then
-   `cargo publish --workspace --dry-run`.
-2. **publish** (GitHub environment `release`, which only accepts `v*`
-   tags): `rust-lang/crates-io-auth-action` swaps the job's GitHub OIDC
-   token for a crates.io token that lives 30 minutes and is revoked when
-   the job ends. `cargo publish --workspace` then publishes core, then
-   the proxy. The job finishes by creating the GitHub release from the
-   CHANGELOG section.
+1. **verify** (`contents: read`): the tag must point at a commit on `main`
+   and equal the workspace version, and `CHANGELOG.md` must have a
+   non-empty section for that version (its text becomes the release
+   notes). Tests run in both body modes, then
+   `cargo package -p ferryman-edge-core -p ferryman-edge --locked` packages
+   and builds both crates in isolation. The two `.crate` files and the
+   release notes are uploaded as artifacts.
+2. **attest** (`id-token: write`, `attestations: write`, `contents: read`;
+   no checkout, no cargo): build provenance for the `.crate` files.
+   `publish` needs it, so nothing is published without an attestation.
+3. **publish** (GitHub environment `release`, which only accepts `v*`
+   tags; `id-token: write`, `contents: read`):
+   `rust-lang/crates-io-auth-action` swaps the job's GitHub OIDC token for
+   a crates.io token that lives 30 minutes and is revoked when the job
+   ends. Then, for `ferryman-edge-core` and then `ferryman-edge`: skip the
+   crate if `crates.io/api/v1/crates/<name>/<version>` already exists,
+   if it returns 404 run `cargo publish -p <name> --locked --no-verify`, and
+   fail on any other status (429, 5xx). `--no-verify` is safe because verify
+   already built the same commit, and it keeps dependency build scripts out
+   of the job holding the crates.io token. This is idempotent, so
+   re-running the job after a partial failure just finishes the job.
+4. **release** (`contents: write` only; no checkout, no cargo): creates the
+   GitHub release from the CHANGELOG section and attaches the `.crate`
+   files (on a re-run it uploads the files to the existing release).
+
+`contents: write` and `id-token: write` are never in the same job, the
+workflow's top-level `permissions` is empty, every action is pinned by
+commit SHA, and checkouts use `persist-credentials: false`. There is no
+`workflow_dispatch` trigger and no binaries: a manual run has no tag to
+verify, and prebuilt binaries wait for the 0.2.0 ring switch (aws-lc-rs
+needs a C toolchain per cross target).
+
+### Verifying provenance
+
+The attested files are the `.crate` files built by `verify` and attached to
+the GitHub release. Check one against this repository's workflow:
+
+```bash
+gh release download vX.Y.Z --repo Bunty9/ferryman-edge --pattern '*.crate'
+gh attestation verify ferryman-edge-X.Y.Z.crate --repo Bunty9/ferryman-edge
+```
+
+`cargo publish` repackages from the same commit, so the crates.io download
+should be byte-identical, but only the release asset is attested.
+Compare with `sha256sum` against
+`https://static.crates.io/crates/<name>/<name>-X.Y.Z.crate` if it matters.
 
 The trust is configured on both sides:
 
@@ -119,10 +157,15 @@ After publishing:
 - **The verify job fails** (e.g. tag/version mismatch): nothing was
   published. Delete the tag (`git push origin :refs/tags/vX.Y.Z && git tag -d vX.Y.Z`),
   fix, and tag again.
-- **The publish job fails after core went out:** re-running it would fail
-  on the already-published core, so publish only the proxy:
-  `cargo publish -p ferryman-edge` locally, with an API token scoped to
-  `publish-update` for that crate. Don't re-bump core.
+- **The publish job fails after core went out** (a crates.io outage, a
+  rate limit, or an API error such as HTTP 429/5xx on the existence check):
+  use "Re-run failed jobs" on the run. The publish step skips crates
+  already on crates.io and publishes the rest; re-running is safe. Don't
+  re-bump the version. The `.crate` and release-notes artifacts are kept
+  for 7 days, so re-run `publish` / `release` within that window; after
+  that, push a new patch version instead.
+- **The release job fails:** same, "Re-run failed jobs"; it creates the
+  release, or uploads to the one that already exists.
 - **Bad release:** `cargo yank --version X.Y.Z ferryman-edge` (and core
   if needed), fix, and release X.Y.Z+1. Yanking stops new lockfiles from
   picking it up; it does not delete it.
