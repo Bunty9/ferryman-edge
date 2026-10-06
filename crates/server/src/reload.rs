@@ -20,11 +20,13 @@
 //! point of view) without dropping connections.
 
 use arc_swap::ArcSwap;
-use ferryman_edge_core::{build_table, ConfigToml, RouteTable, SharedTable};
+use ferryman_edge_core::{build_table_ext, parse_config, RouteTable, SharedTable};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Spawn the SIGUSR1 reload loop. Returns immediately; the loop runs until
+/// Spawn the SIGUSR1 reload loop. Routes and their health keys
+/// (`health_path`, `health_disabled`) reload; `[limits]` are boot-only and
+/// a changed value needs a restart. Returns immediately; the loop runs until
 /// process exit.
 pub fn spawn_reload(path: PathBuf, table: SharedTable) {
     tokio::spawn(async move {
@@ -53,8 +55,8 @@ pub fn spawn_reload(path: PathBuf, table: SharedTable) {
 
 fn reload_once(path: &Path) -> anyhow::Result<RouteTable> {
     let raw = std::fs::read_to_string(path)?;
-    let cfg: ConfigToml = toml::from_str(&raw)?;
-    build_table(&cfg)
+    let (cfg, ext) = parse_config(&raw)?;
+    build_table_ext(&cfg, &ext)
 }
 
 /// Helper for tests / integration code that build their own `SharedTable`

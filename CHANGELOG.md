@@ -12,6 +12,14 @@ Both crates share one version. Format follows
   encoded and alternative separator forms are rejected with 400.
 
 ### Added
+- Config: `[limits]` table (`max_request_body_bytes`, `request_body_timeout_secs`,
+  `upstream_timeout_secs`, `tls_handshake_timeout_secs`,
+  `first_request_timeout_secs`, `h2_max_concurrent_streams`,
+  `shutdown_drain_secs`; defaults unchanged, boot-only) and per-route
+  `health_path` / `health_disabled`, via new `parse_config`, `ConfigExt`,
+  `Limits`, `RouteExt`, `build_table_ext`, `Upstream::with_health`.
+  `health_interval_secs = 0` is now rejected at load (it previously
+  panicked the health task).
 - `SECURITY.md`: supported versions and private vulnerability reporting.
 
 ### Changed

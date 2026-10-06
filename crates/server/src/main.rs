@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use ferryman_edge::{reload, serve, AppState, UpstreamClient};
 use ferryman_edge_core::{
-    build_limiter, build_table, health_loop, spawn_gc, ConfigToml, JwtVerifier, Limiter,
+    build_limiter, build_table_ext, health_loop, parse_config, spawn_gc, JwtVerifier, Limiter,
     ReloadingTls, SharedTable,
 };
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -68,11 +68,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let raw = std::fs::read_to_string(&args.config)?;
-    let cfg: ConfigToml = toml::from_str(&raw)?;
+    // Limits are validated here; applying them is wired separately.
+    let (cfg, ext) = parse_config(&raw)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
 
     // Routing table (atomic hot-swap).
-    let table = build_table(&cfg)?;
+    let table = build_table_ext(&cfg, &ext)?;
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 
     // mTLS material + reloading wrapper. SIGUSR1 swaps cert/key/ca atomically.
