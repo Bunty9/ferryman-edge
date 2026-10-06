@@ -26,8 +26,8 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
-    # webpki-roots (Mozilla CA bundle data), pulled in by metrics-exporter-prometheus
-    # (server) and by reqwest rustls-tls (dev-deps, examples).
+    # webpki-roots (Mozilla CA bundle data), pulled in by reqwest rustls-tls (core health
+    # probes, dev-deps, examples) and metrics-exporter-prometheus (server).
     "CDLA-Permissive-2.0",
 ]
 

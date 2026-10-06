@@ -13,8 +13,8 @@ Both crates share one version. Format follows
 ### Changed
 - Dependency cleanup: removed unused `tower`, `tower-http`, `tokio-util`,
   `url`, `thiserror`, `parking_lot`, `tokio-rustls`, `hyper`, `hyper-util`
-  and `rustls-pki-types` declarations. `ferryman-edge-core` now builds
-  `reqwest` without TLS (health probes are plain HTTP).
+  and `rustls-pki-types` declarations, plus reqwest's unused `json` feature
+  in `ferryman-edge-core`. No behaviour change.
 - CI gates: MSRV (1.88) check, doctests, and `cargo-semver-checks` against
   the last crates.io release.
 - Docs: corrected the README stack table and comments about the crypto

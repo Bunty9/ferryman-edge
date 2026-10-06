@@ -50,8 +50,9 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     // Install the aws-lc-rs default crypto provider for rustls before any
     // ServerConfig is built. Both the aws-lc-rs and ring provider features of
-    // rustls end up enabled through dependencies, so rustls cannot pick a
-    // process default on its own; install it explicitly.
+    // rustls are enabled in this build (ring via reqwest's rustls-tls in
+    // ferryman-edge-core), so rustls cannot pick a process default on its
+    // own; install it explicitly.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install aws-lc-rs crypto provider"))?;
