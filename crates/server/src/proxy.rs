@@ -252,6 +252,16 @@ struct BodyState {
     client_failed: AtomicBool,
 }
 
+impl BodyState {
+    /// The proxy is parked waiting for the client's next upload frame. An
+    /// upstream that gives up now (its own read timeout, say) is reacting to
+    /// the client's stall, so it is not blamed. Once the upload has finished,
+    /// or while the client is actively sending, the flag is clear.
+    fn waiting_on_client(&self) -> bool {
+        self.waiting_on_client.load(Ordering::Acquire)
+    }
+}
+
 /// End-of-upload signal for [`upstream_timer`].
 pub(crate) struct Eos {
     rx: oneshot::Receiver<()>,
@@ -425,6 +435,7 @@ impl hyper::body::Body for WatchedBody {
             if !this.failed
                 && client_fault(e).is_none()
                 && !this.request.client_failed.load(Ordering::Acquire)
+                && !this.request.waiting_on_client()
             {
                 this.failed = true;
                 this.upstream.mark_failed();
@@ -562,7 +573,11 @@ pub(crate) async fn handle_checked(
                 return plain(status, msg);
             }
             tracing::warn!(upstream = %host, error = %e, "upstream request failed");
-            upstream.mark_failed();
+            // An upstream that drops the connection while we wait on a
+            // stalled client is reacting to that stall: answer 502, blame no one.
+            if !client_state.waiting_on_client() {
+                upstream.mark_failed();
+            }
             return upstream_error(502, b"bad gateway", host);
         }
         None => {

@@ -336,6 +336,55 @@ async fn spawn_early_upstream() -> SocketAddr {
     addr
 }
 
+/// An upstream with a strict read timeout: it closes the connection if no
+/// body bytes arrive for 1 s. `/strict-b` sends its 200 head first, `/strict-a`
+/// does not. A GET (no body) is answered normally.
+async fn spawn_strict_read_upstream() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).into_owned();
+                if text.starts_with("GET ") {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                if text.contains(" /strict-b") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+                        .await;
+                }
+                while let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await
+                {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                // Dropping the stream closes it without a (further) answer.
+            });
+        }
+    });
+    addr
+}
+
 async fn spawn_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -397,6 +446,7 @@ impl Harness {
         let sse_addr = spawn_sse_upstream().await;
         let trunc_addr = spawn_truncating_upstream().await;
         let early_addr = spawn_early_upstream().await;
+        let strict_addr = spawn_strict_read_upstream().await;
         let down_addr = closed_port();
 
         let tls = ReloadingTls::new(
@@ -418,6 +468,14 @@ impl Harness {
             (
                 "/slow".to_string(),
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/strict-a".to_string(),
+                Upstream::new(format!("http://{strict_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/strict-b".to_string(),
+                Upstream::new(format!("http://{strict_addr}").parse().unwrap(), 30),
             ),
             (
                 "/early".to_string(),
@@ -1632,4 +1690,39 @@ async fn client_stalling_after_an_early_upstream_answer_does_not_trip_the_breake
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "breaker must stay closed");
+}
+
+/// The client stalls its upload (inside the proxy's idle gap) for longer than
+/// the upstream's own read timeout, so the upstream hangs up. That is the
+/// client's stall, not an unhealthy upstream: the breaker must stay closed,
+/// whether the upstream closes before its head or after an early one.
+#[tokio::test]
+async fn upstream_read_timeout_during_a_client_stall_does_not_trip_the_breaker() {
+    use tokio::io::AsyncWriteExt;
+
+    let h = Harness::build(0, Limits::default(), |t| {
+        t.with_request_body_idle_timeout(Duration::from_secs(5))
+            .with_request_body_timeout(Duration::from_secs(30))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for route in ["/strict-a", "/strict-b"] {
+        let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+        let req = format!(
+            "POST {route}/up HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+             transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        drop(tls);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let resp = h
+            .client()
+            .get(h.url(&format!("{route}/after")))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{route}: breaker must stay closed");
+    }
 }

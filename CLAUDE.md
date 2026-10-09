@@ -58,14 +58,15 @@ SIGUSR1 reloads.
   and passes it to `handle_checked`; `h2c` is exempt.
 - Only upstream-caused failures may count against the breaker: transport
   errors, 502–504, response-body errors (an error from the upstream body,
-  not a slow or long one), and timeouts after the upload finished (the
-  upstream timer fires only then, or when hyper stopped reading the body
-  while the client was not stalling). Client-side failures (body cap 413,
-  idle/total upload deadline 408, disconnect 400) and elapsed time in a
-  response body (a long stream) must not, or any
-  tenant can open a route's breaker for everyone. They must not call
-  `mark_success` either, or a client could close an open breaker by
-  aborting an upload.
+  not a slow or long one), and timeouts after the upload finished, and not
+  while the proxy is waiting on the client's upload (an upstream that hangs
+  up on a stalled client is reacting to the client). The upstream timer
+  fires only after the upload finished, or when hyper stopped reading the
+  body while the client was not stalling. Client-side failures (body cap
+  413, idle/total upload deadline 408, disconnect 400) and elapsed time in
+  a response body (a long stream) must not count, or any tenant can open a
+  route's breaker for everyone. They must not call `mark_success` either,
+  or a client could close an open breaker by aborting an upload.
 - Bodies stream; nothing is buffered. Every rejection that needs no
   upstream (400 bad path, 501 upgrade, 413 declared Content-Length, 404)
   happens before `RouteTable::lookup`, because lookup may admit the request
