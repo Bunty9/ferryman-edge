@@ -98,6 +98,10 @@ pub struct RouteToml {
     /// Skip active health probing for this route.
     #[serde(default)]
     pub health_disabled: bool,
+    /// `true`: send the upstream's authority as `Host` (0.1.x behaviour).
+    /// `false` (default): keep the client's `Host`.
+    #[serde(default)]
+    pub rewrite_host: bool,
 }
 
 /// `[mtls]` (deprecated alias `[tls]`): material for `tls::build_mtls_config`.
@@ -311,7 +315,9 @@ pub fn build_table(cfg: &ConfigToml) -> anyhow::Result<RouteTable> {
                 r.prefix
             );
         }
-        let up = Upstream::new(uri, cooldown).with_health(r.health_path.clone(), r.health_disabled);
+        let up = Upstream::new(uri, cooldown)
+            .with_health(r.health_path.clone(), r.health_disabled)
+            .with_rewrite_host(r.rewrite_host);
         rules.push((r.prefix.clone(), up));
     }
     let secs = Duration::from_secs;
@@ -561,5 +567,21 @@ health_path = "/ready"
         let t = build_table(&c.core).unwrap();
         let a = t.lookup("/svc-a").unwrap();
         assert_eq!((a.health_path(), a.health_disabled()), ("/ready", true));
+    }
+
+    #[test]
+    fn rewrite_host_key_reaches_the_upstream() {
+        let on = EdgeConfig::parse(&cfg("", "", "", "", "rewrite_host = true")).unwrap();
+        let off = EdgeConfig::parse(&cfg("", "", "", "", "")).unwrap();
+        assert!(build_table(&on.core)
+            .unwrap()
+            .lookup("/svc-a")
+            .unwrap()
+            .rewrite_host());
+        assert!(!build_table(&off.core)
+            .unwrap()
+            .lookup("/svc-a")
+            .unwrap()
+            .rewrite_host());
     }
 }

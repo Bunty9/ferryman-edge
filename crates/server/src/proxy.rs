@@ -562,6 +562,53 @@ pub async fn handle_with(
     handle_checked(table, client, req, peer_ip, upgrade, limits).await
 }
 
+/// The `Host` the upstream sees, and `x-forwarded-host` (E1).
+///
+/// By default this is the client's host: the request-target authority
+/// (h2 `:authority`, or an HTTP/1 absolute-form URI) wins over `Host`, per
+/// RFC 9112 section 3.2.2. `rewrite_host` sends the upstream's own
+/// authority instead (the 0.1.x behaviour). A client-sent
+/// `x-forwarded-host` is always replaced.
+///
+/// This is the only place `rewrite_host` is interpreted.
+fn set_host(
+    headers: &mut HeaderMap,
+    client_uri: &http::Uri,
+    upstream_uri: &http::Uri,
+    rewrite_host: bool,
+) {
+    let client_host = client_uri
+        .authority()
+        .and_then(host_value)
+        .or_else(|| headers.get(http::header::HOST).cloned());
+    headers.remove("x-forwarded-host");
+    if let Some(h) = &client_host {
+        headers.insert("x-forwarded-host", h.clone());
+    }
+    let host = if rewrite_host {
+        upstream_uri.authority().and_then(host_value)
+    } else {
+        client_host
+    };
+    match host {
+        Some(h) => {
+            headers.insert(http::header::HOST, h);
+        }
+        None => {
+            headers.remove(http::header::HOST);
+        }
+    }
+}
+
+/// `host[:port]` of an authority, without userinfo.
+fn host_value(a: &http::uri::Authority) -> Option<HeaderValue> {
+    let s = match a.port() {
+        Some(p) => format!("{}:{p}", a.host()),
+        None => a.host().to_string(),
+    };
+    HeaderValue::from_str(&s).ok()
+}
+
 /// `handle` with the upgrade check done by the caller, who saw the headers
 /// before they were stripped.
 pub(crate) async fn handle_checked(
@@ -612,12 +659,12 @@ pub(crate) async fn handle_checked(
     // this is always a full rebuild, never a patch.
     let mut up_parts = upstream.uri.clone().into_parts();
     up_parts.path_and_query = parts.uri.path_and_query().cloned();
-    if let Some(authority) = upstream.uri.authority() {
-        parts.headers.insert(
-            http::header::HOST,
-            HeaderValue::from_str(authority.as_str())?,
-        );
-    }
+    set_host(
+        &mut parts.headers,
+        &parts.uri,
+        &upstream.uri,
+        upstream.rewrite_host(),
+    );
     parts.uri = http::Uri::from_parts(up_parts)?;
     // hyper-util's legacy Client rejects an HTTP/2-versioned request on an
     // HTTP/1 connection; upstreams here are plain http://, so downgrade.
@@ -701,7 +748,8 @@ pub(crate) async fn handle_checked(
 
 #[cfg(test)]
 mod tests {
-    use super::{bad_path, stall_threshold, wants_upgrade};
+    use super::{bad_path, set_host, stall_threshold, wants_upgrade};
+    use http::{HeaderMap, HeaderValue};
     use std::time::Duration;
 
     #[test]
@@ -711,6 +759,47 @@ mod tests {
         assert_eq!(stall_threshold(ms(100)), ms(100));
         assert_eq!(stall_threshold(ms(600)), ms(300));
         assert_eq!(stall_threshold(Duration::from_secs(30)), ms(1000));
+    }
+
+    #[test]
+    fn host_policy() {
+        let up: http::Uri = "http://10.0.0.5:8001".parse().unwrap();
+        let get = |h: &HeaderMap, n: &str| h.get(n).unwrap().to_str().unwrap().to_string();
+
+        // Origin-form: the Host header is kept; a client XFH is replaced.
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("app.example"));
+        h.insert("x-forwarded-host", HeaderValue::from_static("evil.example"));
+        set_host(&mut h, &"/x".parse().unwrap(), &up, false);
+        assert_eq!(get(&h, "host"), "app.example");
+        assert_eq!(get(&h, "x-forwarded-host"), "app.example");
+
+        // A request-target authority (h2 :authority, absolute-form) wins.
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("ignored.example"));
+        let abs: http::Uri = "https://api.example:8443/x".parse().unwrap();
+        set_host(&mut h, &abs, &up, false);
+        assert_eq!(get(&h, "host"), "api.example:8443");
+
+        // rewrite_host: upstream authority as Host, client host in XFH.
+        set_host(&mut h, &abs, &up, true);
+        assert_eq!(get(&h, "host"), "10.0.0.5:8001");
+        assert_eq!(get(&h, "x-forwarded-host"), "api.example:8443");
+
+        // Userinfo never reaches a header.
+        let mut h = HeaderMap::new();
+        set_host(
+            &mut h,
+            &"http://u:p@a.example/x".parse().unwrap(),
+            &up,
+            false,
+        );
+        assert_eq!(get(&h, "host"), "a.example");
+
+        // No host at all: no Host header and no XFH.
+        let mut h = HeaderMap::new();
+        set_host(&mut h, &"/x".parse().unwrap(), &up, false);
+        assert!(h.get("host").is_none() && h.get("x-forwarded-host").is_none());
     }
 
     #[test]

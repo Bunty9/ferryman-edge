@@ -210,6 +210,12 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let xfh = req
+        .headers()
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let xff = req
         .headers()
         .get("x-forwarded-for")
@@ -228,6 +234,7 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .header("x-echo-path", path)
         .header("x-echo-tenant", tenant)
         .header("x-echo-host", host)
+        .header("x-echo-xfh", xfh)
         .body(Full::new(body))
         .unwrap())
 }
@@ -557,6 +564,11 @@ impl Harness {
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
             ),
             (
+                "/rewrite".to_string(),
+                Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30)
+                    .with_rewrite_host(true),
+            ),
+            (
                 "/slow".to_string(),
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
             ),
@@ -780,9 +792,63 @@ async fn valid_request_succeeds_and_tenant_header_is_enforced() {
     assert_eq!(resp.headers().get("x-echo-tenant").unwrap(), "tenant-a");
     assert_eq!(
         resp.headers().get("x-echo-host").unwrap().to_str().unwrap(),
-        h.upstream_addr.to_string()
+        format!("127.0.0.1:{}", h.proxy_addr.port()),
+        "the upstream sees the host the client used"
     );
     assert_eq!(resp.text().await.unwrap(), "hello body");
+}
+
+/// HTTP/1 `Host` reaches the upstream unchanged (E1), and a client cannot
+/// inject its own `x-forwarded-host`.
+#[tokio::test]
+async fn client_host_is_preserved_and_forwarded_host_is_not_spoofable() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, rest) = raw_get_with(
+        &h,
+        "/svc-a/host",
+        Some(&token),
+        "x-forwarded-host: evil.example\r\n",
+    )
+    .await;
+    assert!(s.contains(" 200"), "{s}");
+    let rest = rest.to_ascii_lowercase();
+    assert!(rest.contains("x-echo-host: localhost\r\n"), "{rest}");
+    assert!(rest.contains("x-echo-xfh: localhost\r\n"), "{rest}");
+}
+
+/// HTTP/2 has no Host header: `:authority` becomes the upstream's Host.
+#[tokio::test]
+async fn h2_authority_becomes_the_upstream_host() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/h2"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    let want = format!("127.0.0.1:{}", h.proxy_addr.port());
+    let get = |n: &str| resp.headers().get(n).unwrap().to_str().unwrap().to_string();
+    assert_eq!(get("x-echo-host"), want);
+    assert_eq!(get("x-echo-xfh"), want);
+}
+
+/// `rewrite_host = true` restores the 0.1.x behaviour for that route only.
+#[tokio::test]
+async fn rewrite_host_route_sends_the_upstream_authority() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, rest) = raw_get(&h, "/rewrite/x", Some(&token)).await;
+    assert!(s.contains(" 200"), "{s}");
+    let rest = rest.to_ascii_lowercase();
+    assert!(
+        rest.contains(&format!("x-echo-host: {}\r\n", h.upstream_addr)),
+        "{rest}"
+    );
+    assert!(rest.contains("x-echo-xfh: localhost\r\n"), "{rest}");
 }
 
 #[tokio::test]

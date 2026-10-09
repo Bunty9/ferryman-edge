@@ -27,6 +27,7 @@ are resolved against the process working directory.
 | `[[routes]] cooldown_secs` | `default_cooldown_secs` | yes | Per-route breaker cooldown, must be ≥ 1. |
 | `[[routes]] health_path` | `/health` | yes | Path the health checker probes on this upstream. Must start with `/`, no `?` or `#`. |
 | `[[routes]] health_disabled` | `false` | yes | `true` skips active probing for this route; only requests drive its breaker. While half-open, a client that abandons the probe request delays recovery by one cooldown; routes with active health checks recover on the next healthy probe. |
+| `[[routes]] rewrite_host` | `false` | yes | `true` sends the upstream's `host:port` as `Host`; `false` keeps the client's `Host`. `x-forwarded-host` always carries the client's host. |
 
 Set `issuer` and `audience` in every non-local deployment. Without them the
 proxy accepts any token signed by the issuer key, whichever service it was

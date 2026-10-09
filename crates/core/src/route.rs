@@ -59,6 +59,7 @@ pub struct Upstream {
     pub cooldown_secs: u64,
     health_path: Option<String>,
     health_disabled: bool,
+    rewrite_host: bool,
 }
 
 impl Upstream {
@@ -70,7 +71,19 @@ impl Upstream {
             cooldown_secs,
             health_path: None,
             health_disabled: false,
+            rewrite_host: false,
         }
+    }
+
+    /// Send the upstream's own authority as `Host` instead of the client's
+    /// (per-route `rewrite_host`; ferryman-core 0.3 has the same key).
+    pub fn with_rewrite_host(mut self, on: bool) -> Self {
+        self.rewrite_host = on;
+        self
+    }
+
+    pub fn rewrite_host(&self) -> bool {
+        self.rewrite_host
     }
 
     /// Set the health-probe path (`None` = `/health`) and whether probing
@@ -251,7 +264,9 @@ impl RouteTable {
                     && prev.health_path() == up.health_path()
                     && prev.health_disabled() == up.health_disabled()
             }) {
+                let rewrite_host = up.rewrite_host;
                 *up = prev.clone();
+                up.rewrite_host = rewrite_host;
             }
         }
     }
@@ -349,6 +364,20 @@ mod tests {
             moved.lookup("/svc-a").is_some(),
             "new upstream starts closed"
         );
+    }
+
+    #[test]
+    fn reload_keeps_breaker_and_applies_new_rewrite_host() {
+        let a = upstream(30);
+        let old = RouteTable::new(vec![("/svc-a".to_string(), a.clone())]);
+        a.mark_failed();
+        let mut new = RouteTable::new(vec![(
+            "/svc-a".to_string(),
+            upstream(30).with_rewrite_host(true),
+        )]);
+        new.inherit_breakers(&old);
+        assert!(new.lookup("/svc-a").is_none(), "breaker state carried over");
+        assert!(new.rules[0].1.rewrite_host(), "the new flag applies");
     }
 
     #[test]

@@ -24,6 +24,7 @@ struct Echo {
     path: String,
     tenant: Option<String>,
     host: Option<String>,
+    forwarded_host: Option<String>,
     forwarded_for: Option<String>,
     forwarded_proto: Option<String>,
     body_bytes: usize,
@@ -440,7 +441,6 @@ async fn jwt(d: &mut Demo) -> anyhow::Result<()> {
 async fn identity(d: &mut Demo) -> anyhow::Result<()> {
     d.scenario("Identity propagation: the backend sees the proxy's view, not the client's");
     let sub = "acme-corp";
-    let orders = d.backend_addrs["orders"].to_string();
 
     // h2: the client lies about who it is and where it came from.
     let resp = d
@@ -458,10 +458,16 @@ async fn identity(d: &mut Demo) -> anyhow::Result<()> {
         e.tenant.as_deref() == Some(sub),
         format!("{:?}", e.tenant),
     );
+    let client_host = d.edge.addr.to_string();
     d.check(
-        "Host is the upstream authority from config",
-        e.host.as_deref() == Some(&orders),
+        "Host is the one the client used (h2 :authority), not the upstream's",
+        e.host.as_deref() == Some(&client_host),
         format!("{:?}", e.host),
+    );
+    d.check(
+        "x-forwarded-host carries the same host",
+        e.forwarded_host.as_deref() == Some(&client_host),
+        format!("{:?}", e.forwarded_host),
     );
     d.check(
         "x-forwarded-for is the peer IP, not the client's claim",

@@ -52,6 +52,14 @@ Both crates share one version. Format follows
   client exceeds, since every gap is under θ. Uploads have their own idle (30 s) and total
   deadlines and get 408. The total default (`request_body_timeout_secs`)
   rises from 30 s to 300 s.
+- The upstream sees the client's `Host` (h2 `:authority` included), not
+  the upstream authority, plus `x-forwarded-host` with the same value; a
+  client-sent `x-forwarded-host` is dropped. Migration: set
+  `rewrite_host = true` on routes whose upstream needs its own authority
+  as Host.
+
+### Added
+- Per-route `rewrite_host` (same key and meaning as ferryman-core 0.3).
 
 ### Fixed
 - A long or slow streamed response (SSE, LLM, download) is no longer cut

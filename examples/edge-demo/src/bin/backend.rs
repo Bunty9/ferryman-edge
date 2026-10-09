@@ -117,8 +117,9 @@ async fn echo(
         "path": parts.uri.path(),
         // Trustworthy only because the proxy overwrote it: see module docs.
         "tenant": header_str("x-ferryman-tenant"),
-        // The proxy rewrites Host to the upstream authority from its config.
+        // The client's host, as the proxy preserves it (E1).
         "host": header_str(header::HOST.as_str()),
+        "forwarded_host": header_str("x-forwarded-host"),
         "forwarded_for": header_str("x-forwarded-for"),
         "forwarded_proto": header_str("x-forwarded-proto"),
         "body_bytes": body_bytes,
