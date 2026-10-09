@@ -244,7 +244,13 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
     if path.starts_with("/slow") || path.starts_with("/flaky/slow") {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
-    let body = req.into_body().collect().await.unwrap().to_bytes();
+    let collected = req.into_body().collect().await.unwrap();
+    // Trailer names the upstream received, if any.
+    let trailers = collected
+        .trailers()
+        .map(|t| t.keys().map(|n| n.as_str()).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let body = collected.to_bytes();
     Ok(Response::builder()
         .header("x-echo-xff", xff)
         .status(200)
@@ -255,6 +261,7 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .header("x-echo-host", host)
         .header("x-echo-xfh", xfh)
         .header("x-echo-names", names)
+        .header("x-echo-trailers", trailers)
         .body(Full::new(body))
         .unwrap())
 }
@@ -1016,7 +1023,7 @@ async fn client_cannot_strip_tenant_or_spoof_forwarding_headers() {
         .get(h.url("/svc-a/hello"))
         .header("authorization", format!("Bearer {token}"))
         .header("connection", "keep-alive, x-ferryman-tenant")
-        .header("x-forwarded-for", "6.6.6.6")
+        .header("x-forwarded-for", "1.2.3.4")
         .send()
         .await
         .unwrap();
@@ -2419,7 +2426,7 @@ async fn non_canonical_proxy_header_spellings_are_stripped_e2e() {
         &h,
         "/svc-a/x",
         Some(&token),
-        "X_Ferryman_Tenant: victim\r\nX_Forwarded_For: 6.6.6.6\r\nx_custom: 1\r\n",
+        "X_Ferryman_Tenant: t2\r\nX_Forwarded_For: 1.2.3.4\r\nx_custom: 1\r\n",
     )
     .await;
     assert!(s.contains(" 200"), "{s}");
@@ -2434,7 +2441,8 @@ async fn non_canonical_proxy_header_spellings_are_stripped_e2e() {
     assert!(!names.contains(&"x_forwarded_for"), "{names:?}");
     assert!(names.contains(&"x_custom"), "{names:?}");
     assert!(rest.contains("x-echo-tenant: tenant-a\r\n"), "{rest}");
-    assert!(!rest.contains("victim"), "only the real tenant: {rest}");
+    assert!(!rest.contains("t2"), "only the real tenant: {rest}");
+    assert!(!rest.contains("1.2.3.4"), "only the peer address: {rest}");
     assert!(rest.contains("x-echo-xff: 127.0.0.1\r\n"), "{rest}");
 }
 
@@ -2461,4 +2469,128 @@ async fn failed_head_with_a_broken_body_counts_once() {
         };
         assert_eq!(h.circuit("/trunc"), want, "after request {i}");
     }
+}
+
+/// Forwarding headers the proxy does not set itself, and other spellings of
+/// the ones it asserts, never reach the upstream; the values it sets do.
+#[tokio::test]
+async fn unset_forwarding_headers_and_other_spellings_are_stripped() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, rest) = raw_get_with(
+        &h,
+        "/svc-a/x",
+        Some(&token),
+        "X-Forwarded-Prefix: /p\r\nX-Forwarded-Port: 1\r\nX-Real-IP: 1.2.3.4\r\n\
+         x.ferryman.tenant: t2\r\nX.Forwarded.For: 1.2.3.4\r\nx-custom.1: k\r\n",
+    )
+    .await;
+    assert!(s.contains(" 200"), "{s}");
+    let rest = rest.to_ascii_lowercase();
+    let names: Vec<String> = rest
+        .lines()
+        .find_map(|l| l.strip_prefix("x-echo-names: "))
+        .unwrap_or_default()
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    for gone in [
+        "x-forwarded-prefix",
+        "x-forwarded-port",
+        "x-real-ip",
+        "x.ferryman.tenant",
+        "x.forwarded.for",
+    ] {
+        assert!(!names.iter().any(|n| n == gone), "{gone}: {names:?}");
+    }
+    assert!(names.iter().any(|n| n == "x-custom.1"), "{names:?}");
+    assert!(rest.contains("x-echo-tenant: tenant-a\r\n"), "{rest}");
+    assert!(rest.contains("x-echo-xff: 127.0.0.1\r\n"), "{rest}");
+}
+
+/// Request trailers are not forwarded, even when the client declares them.
+#[tokio::test]
+async fn request_trailers_are_not_forwarded() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /svc-a/t HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\nte: trailers\r\ntrailer: x-ferryman-tenant, x-extra\r\n\
+         connection: close\r\n\r\n4\r\nabcd\r\n0\r\nx-ferryman-tenant: other\r\n\
+         x-extra: 1\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut out))
+        .await
+        .expect("answered")
+        .unwrap();
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 200"), "{text}");
+    assert!(text.contains("x-echo-tenant: tenant-a\r\n"), "{text}");
+    assert!(
+        text.contains("x-echo-trailers: \r\n"),
+        "no trailers: {text}"
+    );
+    assert!(text.ends_with("abcd"), "{text}");
+}
+
+/// Library callers of `proxy::handle_with` (no `lib.rs` middleware) get the
+/// same strip: it runs inside the handler too.
+#[tokio::test]
+async fn handle_with_strips_other_spellings_for_library_callers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::new(0).await;
+    let table = h.table.clone();
+    let client: UpstreamClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let svc = service_fn(move |req| {
+            let (table, client) = (table.clone(), client.clone());
+            async move {
+                let resp = ferryman_edge::proxy::handle_with(
+                    table,
+                    client,
+                    req,
+                    peer.ip(),
+                    &Limits::default(),
+                )
+                .await
+                .unwrap();
+                Ok::<_, Infallible>(resp)
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), svc)
+            .await;
+    });
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(
+        b"GET /svc-a/x HTTP/1.1\r\nhost: localhost\r\nx.ferryman.tenant: t2\r\n\
+          X_Forwarded_For: 1.2.3.4\r\nX-Forwarded-Prefix: /p\r\nconnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut out))
+        .await
+        .expect("answered")
+        .unwrap();
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 200"), "{text}");
+    let names = text
+        .lines()
+        .find_map(|l| l.strip_prefix("x-echo-names: "))
+        .unwrap_or_default()
+        .to_string();
+    for gone in ["x.ferryman.tenant", "x_forwarded_for", "x-forwarded-prefix"] {
+        assert!(!names.split(',').any(|n| n == gone), "{gone}: {names}");
+    }
+    assert!(text.contains("x-echo-xff: 127.0.0.1\r\n"), "{text}");
 }

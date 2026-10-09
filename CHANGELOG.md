@@ -10,7 +10,11 @@ Both crates share one version. Format follows
 ### Security
 - Strip non-canonical spellings of proxy-asserted headers (forwarding
   headers, `x-real-ip`, `x-ferryman-tenant`) from client requests, so only
-  the values the proxy sets reach the upstream.
+  the values the proxy sets reach the upstream. Client-sent forwarding
+  headers the proxy does not set itself (`forwarded`, `x-real-ip`,
+  `x-forwarded-port` / `-ssl` / `-scheme` / `-prefix`) are stripped too,
+  and request trailers are not forwarded. This also applies to library
+  callers of `proxy::handle` / `handle_with`.
 
 ### Changed (breaking)
 - Docker image: a static musl binary in `scratch` running as `65532:65532`

@@ -111,18 +111,31 @@ const PROXY_ASSERTED_HEADERS: &[&str] = &[
     "x-ferryman-tenant",
 ];
 
+/// Of [`PROXY_ASSERTED_HEADERS`], the ones the proxy sets on every forwarded
+/// request (`set_host`, `set_forwarded`, the tenant stamp in `lib.rs`). The
+/// rest are removed outright.
+const SET_BY_PROXY: &[&str] = &[
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-ferryman-tenant",
+];
+
 /// Strip non-canonical spellings of proxy-asserted headers from a client
 /// request, whoever the peer is: only the canonical name, set by the proxy,
-/// may reach the upstream. Header names are already lowercase.
+/// may reach the upstream. A name is a spelling of a listed header when it
+/// differs from it but matches once every non-alphanumeric byte is read as
+/// `-`. Header names are already lowercase. Idempotent, and never touches a
+/// canonical name.
 pub(crate) fn strip_noncanonical_asserted(headers: &mut HeaderMap) {
     let spelled = |n: &str| {
-        n.contains('_')
-            && PROXY_ASSERTED_HEADERS.iter().any(|h| {
-                h.len() == n.len()
-                    && h.bytes()
-                        .zip(n.bytes())
-                        .all(|(a, b)| a == if b == b'_' { b'-' } else { b })
-            })
+        PROXY_ASSERTED_HEADERS.iter().any(|h| {
+            *h != n
+                && h.len() == n.len()
+                && h.bytes()
+                    .zip(n.bytes())
+                    .all(|(a, b)| a == if b.is_ascii_alphanumeric() { b } else { b'-' })
+        })
     };
     let drop: Vec<http::HeaderName> = headers
         .keys()
@@ -135,10 +148,19 @@ pub(crate) fn strip_noncanonical_asserted(headers: &mut HeaderMap) {
 }
 
 /// This is the edge: whatever forwarding headers the client sent are
-/// untrusted, so replace them with the peer address instead of appending.
+/// untrusted. Non-canonical spellings of every proxy-asserted header go, the
+/// canonical ones the proxy does not set (`forwarded`, `x-real-ip`,
+/// `x-forwarded-port`/`-ssl`/`-scheme`/`-prefix`) go, and
+/// `x-forwarded-for` / `x-forwarded-proto` are replaced with the peer
+/// address and `https`. Runs after `set_host`, which owns
+/// `x-forwarded-host`; the tenant header is stamped by the caller.
 fn set_forwarded(headers: &mut HeaderMap, ip: IpAddr) {
-    headers.remove("forwarded");
-    headers.remove("x-real-ip");
+    strip_noncanonical_asserted(headers);
+    for h in PROXY_ASSERTED_HEADERS {
+        if !SET_BY_PROXY.contains(h) {
+            headers.remove(*h);
+        }
+    }
     headers.insert(
         "x-forwarded-for",
         HeaderValue::from_str(&ip.to_string()).expect("an IP is a valid header value"),
@@ -459,45 +481,52 @@ impl RequestBody {
         if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(UploadError::TotalTimeout.into())));
         }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                this.idle_sleep = None;
-                if let (Some(left), Some(data)) = (this.remaining.as_mut(), frame.data_ref()) {
-                    let n = data.len() as u64;
-                    if n > *left {
-                        return Poll::Ready(Some(Err(UploadError::TooLarge.into())));
+        // Trailers are dropped: the upstream gets only the body data.
+        loop {
+            break match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
+                    this.idle_sleep = None;
+                    continue;
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    this.idle_sleep = None;
+                    if let (Some(left), Some(data)) = (this.remaining.as_mut(), frame.data_ref()) {
+                        let n = data.len() as u64;
+                        if n > *left {
+                            return Poll::Ready(Some(Err(UploadError::TooLarge.into())));
+                        }
+                        *left -= n;
                     }
-                    *left -= n;
+                    // The last frame of a content-length body may not be
+                    // followed by another poll, so check here as well as on None.
+                    this.signal_if_done();
+                    Poll::Ready(Some(Ok(frame)))
                 }
-                // The last frame of a content-length body may not be
-                // followed by another poll, so check here as well as on None.
-                this.signal_if_done();
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(None) => {
-                if let Some(tx) = this.eos.take() {
-                    let _ = tx.send(());
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(None) => {
+                    if let Some(tx) = this.eos.take() {
+                        let _ = tx.send(());
+                    }
+                    Poll::Ready(None)
                 }
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                let idle = this.idle;
-                let idle_sleep = this
-                    .idle_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
-                if idle_sleep.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Some(Err(UploadError::IdleTimeout.into())));
+                Poll::Pending => {
+                    let idle = this.idle;
+                    let idle_sleep = this
+                        .idle_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                    if idle_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(UploadError::IdleTimeout.into())));
+                    }
+                    let deadline = this.deadline;
+                    let total_sleep = this
+                        .total_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+                    if total_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(UploadError::TotalTimeout.into())));
+                    }
+                    Poll::Pending
                 }
-                let deadline = this.deadline;
-                let total_sleep = this
-                    .total_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
-                if total_sleep.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Some(Err(UploadError::TotalTimeout.into())));
-                }
-                Poll::Pending
-            }
+            };
         }
     }
 }
@@ -1027,15 +1056,31 @@ mod tests {
                 );
             }
         }
+        // Other separators, and mixed ones, are spellings too.
+        for h in PROXY_ASSERTED_HEADERS {
+            for alt in [
+                h.replace('-', "."),
+                h.replacen('-', ".", 1).replace('-', "_"),
+            ] {
+                if alt != *h {
+                    m.insert(
+                        http::HeaderName::from_bytes(alt.as_bytes()).unwrap(),
+                        HeaderValue::from_static("drop"),
+                    );
+                }
+            }
+        }
         m.insert("x_custom", HeaderValue::from_static("keep"));
         m.insert("x-forwarded_for_x", HeaderValue::from_static("keep"));
+        m.insert("x.custom", HeaderValue::from_static("keep"));
+        assert!(m.contains_key("x.ferryman.tenant") && m.contains_key("x.forwarded_for"));
         strip_noncanonical_asserted(&mut m);
         for h in PROXY_ASSERTED_HEADERS {
             assert_eq!(m.get(*h).unwrap(), "keep", "{h}");
         }
         assert!(m.values().all(|v| v == "keep"), "{m:?}");
         assert!(m.contains_key("x_custom") && m.contains_key("x-forwarded_for_x"));
-        assert_eq!(m.len(), PROXY_ASSERTED_HEADERS.len() + 2);
+        assert_eq!(m.len(), PROXY_ASSERTED_HEADERS.len() + 3);
     }
 
     #[test]

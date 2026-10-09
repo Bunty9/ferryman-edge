@@ -56,7 +56,11 @@ SIGUSR1 reloads.
   is stamped; otherwise `Connection: x-ferryman-tenant` deletes it. Right
   after that strip, `proxy::strip_noncanonical_asserted` drops
   non-canonical spellings of the headers in `PROXY_ASSERTED_HEADERS` (for
-  every peer); keep a header there whenever the proxy starts asserting it.
+  every peer; any name that differs from a listed one but matches it with
+  non-alphanumeric bytes read as `-`). `set_forwarded` runs it again (for
+  `proxy::handle` callers; idempotent) and removes every listed canonical
+  name not in `SET_BY_PROXY`. Keep a header in the list whenever the proxy
+  starts asserting it. Request trailers are dropped in `RequestBody`.
 - Order in `proxy::handle_checked` (called by `handle` and `handle_with`):
   `bad_path` → `ambiguous_route` (both 400 bad path, both from
   `ferryman_core::path`, both on the raw path; `ambiguous_route` relies on

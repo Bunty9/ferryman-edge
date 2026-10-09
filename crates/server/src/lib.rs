@@ -226,6 +226,7 @@ async fn route_request(
     // stamped value.
     let upgrade = proxy::wants_upgrade(&req);
     proxy::strip_hop_by_hop(req.headers_mut());
+    // Also run by `set_forwarded` (for `proxy::handle` callers); idempotent.
     proxy::strip_noncanonical_asserted(req.headers_mut());
     // Stamp the tenant for the upstream; discard whatever the client sent
     // to close the obvious spoofing hole.
