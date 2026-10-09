@@ -9,7 +9,12 @@
 //! or download is never cut and never trips the breaker. The upload has
 //! its own idle and total deadlines and an optional size cap. Those fail
 //! with 408/413 and never touch the breaker. An error from the response body
-//! (not a slow or long one) counts against the breaker.
+//! (not a slow or long one) counts against the breaker. An upstream failure
+//! after the client stalled its upload or its response reads for at least
+//! min(1 s, idle gap / 2) does not: the upstream was reacting to the client.
+//! Known limits: an upstream whose own read/write timeout is under that
+//! threshold can still be blamed for a client stall, and a gateway upstream
+//! answering 502/504 because its backend timed out on a stalled upload is.
 //!
 //! Auth (JWT verify + rate limit + `x-ferryman-tenant` stamping) happens in
 //! `lib.rs` before a request reaches `handle`.
@@ -28,7 +33,7 @@ use hyper_util::client::legacy::Client;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -241,24 +246,56 @@ pub struct RequestBody {
     state: Arc<BodyState>,
 }
 
-/// What the timer can see of the body: whether hyper polled it, and
-/// whether the last poll was left waiting on the client (rather than
-/// hyper having stopped reading because the upstream isn't draining it).
-#[derive(Default)]
+/// What the timer and the blame checks can see of the body: whether hyper
+/// polled it, and since when the last poll has been left waiting on the
+/// client (rather than hyper having stopped reading because the upstream
+/// isn't draining it).
 struct BodyState {
     polled: AtomicBool,
-    waiting_on_client: AtomicBool,
+    /// Start of the current wait on the client, as nanoseconds since `base`
+    /// plus one; 0 while not waiting. Set on a `Pending` poll, cleared by
+    /// any `Ready` (frame, end of stream, error).
+    waiting_since: AtomicU64,
+    base: tokio::time::Instant,
+    /// How long a client must stall (upload, or pulling the response) before
+    /// an upstream failure is put down to that stall: min(1 s, idle gap / 2).
+    stall: Duration,
     /// The request body yielded an error (cap, deadline, client broke off).
     client_failed: AtomicBool,
 }
 
 impl BodyState {
-    /// The proxy is parked waiting for the client's next upload frame. An
-    /// upstream that gives up now (its own read timeout, say) is reacting to
-    /// the client's stall, so it is not blamed. Once the upload has finished,
-    /// or while the client is actively sending, the flag is clear.
+    fn new(idle: Duration) -> Self {
+        Self {
+            polled: AtomicBool::new(false),
+            waiting_since: AtomicU64::new(0),
+            base: tokio::time::Instant::now(),
+            stall: (idle / 2).min(Duration::from_secs(1)),
+            client_failed: AtomicBool::new(false),
+        }
+    }
+
+    fn now_mark(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1)
+    }
+
+    /// The last poll of the upload was left waiting on the client. During a
+    /// normal upload this is true most of the time (the proxy drains the
+    /// client faster than it sends), so it is no excuse for an upstream
+    /// failure on its own; see [`Self::client_stalled`].
     fn waiting_on_client(&self) -> bool {
-        self.waiting_on_client.load(Ordering::Acquire)
+        self.waiting_since.load(Ordering::Acquire) != 0
+    }
+
+    /// The proxy has been waiting on the client's next upload frame for at
+    /// least `stall`. An upstream that gives up now (its own read timeout,
+    /// say) is reacting to the client's stall, so it is not blamed. An
+    /// upstream that dies while the client keeps sending is.
+    fn client_stalled(&self) -> bool {
+        let since = self.waiting_since.load(Ordering::Acquire);
+        since != 0 && Duration::from_nanos(self.now_mark().saturating_sub(since)) >= self.stall
     }
 }
 
@@ -271,7 +308,7 @@ pub(crate) struct Eos {
 impl RequestBody {
     fn new(inner: Incoming, cap: Option<u64>, idle: Duration, total: Duration) -> (Self, Eos) {
         let (tx, rx) = oneshot::channel();
-        let state = Arc::new(BodyState::default());
+        let state = Arc::new(BodyState::new(idle));
         let mut b = Self {
             inner,
             remaining: cap,
@@ -305,8 +342,21 @@ impl hyper::body::Body for RequestBody {
     ) -> Poll<Option<Result<Frame<Bytes>, BoxErr>>> {
         let this = self.get_mut();
         let polled = this.poll_inner(cx);
-        if matches!(polled, Poll::Ready(Some(Err(_)))) {
-            this.state.client_failed.store(true, Ordering::Release);
+        let state = &this.state;
+        match polled {
+            Poll::Pending => {
+                if state.waiting_since.load(Ordering::Acquire) == 0 {
+                    state
+                        .waiting_since
+                        .store(state.now_mark(), Ordering::Release);
+                }
+            }
+            Poll::Ready(ref r) => {
+                state.waiting_since.store(0, Ordering::Release);
+                if matches!(r, Some(Err(_))) {
+                    state.client_failed.store(true, Ordering::Release);
+                }
+            }
         }
         polled
     }
@@ -330,7 +380,6 @@ impl RequestBody {
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 this.idle_sleep = None;
-                this.state.waiting_on_client.store(false, Ordering::Release);
                 if let (Some(left), Some(data)) = (this.remaining.as_mut(), frame.data_ref()) {
                     let n = data.len() as u64;
                     if n > *left {
@@ -343,19 +392,14 @@ impl RequestBody {
                 this.signal_if_done();
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => {
-                this.state.waiting_on_client.store(false, Ordering::Release);
-                Poll::Ready(Some(Err(e.into())))
-            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Ready(None) => {
-                this.state.waiting_on_client.store(false, Ordering::Release);
                 if let Some(tx) = this.eos.take() {
                     let _ = tx.send(());
                 }
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                this.state.waiting_on_client.store(true, Ordering::Release);
                 let idle = this.idle;
                 let idle_sleep = this
                     .idle_sleep
@@ -395,7 +439,7 @@ async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
             }
             () = tokio::time::sleep(upstream_timeout) => {
                 if !state.polled.swap(false, Ordering::AcqRel)
-                    && !state.waiting_on_client.load(Ordering::Acquire)
+                    && !state.waiting_on_client()
                 {
                     return;
                 }
@@ -409,11 +453,22 @@ async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
 /// stream) is the upstream's fault and counts against the breaker, once. The
 /// head already reported success; a slow or long body is never blamed, and a
 /// client that goes away drops the body without a poll error.
+///
+/// Not blamed either: an error after the client was slow to pull the
+/// response. hyper polls this body only when the client side can take more,
+/// so a gap of at least `stall` between a frame (or the head) and the next
+/// poll means the client paused reading; an upstream with a write timeout
+/// then hangs up, reacting to that client.
 struct WatchedBody {
     inner: Incoming,
     upstream: Upstream,
     request: Arc<BodyState>,
     failed: bool,
+    /// When the head or the last frame was handed on and not yet followed
+    /// by another poll.
+    ready_at: Option<tokio::time::Instant>,
+    /// Sticky: the client once took at least `stall` to pull the next frame.
+    client_stalled_reading: bool,
 }
 
 impl hyper::body::Body for WatchedBody {
@@ -425,7 +480,16 @@ impl hyper::body::Body for WatchedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         let this = self.get_mut();
+        let now = tokio::time::Instant::now();
+        if let Some(t) = this.ready_at.take() {
+            if now - t >= this.request.stall {
+                this.client_stalled_reading = true;
+            }
+        }
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(_))) = &polled {
+            this.ready_at = Some(now);
+        }
         // The upstream may answer before it has read the whole upload. If the
         // client then aborts or stalls, hyper tears the connection down and
         // surfaces a plain "connection error" here, with no trace of the
@@ -435,7 +499,8 @@ impl hyper::body::Body for WatchedBody {
             if !this.failed
                 && client_fault(e).is_none()
                 && !this.request.client_failed.load(Ordering::Acquire)
-                && !this.request.waiting_on_client()
+                && !this.request.client_stalled()
+                && !this.client_stalled_reading
             {
                 this.failed = true;
                 this.upstream.mark_failed();
@@ -573,9 +638,10 @@ pub(crate) async fn handle_checked(
                 return plain(status, msg);
             }
             tracing::warn!(upstream = %host, error = %e, "upstream request failed");
-            // An upstream that drops the connection while we wait on a
-            // stalled client is reacting to that stall: answer 502, blame no one.
-            if !client_state.waiting_on_client() {
+            // An upstream that drops the connection after the client stalled
+            // its upload for `stall` is reacting to that stall: answer 502,
+            // blame no one.
+            if !client_state.client_stalled() {
                 upstream.mark_failed();
             }
             return upstream_error(502, b"bad gateway", host);
@@ -601,6 +667,9 @@ pub(crate) async fn handle_checked(
         upstream: upstream.clone(),
         request: client_state,
         failed: false,
+        // The gap between the head and the first body poll counts too.
+        ready_at: Some(tokio::time::Instant::now()),
+        client_stalled_reading: false,
     };
     strip_hop_by_hop(&mut resp_parts.headers);
     // Don't echo the upstream's HTTP version back; hyper picks the wire version.

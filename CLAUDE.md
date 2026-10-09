@@ -59,8 +59,14 @@ SIGUSR1 reloads.
 - Only upstream-caused failures may count against the breaker: transport
   errors, 502–504, response-body errors (an error from the upstream body,
   not a slow or long one), and timeouts after the upload finished, and not
-  while the proxy is waiting on the client's upload (an upstream that hangs
-  up on a stalled client is reacting to the client). The upstream timer
+  after the client has stalled its upload or its response reads for at
+  least θ = min(1 s, request_body_idle_timeout / 2) (an upstream that hangs
+  up on a stalled client is reacting to the client). Merely "waiting on the
+  client" is no excuse: the proxy waits on an actively sending client nearly
+  all the time. Known limits: an upstream whose own read/write timeout is
+  under θ can still be blamed for a client stall, and a gateway upstream
+  answering 502/504 because its backend timed out on a stalled upload is
+  blamed. The upstream timer
   fires only after the upload finished, or when hyper stopped reading the
   body while the client was not stalling. Client-side failures (body cap
   413, idle/total upload deadline 408, disconnect 400) and elapsed time in

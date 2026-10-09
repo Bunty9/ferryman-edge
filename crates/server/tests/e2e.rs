@@ -336,8 +336,97 @@ async fn spawn_early_upstream() -> SocketAddr {
     addr
 }
 
+/// Reads a request head; answers a GET with an empty 200 and `connection:
+/// close`. Returns the head text and any body bytes read with it, or `None`
+/// once a GET has been answered.
+async fn raw_head(stream: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    let end = loop {
+        if let Some(i) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    };
+    let text = String::from_utf8_lossy(&head[..end]).into_owned();
+    if text.starts_with("GET ") && !text.contains(" /wt/big") {
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await;
+        return None;
+    }
+    Some((text, head[end..].to_vec()))
+}
+
+/// Reads about 2 KB of a request body, then dies without answering (an
+/// unhealthy upstream, whatever the client is doing).
+async fn spawn_dying_upstream() -> SocketAddr {
+    use tokio::io::AsyncReadExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let Some((_, body)) = raw_head(&mut stream).await else {
+                    return;
+                };
+                let mut got = body.len();
+                let mut buf = [0u8; 512];
+                while got < 2048 {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => got += n,
+                    }
+                }
+                // Dropped with the rest of the upload unread: a reset.
+            });
+        }
+    });
+    addr
+}
+
+/// `GET /wt/big` streams a 64 MiB body under a 1 s per-write timeout (like Go's
+/// `WriteTimeout` or nginx's `send_timeout`): a reader that pauses makes it
+/// hang up mid-body.
+async fn spawn_write_timeout_upstream() -> SocketAddr {
+    use tokio::io::AsyncWriteExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                if raw_head(&mut stream).await.is_none() {
+                    return;
+                }
+                let head = b"HTTP/1.1 200 OK\r\ncontent-length: 67108864\r\n\r\n";
+                if stream.write_all(head).await.is_err() {
+                    return;
+                }
+                let chunk = vec![b'x'; 64 * 1024];
+                for _ in 0..1024 {
+                    let w = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&chunk));
+                    if !matches!(w.await, Ok(Ok(()))) {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 /// An upstream with a strict read timeout: it closes the connection if no
-/// body bytes arrive for 1 s. `/strict-b` sends its 200 head first, `/strict-a`
+/// body bytes arrive for 1.5 s (above the proxy's 1 s stall threshold). `/strict-b` sends its 200 head first, `/strict-a`
 /// does not. A GET (no body) is answered normally.
 async fn spawn_strict_read_upstream() -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -372,7 +461,7 @@ async fn spawn_strict_read_upstream() -> SocketAddr {
                         .await;
                 }
                 while let Ok(Ok(n)) =
-                    tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await
+                    tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut buf)).await
                 {
                     if n == 0 {
                         break;
@@ -447,6 +536,8 @@ impl Harness {
         let trunc_addr = spawn_truncating_upstream().await;
         let early_addr = spawn_early_upstream().await;
         let strict_addr = spawn_strict_read_upstream().await;
+        let dying_addr = spawn_dying_upstream().await;
+        let wt_addr = spawn_write_timeout_upstream().await;
         let down_addr = closed_port();
 
         let tls = ReloadingTls::new(
@@ -476,6 +567,14 @@ impl Harness {
             (
                 "/strict-b".to_string(),
                 Upstream::new(format!("http://{strict_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/dies".to_string(),
+                Upstream::new(format!("http://{dying_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/wt".to_string(),
+                Upstream::new(format!("http://{wt_addr}").parse().unwrap(), 30),
             ),
             (
                 "/early".to_string(),
@@ -1725,4 +1824,88 @@ async fn upstream_read_timeout_during_a_client_stall_does_not_trip_the_breaker()
             .unwrap();
         assert_eq!(resp.status(), 200, "{route}: breaker must stay closed");
     }
+}
+
+/// An upstream that dies mid-upload while the client is actively sending is
+/// unhealthy: the breaker opens. The proxy is parked on the client between
+/// chunks nearly all the time, so "waiting on the client" alone must not
+/// excuse the upstream; only a stall of at least the threshold does.
+#[tokio::test]
+async fn upstream_dying_mid_upload_while_the_client_sends_trips_the_breaker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let (mut rd, mut wr) = tokio::io::split(tls);
+    let head = format!(
+        "POST /dies/up HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n"
+    );
+    let writer = tokio::spawn(async move {
+        wr.write_all(head.as_bytes()).await?;
+        let chunk = format!("100\r\n{}\r\n", "x".repeat(256));
+        for _ in 0..400 {
+            wr.write_all(chunk.as_bytes()).await?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::io::Result::Ok(())
+    });
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(5), rd.read(&mut buf))
+        .await
+        .expect("answered")
+        .unwrap();
+    writer.abort();
+    let line = String::from_utf8_lossy(&buf[..n]);
+    assert!(line.starts_with("HTTP/1.1 502"), "{line}");
+    let resp = h
+        .client()
+        .get(h.url("/dies/after"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503, "breaker must open");
+}
+
+/// A client that pauses reading a large response makes an upstream with a
+/// write timeout hang up mid-body. That is the client's stall: the breaker
+/// must stay closed.
+#[tokio::test]
+async fn upstream_write_timeout_during_a_paused_reader_does_not_trip_the_breaker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "GET /wt/big HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         connection: close\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut got = 0;
+    while got < 64 * 1024 {
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 0, "response ended early");
+        got += n;
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let mut total = got;
+    while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf)).await {
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(total < 64 << 20, "upstream must have hung up mid-body");
+    let resp = h
+        .client()
+        .get(h.url("/wt/after"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
 }

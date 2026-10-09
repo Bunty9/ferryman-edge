@@ -156,7 +156,13 @@ error from the upstream body does. While half-open, a client that abandons
 the probe request delays recovery by one cooldown (routes with active health
 checks recover on the next healthy probe). A plain `500` does not trip it,
 and neither does a failure caused by the client's own body (size cap,
-disconnect, stall), even if the upstream had already answered. The active health
+disconnect, stall), even if the upstream had already answered. An upstream
+that hangs up after the client stalled its upload, or paused reading the
+response, for at least θ = min(1 s, `request_body_idle_timeout_secs` / 2) is
+not blamed either; one that dies while the client keeps sending or reading
+is. Known limits: an upstream whose own read or write timeout is under θ can
+still be blamed for a client stall, and a gateway upstream that answers
+502/504 because its own backend timed out on a stalled upload is blamed. The active health
 checker (`GET <upstream>/health` every `health_interval_secs`; per-route
 `health_path` / `health_disabled` change or skip the probe) opens and
 closes it too. A route reload keeps breaker state for rules whose prefix,
