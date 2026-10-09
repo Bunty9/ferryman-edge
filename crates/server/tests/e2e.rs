@@ -872,7 +872,7 @@ async fn forwarded_host_variants_and_absolute_form() {
 async fn bad_host_headers_are_rejected_and_good_ones_pass() {
     let h = Harness::new(0).await;
     let token = mint_jwt("tenant-a", 3600, "read");
-    for bad in ["a.example, b.example", "u@x", "x/y"] {
+    for bad in ["a.example, b.example", "u@x", "x/y", "x:99999", "a:b", "*"] {
         let (s, rest) = raw_host(&h, &token, &[bad]).await;
         assert!(s.contains(" 400"), "{bad}: {s}");
         assert!(rest.contains("bad host"), "{bad}: {rest}");
@@ -888,11 +888,15 @@ async fn bad_host_headers_are_rejected_and_good_ones_pass() {
 }
 
 async fn raw_host(h: &Harness, token: &str, hosts: &[&str]) -> (String, String) {
+    raw_host_ver(h, token, "1.1", hosts).await
+}
+
+async fn raw_host_ver(h: &Harness, token: &str, ver: &str, hosts: &[&str]) -> (String, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
     let hs: String = hosts.iter().map(|v| format!("host: {v}\r\n")).collect();
     let req = format!(
-        "GET /svc-a/x HTTP/1.1\r\n{hs}authorization: Bearer {token}\r\nconnection: close\r\n\r\n"
+        "GET /svc-a/x HTTP/{ver}\r\n{hs}authorization: Bearer {token}\r\nconnection: close\r\n\r\n"
     );
     tls.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();

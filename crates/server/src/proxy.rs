@@ -614,6 +614,27 @@ fn parse_host(v: &HeaderValue) -> Option<HeaderValue> {
     {
         return None;
     }
+    let s = v.to_str().ok()?;
+    // Whatever follows the host part (after `]` for an IPv6 literal) must be
+    // `:` plus a 1-5 digit port that fits u16; `Authority` alone accepts
+    // `a:b`, `x:99999` and `x:`.
+    let rest = if s.starts_with('[') {
+        s.find(']').map(|i| &s[i + 1..])?
+    } else {
+        s.find(':').map_or("", |i| &s[i..])
+    };
+    if !rest.is_empty() {
+        let port = rest.strip_prefix(':')?;
+        if port.len() > 5
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return None;
+        }
+    }
+    if s == "*" {
+        return None;
+    }
     http::uri::Authority::try_from(v.as_bytes())
         .ok()
         .and_then(|a| host_value(&a))
@@ -622,10 +643,11 @@ fn parse_host(v: &HeaderValue) -> Option<HeaderValue> {
 /// More than one `Host`, or (when the request target has no authority, so
 /// the header is what gets used) one that is not a plain authority. Checked
 /// before `lookup`, so the 400 cannot leak a half-open probe slot.
-fn bad_host(headers: &HeaderMap, uri: &http::Uri) -> bool {
+fn bad_host(headers: &HeaderMap, uri: &http::Uri, version: http::Version) -> bool {
     let mut it = headers.get_all(http::header::HOST).iter();
     match (it.next(), it.next()) {
-        (None, _) => false,
+        // RFC 9112 section 3.2: HTTP/1.1 needs a Host or an absolute target.
+        (None, _) => version == http::Version::HTTP_11 && uri.authority().is_none(),
         (Some(v), None) => uri.authority().is_none() && parse_host(v).is_none(),
         _ => true,
     }
@@ -661,7 +683,7 @@ pub(crate) async fn handle_checked(
     if bad_path(&path) {
         return plain(400, b"bad path");
     }
-    if bad_host(req.headers(), req.uri()) {
+    if bad_host(req.headers(), req.uri(), req.version()) {
         return plain(400, b"bad host");
     }
     if upgrade {
@@ -838,6 +860,7 @@ mod tests {
 
     #[test]
     fn host_validation() {
+        const V: http::Version = http::Version::HTTP_11;
         let h = |vals: &[&str]| {
             let mut m = HeaderMap::new();
             for v in vals {
@@ -845,25 +868,56 @@ mod tests {
             }
             m
         };
-        for bad in ["a.example, b.example", "u@x", "x/y", ""] {
-            assert!(bad_host(&h(&[bad]), &"/".parse().unwrap()), "{bad:?}");
+        for bad in [
+            "a.example, b.example",
+            "u@x",
+            "x/y",
+            "",
+            "a:b",
+            "x:99999",
+            "x:",
+            "*",
+            "[::1]:",
+        ] {
+            assert!(bad_host(&h(&[bad]), &"/".parse().unwrap(), V), "{bad:?}");
         }
         assert!(bad_host(
             &h(&["a.example", "b.example"]),
-            &"/".parse().unwrap()
+            &"/".parse().unwrap(),
+            V
         ));
-        for ok in ["a.example", "a.example:8443", "[::1]:8443", "LOCALHOST"] {
-            assert!(!bad_host(&h(&[ok]), &"/".parse().unwrap()), "{ok:?}");
+        for ok in [
+            "a.example",
+            "a.example:8443",
+            "x:8443",
+            "[::1]",
+            "[::1]:8443",
+            "LOCALHOST",
+        ] {
+            assert!(!bad_host(&h(&[ok]), &"/".parse().unwrap(), V), "{ok:?}");
         }
-        assert!(!bad_host(&HeaderMap::new(), &"/".parse().unwrap()));
+        // No Host: an error on HTTP/1.1 only.
+        assert!(bad_host(&HeaderMap::new(), &"/".parse().unwrap(), V));
+        assert!(!bad_host(
+            &HeaderMap::new(),
+            &"/".parse().unwrap(),
+            http::Version::HTTP_10
+        ));
+        assert!(!bad_host(
+            &HeaderMap::new(),
+            &"http://a.example/".parse().unwrap(),
+            V
+        ));
         // With a URI authority the header is not used, so it is not judged.
         assert!(!bad_host(
             &h(&["u@x"]),
-            &"http://a.example/".parse().unwrap()
+            &"http://a.example/".parse().unwrap(),
+            V
         ));
         assert!(bad_host(
             &h(&["a", "b"]),
-            &"http://a.example/".parse().unwrap()
+            &"http://a.example/".parse().unwrap(),
+            V
         ));
         // The validated value is what gets forwarded.
         let mut m = h(&["[::1]:8443"]);
