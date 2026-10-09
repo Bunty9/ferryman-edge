@@ -9,7 +9,7 @@
 # on this network can reach them. In production, enforce that with network
 # policy, not just by not publishing ports.
 #
-# Readiness: no container healthchecks. The images are distroless (no shell,
+# Readiness: no container healthchecks. The proxy image is `scratch` (no shell,
 # no curl), and the proxy doesn't need them: its own health checker probes
 # each backend's /health every `health_interval_secs` and keeps a route's
 # breaker open (503) until the backend answers.
@@ -26,6 +26,10 @@ services:
       context: ../../..
       dockerfile: Dockerfile
     image: ferryman-edge
+    # The image runs as 65532, but `edge-demo setup` writes the keys 0600
+    # for you. Run as your own uid so the mounted keys stay readable:
+    #   DEMO_UID=$(id -u) DEMO_GID=$(id -g) docker compose -f … up -d --build
+    user: "${DEMO_UID:-1000}:${DEMO_GID:-1000}"
     ports:
       - "8443:8443"          # mTLS listener; metrics (9090) stay internal
     volumes:

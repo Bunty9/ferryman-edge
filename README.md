@@ -67,7 +67,7 @@ Cloudflare Pingora team to reply.
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |
 | Observability         | `tracing` + `metrics-exporter-prometheus` 0.16            |
 | CLI                   | `clap` 4                                                  |
-| Container build       | `cargo-chef` multi-stage; **distroless** final (a `scratch` image on ring + musl is planned for this release, not done yet) |
+| Container build       | `cargo-chef` multi-stage; static musl binary in a `scratch` final image, running as `65532:65532` |
 | Deploy                | Fly.io 2-region (`sin` + `iad`)                           |
 | CI                    | GHA (stable + beta) + `cargo-deny` + `cargo-nextest` + criterion (non-blocking) + mTLS smoke |
 
@@ -77,9 +77,16 @@ Pinned versions live in [`Cargo.toml`](https://github.com/Bunty9/ferryman-edge/b
 
 ## Install
 
+Prebuilt static binaries (Linux musl x86_64/aarch64, macOS x86_64/aarch64)
+are attached to every GitHub release with `SHA256SUMS` and build
+provenance (`gh attestation verify <file> --repo Bunty9/ferryman-edge`):
+
 ```bash
-cargo install ferryman-edge      # installs the `ferryman-edge-server` binary
+cargo binstall ferryman-edge     # or: cargo install ferryman-edge
+docker build -t ferryman-edge .  # static binary in scratch, runs as 65532
 ```
+
+Both install the `ferryman-edge-server` binary.
 
 The reusable pieces (TLS reload, JWT verifier, rate limiter, routing +
 circuit breaker) are published separately as
@@ -230,11 +237,10 @@ surfaces atomically from the operator's perspective.
 
 * **Pure-Rust audit story.** rustls with ring keeps the TLS stack in
   Rust plus ring's small, audited assembly.
-* **Static builds.** ring cross-compiles to musl with only `musl-gcc`,
-  which makes static binaries and a `scratch` image possible (planned
-  for this release, not done yet). aws-lc-rs needs a C toolchain (and
-  CMake on some targets) per target and keeps the image on
-  glibc/distroless.
+* **Static builds.** ring builds for musl with only `musl-gcc`, which
+  gives the static release binaries and the `scratch` image. aws-lc-rs
+  needs a C toolchain (and CMake on some targets) per target and would
+  keep the image on glibc/distroless.
 * **Cost.** No FIPS build and no post-quantum `X25519MLKEM768` key
   exchange by default (rustls offers it only with aws-lc-rs). An opt-in
   `tls-aws-lc` feature may be added on request.
@@ -281,7 +287,7 @@ ferryman-edge/
   benches/
     wrk2.lua                       # throughput script (non-mTLS listeners only)
     reload.sh                      # zero-loss reload check (curl workers + kill -USR1)
-  Dockerfile                       # cargo-chef multi-stage, distroless final
+  Dockerfile                       # cargo-chef multi-stage, static musl in scratch
   fly.toml                         # Fly.io 2-region (sin + iad)
   deny.toml                        # cargo-deny config
   rust-toolchain.toml              # stable channel

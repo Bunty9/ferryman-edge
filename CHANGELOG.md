@@ -8,6 +8,10 @@ Both crates share one version. Format follows
 ## [Unreleased]
 
 ### Changed (breaking)
+- Docker image: a static musl binary in `scratch` running as `65532:65532`
+  (was distroless/cc as root). Migration: mounted certs, keys and config
+  must be readable by uid 65532 (volume ownership: `chgrp 65532` + `chmod
+  0640`, or `chown`), or run the container with `--user`.
 - `JwtVerifier::reload_key` returns `Ok(bool)` (whether the key changed).
 - TLS provider is ring (was aws-lc-rs), across the proxy, tests and
   examples; `deny.toml` bans aws-lc. Library users install
@@ -61,6 +65,10 @@ Both crates share one version. Format follows
 
 ### Added
 - Per-route `rewrite_host` (same key and meaning as ferryman-core 0.3).
+- Release binaries for Linux musl (x86_64, aarch64) and macOS (x86_64,
+  aarch64) with `SHA256SUMS` and build provenance; each Linux binary passes
+  an mTLS + JWT smoke test before packaging. `cargo binstall ferryman-edge`.
+  `ferryman-edge-server --version`.
 
 ### Fixed
 - A long or slow streamed response (SSE, LLM, download) is no longer cut

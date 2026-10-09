@@ -161,7 +161,7 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 | `401` with a token you believe is valid | Expired (60 s leeway), `nbf` in the future, wrong key, or `iss`/`aud` mismatch. `ferryman_auth_failures_total{reason="invalid"}` counts these. |
 | curl exits 56 / handshake failure | No client cert, or it doesn't chain to `client_ca_path`. `ferryman_tls_handshake_failures_total` counts these. |
 | Python client: `CA cert does not include key usage extension` | Root CA generated without extensions; regenerate with the current `gen-test-certs.sh`. |
-| Container exits with `GLIBC_2.38 not found` | Builder and runtime images on different Debian releases; the Dockerfile pins both to bookworm. |
+| Container exits: permission denied reading a key | The image runs as 65532; make mounted files readable by it (see Container). |
 
 ## Container
 
@@ -169,6 +169,11 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 docker build -t ferryman-edge .
 docker run -p 8443:8443 -v "$PWD/certs:/app/certs:ro" ferryman-edge
 ```
+
+The image is `scratch` with a static musl binary and runs as `65532:65532`.
+Mounted certs, keys and config must be readable by that uid (`chmod 0640` +
+`chgrp 65532`, or `docker run --user $(id -u)`). It also runs with
+`--read-only`: the proxy writes nothing to disk.
 
 The image ships no key material and no certs; mount them at `/app/certs`
 (the paths in the baked-in `/app/config.toml`) or the server exits at boot.

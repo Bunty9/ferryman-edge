@@ -107,6 +107,14 @@ jobs:
           curl -sf 127.0.0.1:9090/metrics | grep -q ferryman_requests_total
           kill -USR1 "$pid"; sleep 1
           check "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" 200 "after SIGUSR1 reload"
+      - name: Container image smoke (read-only rootfs, uid 65532)
+        # Spec Q04: the scratch image must serve mTLS + JWT traffic with a
+        # read-only root filesystem as a non-root user, not just print --version.
+        run: |
+          set -euo pipefail
+          docker build -t ferryman-edge:kiln .
+          [ "$(docker inspect -f '{{.Config.User}}' ferryman-edge:kiln)" = "65532:65532" ]
+          SMOKE_IMAGE=ferryman-edge:kiln bash scripts/smoke.sh
       - name: Logs on failure
         if: failure()
         run: cat "$RUNNER_TEMP"/*.log examples/edge-demo/.demo/run/*.log 2>/dev/null || true

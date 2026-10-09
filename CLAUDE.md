@@ -98,8 +98,10 @@ SIGUSR1 reloads.
   branch fires; re-check state inside the branch.
 - jsonwebtoken 9 only checks `iss`/`aud` when present unless they are in
   `required_spec_claims` (`with_issuer`/`with_audience` handle this).
-- Dockerfile builder and distroless runtime must share a Debian release
-  (glibc); both are bookworm.
+- The image is `scratch` + static musl and runs as 65532; anything mounted
+  into it must be readable by that uid. The Dockerfile sets
+  `RUSTUP_TOOLCHAIN=stable` because `rust-toolchain.toml` would otherwise
+  switch cargo to a toolchain without the musl target.
 - Running the server in the background from a tool call: redirect its
   stdout/stderr to a file, or a trailing `| tail` waits forever.
 
@@ -116,7 +118,7 @@ absolute or they break in the book. Build locally with
 ## Releasing
 
 Both crates share one version. Publishing is done by
-`.github/workflows/release.yml` (jobs verify, attest, publish, release; the
+`.github/workflows/release.yml` (jobs verify, binaries, attest, publish, release; the
 publish job is idempotent, so a failed run is recovered by re-running it)
 on a `v*` tag push, through crates.io Trusted Publishing (OIDC; environment
 `release`); there is no registry token secret. The crates.io

@@ -27,7 +27,11 @@ use tracing_subscriber::EnvFilter;
 const LIMITER_GC_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
-#[command(name = "ferryman-edge-server", about = "programmable mTLS L7 proxy")]
+#[command(
+    name = "ferryman-edge-server",
+    version,
+    about = "programmable mTLS L7 proxy"
+)]
 struct Args {
     /// Path to the TOML config (TLS paths, JWKS path, routes, rps cap).
     #[arg(long, env = "FERRYMAN_EDGE_CONFIG", default_value = "config.toml")]

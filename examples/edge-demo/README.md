@@ -154,7 +154,8 @@ Prometheus. From the repository root:
 cargo run -q -p ferryman-edge-demo --bin edge-demo -- setup
 
 # First build compiles both images in release mode: expect several minutes.
-docker compose -f examples/edge-demo/compose/docker-compose.yml up -d --build
+DEMO_UID=$(id -u) DEMO_GID=$(id -g) \
+  docker compose -f examples/edge-demo/compose/docker-compose.yml up -d --build
 
 TOKEN=$(cargo run -q -p ferryman-edge-demo --bin edge-demo -- token --sub acme)
 MTLS="--cacert examples/edge-demo/.demo/ca.crt --cert examples/edge-demo/.demo/client.crt --key examples/edge-demo/.demo/client.key"
