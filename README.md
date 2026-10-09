@@ -150,7 +150,7 @@ then get keep-alive pings and a 64-stream cap.
 Each upstream has a Closed / Open / HalfOpen circuit breaker
 (`ferryman_circuit_state{upstream}`: 0/1/2; `cooldown_secs` must be ≥ 1).
 A transport error, a 502–504, or a timeout opens it; after `cooldown_secs` exactly one request is let through
-as the probe. A response that has started streaming never counts against the breaker, however long it lasts or however it ends. A plain `500` does not trip it, and neither does a failure
+as the probe. A response that has started streaming never counts against the breaker however long it lasts; only an error from the upstream body does. While half-open, a client that abandons the probe request delays recovery by one cooldown (routes with active health checks recover on the next healthy probe). A plain `500` does not trip it, and neither does a failure
 caused by the client's own body (size cap, disconnect). The active health
 checker (`GET <upstream>/health` every `health_interval_secs`; per-route
 `health_path` / `health_disabled` change or skip the probe) opens and

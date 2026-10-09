@@ -37,8 +37,8 @@ SIGUSR1 reloads.
   SIGUSR1 route + JWT key reload; `main.rs` — boot only.
 - `examples/edge-demo` (`ferryman-edge-demo`, publish = false): `backend`
   sample upstream + `edge-demo` driver (`setup` | `token` | `run`). `run`
-  spawns the real proxy binary and checks every feature; CI runs it. `examples/embed-core`: ferryman-edge-core in an axum
-  service. Behaviour changes to the request path must keep
+  spawns the real proxy binary and checks every feature; CI runs it.
+  `examples/embed-core`: ferryman-edge-core in an axum service. Behaviour changes to the request path must keep
   `cargo build -p ferryman-edge -p ferryman-edge-demo && target/debug/edge-demo run`
   green; update its scenarios and README when behaviour changes.
 - `crates/server/tests/e2e.rs` — in-process end-to-end tests with
@@ -56,11 +56,12 @@ SIGUSR1 reloads.
   hop-by-hop, so `lib.rs` computes `proxy::wants_upgrade` before stripping
   and passes it to `handle_checked`; `h2c` is exempt.
 - Only upstream-caused failures may count against the breaker: transport
-  errors, 502–504 response heads, and the upstream timer (which fires only
-  after the upload finished, or when hyper stopped reading the body while
-  the client was not stalling). Client-side failures (body cap 413,
-  idle/total upload deadline 408, disconnect 400) and anything that happens
-  after the response head (a long or broken response body) must not, or any
+  errors, 502–504, response-body errors (an error from the upstream body,
+  not a slow or long one), and timeouts after the upload finished (the
+  upstream timer fires only then, or when hyper stopped reading the body
+  while the client was not stalling). Client-side failures (body cap 413,
+  idle/total upload deadline 408, disconnect 400) and elapsed time in a
+  response body (a long stream) must not, or any
   tenant can open a route's breaker for everyone. They must not call
   `mark_success` either, or a client could close an open breaker by
   aborting an upload.

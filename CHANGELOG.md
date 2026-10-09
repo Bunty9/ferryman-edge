@@ -42,7 +42,7 @@ Both crates share one version. Format follows
   max_request_body_bytes` is optional and has no upper bound; when set,
   over-cap uploads get 413. Migration: set it to keep a cap.
 - `upstream_timeout_secs` runs from the end of the upload to the response
-  head only; the response body has no deadline. Uploads have their own
+  head only; the response body has no deadline (a broken body still counts against the breaker). Uploads have their own
   idle (30 s) and total deadlines and get 408. The total default
   (`request_body_timeout_secs`) rises from 30 s to 300 s.
 

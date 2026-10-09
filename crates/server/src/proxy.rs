@@ -8,12 +8,13 @@
 //! response head. The response body has no deadline, so a long SSE stream
 //! or download is never cut and never trips the breaker. The upload has
 //! its own idle and total deadlines and an optional size cap. Those fail
-//! with 408/413 and never touch the breaker.
+//! with 408/413 and never touch the breaker. An error from the response body
+//! (not a slow or long one) counts against the breaker.
 //!
 //! Auth (JWT verify + rate limit + `x-ferryman-tenant` stamping) happens in
 //! `lib.rs` before a request reaches `handle`.
 
-use ferryman_edge_core::{Limits, SharedTable};
+use ferryman_edge_core::{Limits, SharedTable, Upstream};
 use http::{HeaderMap, HeaderValue};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -223,6 +224,10 @@ pub(crate) fn wants_upgrade<B>(req: &Request<B>) -> bool {
 /// optional size cap, the idle deadline between frames and the total
 /// deadline, and it signals end-of-stream so `upstream_timer` starts
 /// only once the upload is complete. Never buffers.
+///
+/// The total deadline also runs while the upstream drains the body slowly: an
+/// upload that takes longer than it because the upstream reads slowly gets a
+/// 408, which touches no breaker.
 pub struct RequestBody {
     inner: Incoming,
     remaining: Option<u64>,
@@ -287,14 +292,14 @@ impl hyper::body::Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxErr>>> {
         let this = self.get_mut();
-        this.state.polled.store(true, Ordering::Relaxed);
+        this.state.polled.store(true, Ordering::Release);
         if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(UploadError::TotalTimeout.into())));
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 this.idle_sleep = None;
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                this.state.waiting_on_client.store(false, Ordering::Release);
                 if let (Some(left), Some(data)) = (this.remaining.as_mut(), frame.data_ref()) {
                     let n = data.len() as u64;
                     if n > *left {
@@ -308,18 +313,18 @@ impl hyper::body::Body for RequestBody {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                this.state.waiting_on_client.store(false, Ordering::Release);
                 Poll::Ready(Some(Err(e.into())))
             }
             Poll::Ready(None) => {
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                this.state.waiting_on_client.store(false, Ordering::Release);
                 if let Some(tx) = this.eos.take() {
                     let _ = tx.send(());
                 }
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                this.state.waiting_on_client.store(true, Ordering::Relaxed);
+                this.state.waiting_on_client.store(true, Ordering::Release);
                 let idle = this.idle;
                 let idle_sleep = this
                     .idle_sleep
@@ -366,8 +371,8 @@ async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
                 break;
             }
             () = tokio::time::sleep(upstream_timeout) => {
-                if !state.polled.swap(false, Ordering::Relaxed)
-                    && !state.waiting_on_client.load(Ordering::Relaxed)
+                if !state.polled.swap(false, Ordering::AcqRel)
+                    && !state.waiting_on_client.load(Ordering::Acquire)
                 {
                     return;
                 }
@@ -375,6 +380,42 @@ async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
         }
     }
     tokio::time::sleep(upstream_timeout).await;
+}
+
+/// The upstream's response body. An error from it (reset, truncated chunked
+/// stream) is the upstream's fault and counts against the breaker, once. The
+/// head already reported success; a slow or long body is never blamed, and a
+/// client that goes away drops the body without a poll error.
+struct WatchedBody {
+    inner: Incoming,
+    upstream: Upstream,
+    failed: bool,
+}
+
+impl hyper::body::Body for WatchedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(polled, Poll::Ready(Some(Err(_)))) && !this.failed {
+            this.failed = true;
+            this.upstream.mark_failed();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 fn declared_len<B>(req: &Request<B>) -> Option<u64> {
@@ -515,6 +556,11 @@ pub(crate) async fn handle_checked(
         upstream.mark_success();
     }
     let (mut resp_parts, resp_body) = resp.into_parts();
+    let resp_body = WatchedBody {
+        inner: resp_body,
+        upstream: upstream.clone(),
+        failed: false,
+    };
     strip_hop_by_hop(&mut resp_parts.headers);
     // Don't echo the upstream's HTTP version back; hyper picks the wire version.
     resp_parts.version = http::Version::default();

@@ -185,7 +185,8 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         let mut body = req.into_body();
         let mut n = 0usize;
         while let Some(frame) = body.frame().await {
-            if let Ok(data) = frame.unwrap().into_data() {
+            let Ok(frame) = frame else { break };
+            if let Ok(data) = frame.into_data() {
                 n += data.len();
             }
         }
@@ -273,6 +274,32 @@ async fn spawn_sse_upstream() -> SocketAddr {
     addr
 }
 
+/// Answers 200 with a chunked body, then closes without the terminating
+/// chunk: a body error after a healthy head.
+async fn spawn_truncating_upstream() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
 async fn spawn_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -332,6 +359,7 @@ impl Harness {
         let certs = TestCerts::generate();
         let upstream_addr = spawn_upstream().await;
         let sse_addr = spawn_sse_upstream().await;
+        let trunc_addr = spawn_truncating_upstream().await;
         let down_addr = closed_port();
 
         let tls = ReloadingTls::new(
@@ -353,6 +381,10 @@ impl Harness {
             (
                 "/slow".to_string(),
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/trunc".to_string(),
+                Upstream::new(format!("http://{trunc_addr}").parse().unwrap(), 30),
             ),
             (
                 "/sse".to_string(),
@@ -1241,6 +1273,14 @@ async fn configured_request_body_timeout_gives_408() {
         .unwrap();
     let head = String::from_utf8_lossy(&buf[..n]);
     assert!(head.starts_with("HTTP/1.1 408"), "{head}");
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/after"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
 }
 
 /// A streamed response longer than `upstream_timeout` is neither cut nor
@@ -1443,4 +1483,74 @@ async fn aborted_half_open_probe_neither_closes_nor_wedges_the_breaker() {
     tokio::time::sleep(Duration::from_millis(2200)).await;
     assert_eq!(get().await.unwrap().status(), 200, "stale probe re-armed");
     assert_eq!(get().await.unwrap().status(), 200, "breaker closed");
+}
+
+/// A body error after a healthy 200 head is the upstream's fault: the breaker
+/// opens. (A slow or long body, or a client hang-up, never does.)
+#[tokio::test]
+async fn upstream_body_reset_after_200_head_trips_the_breaker() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let get = |p: &str| {
+        h.client()
+            .get(h.url(p))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    let resp = get("/trunc/a").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.bytes().await.is_err(), "body must error");
+    assert_eq!(
+        get("/trunc/b").await.unwrap().status(),
+        503,
+        "breaker must open"
+    );
+}
+
+/// A client that keeps sending within the idle gap but past the total
+/// deadline gets 408, and the breaker never hears about it.
+#[tokio::test]
+async fn trickling_upload_past_the_total_deadline_is_408_and_breaker_stays_closed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(0, Limits::default(), |t| {
+        t.with_request_body_idle_timeout(Duration::from_secs(1))
+            .with_request_body_timeout(Duration::from_secs(2))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let (mut rd, mut wr) = tokio::io::split(tls);
+    let head = format!(
+        "POST /svc-a/upload HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n"
+    );
+    // Keeps trickling well past the total deadline; the answer must come
+    // from that deadline, not from the client running out of data.
+    let writer = tokio::spawn(async move {
+        wr.write_all(head.as_bytes()).await?;
+        for _ in 0..30 {
+            wr.write_all(b"1\r\nx\r\n").await?;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        std::io::Result::Ok(())
+    });
+    let mut buf = [0u8; 256];
+    let started = std::time::Instant::now();
+    let n = tokio::time::timeout(Duration::from_secs(4), rd.read(&mut buf))
+        .await
+        .expect("answered by the total deadline")
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+    writer.abort();
+    let line = String::from_utf8_lossy(&buf[..n]);
+    assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/after"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
 }

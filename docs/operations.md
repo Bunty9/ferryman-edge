@@ -26,7 +26,7 @@ are resolved against the process working directory.
 | `[[routes]] upstream` | — | yes | `http://host:port` of the backend. Must have an authority. |
 | `[[routes]] cooldown_secs` | `default_cooldown_secs` | yes | Per-route breaker cooldown, must be ≥ 1. |
 | `[[routes]] health_path` | `/health` | yes | Path the health checker probes on this upstream. Must start with `/`, no `?` or `#`. |
-| `[[routes]] health_disabled` | `false` | yes | `true` skips active probing for this route; only requests drive its breaker. |
+| `[[routes]] health_disabled` | `false` | yes | `true` skips active probing for this route; only requests drive its breaker. While half-open, a client that abandons the probe request delays recovery by one cooldown; routes with active health checks recover on the next healthy probe. |
 
 Set `issuer` and `audience` in every non-local deployment. Without them the
 proxy accepts any token signed by the issuer key, whichever service it was
@@ -54,7 +54,7 @@ restart (no log line).
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
-| `max_request_body_bytes` | unset (no cap) | at least 1 | Optional cap on the client request body; over-cap gets 413 (declared length before routing, chunked mid-stream). |
+| `max_request_body_bytes` | unset (no cap) | at least 1 | Optional cap on the client request body; over-cap gets 413 (declared length before routing, chunked mid-stream). This is the knob that bounds upload volume: with it unset, uploads are bounded only by `request_body_timeout_secs`. |
 | `tls_handshake_timeout_secs` | `10` | 1 to 86400 | mTLS handshake deadline. |
 | `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request; on HTTP/1 also capped by `keepalive_timeout_secs` (the smaller applies). |
 | `tenant_rps` | `1000` | 0 to 2^32-1 | Per-tenant GCRA limit keyed by JWT sub; 0 disables. (0.1.x: top level, still loads with a warning.) |
