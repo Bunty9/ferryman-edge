@@ -34,8 +34,8 @@ Both crates share one version. Format follows
 - Config: `upstream_timeout_secs` and `request_body_timeout_secs` move from
   `[limits]` to the top level (ferryman-core names; old spellings load with
   a warning), joined by `keepalive_timeout_secs` (default 10 s) and
-  `request_body_idle_timeout_secs` (default 30 s). The top-level timeouts reload on SIGUSR1,
-  except `keepalive_timeout_secs`.
+  `request_body_idle_timeout_secs` (default 30 s). The top-level timeouts
+  reload on SIGUSR1, except `keepalive_timeout_secs`.
 - Config: unknown keys are rejected in every table (0.1.x ignored them, so
   a typo silently kept a default). Migration: fix or remove the key the
   error names.
@@ -160,10 +160,12 @@ Both crates share one version. Format follows
   byte-for-byte unchanged (it used to flush the cache on every reload).
 - `metrics-exporter-prometheus` without its push-gateway client;
   `reqwest` (now only via ferryman-core's health checker) without TLS
-  (health probes are plain HTTP). `webpki-roots` and the CDLA-Permissive-2.0 licence allowance are
-  gone.
+  (health probes are plain HTTP). `webpki-roots` and the CDLA-Permissive-2.0
+  licence allowance are gone.
 - `edge-demo` uses committed test-only RSA keys for its JWT issuer
   instead of generating them.
+- `edge-demo` covers 0.2.0 exit criterion 8 (65 s SSE stream, 50 MiB upload,
+  Host, threshold-3 breaker) and runs 65 checks.
 
 ## [0.1.2] — 2026-10-06
 

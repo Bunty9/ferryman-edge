@@ -13,9 +13,10 @@ The example crate is `ferryman-edge-demo`, with two binaries:
 
 ## What you will see
 
-`edge-demo run` starts three backends and the proxy on free ports, then walks
-through eleven scenarios, printing `✓` / `✗` per check and exiting non-zero if
-any fails (about 5 seconds):
+`edge-demo run` starts four backends and the proxy on free ports, then walks
+through thirteen scenarios, printing `✓` / `✗` per check and exiting non-zero if
+any fails (65 checks, about 75 seconds, most of it the 65 s SSE stream;
+`EDGE_DEMO_SSE_SECS=3` shortens it to about 10 s):
 
 1. **mTLS**: valid cert over HTTP/2 and HTTP/1.1 works; no cert and a cert
    from another CA are refused.
@@ -27,15 +28,28 @@ any fails (about 5 seconds):
    client used (h2 `:authority`), and `x-forwarded-host` carries it (a forged
    one is replaced).
 4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected; a WebSocket upgrade is 501.
-5. **Bodies**: 6 MiB and 9 MiB pass intact (no size cap by default).
-6. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.
-7. **Circuit breaker + health checks**: kill a backend, watch 503 and the
+5. **Bodies**: 6, 9 and 50 MiB pass intact (no size cap by default).
+6. **Streaming**: a 65 s SSE response runs through `upstream_timeout_secs = 30`
+   and leaves the breaker closed.
+7. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.
+8. **Circuit breaker + health checks**: kill a backend, watch 503 and the
    `ferryman_circuit_state` gauge, restart it, watch recovery.
-8. **Hot reload (routes)**: add a route, `SIGUSR1`, it is live.
-9. **Hot reload (certificate)**: rotate the server cert, `SIGUSR1`, new
-   handshakes present it; existing clients keep working.
-10. **Metrics**: Prometheus text on a separate port.
-11. **Graceful shutdown**: `SIGTERM` lets an in-flight request finish.
+9. **Breaker admission**: with threshold 3, a dead unprobed backend gives 502,
+   502, 502, then 503; one probe after the cooldown closes the circuit.
+10. **Hot reload (routes)**: add a route, `SIGUSR1`, it is live.
+11. **Hot reload (certificate)**: rotate the server cert, `SIGUSR1`, new
+    handshakes present it; existing clients keep working.
+12. **Metrics**: Prometheus text on a separate port.
+13. **Graceful shutdown**: `SIGTERM` lets an in-flight request finish.
+
+### 0.2.0 exit criterion 8
+
+| Criterion | Scenario / check |
+| --- | --- |
+| SSE response streams for more than 60 s | Streaming: 66 events over 65 s through `upstream_timeout_secs = 30`, breaker still closed (`EDGE_DEMO_SSE_SECS` shortens it locally) |
+| 50 MiB upload accepted | Bodies: "50 MiB binary upload arrives whole" |
+| `Host` preserved | Identity: Host and `x-forwarded-host` are the client's |
+| Breaker obeys Admission, threshold 3 | Breaker admission: 502, 502, 502, 503; one probe after the cooldown closes it |
 
 ## Run it
 

@@ -959,13 +959,29 @@ async fn forwarded_host_variants_and_absolute_form() {
 async fn bad_host_headers_are_rejected_and_good_ones_pass() {
     let h = Harness::new(0).await;
     let token = mint_jwt("tenant-a", 3600, "read");
-    for bad in ["a.example, b.example", "u@x", "x/y", "x:99999", "a:b", "*"] {
+    for bad in [
+        "a.example, b.example",
+        "u@x",
+        "x/y",
+        "x:99999",
+        "a:b",
+        "*",
+        "",
+    ] {
         let (s, rest) = raw_host(&h, &token, &[bad]).await;
         assert!(s.contains(" 400"), "{bad}: {s}");
         assert!(rest.contains("bad host"), "{bad}: {rest}");
     }
     let (s, _) = raw_host(&h, &token, &["a.example", "b.example"]).await;
     assert!(s.contains(" 400"), "{s}");
+    // HTTP/1.1 with no Host and an origin-form target is a 400; HTTP/1.0 may omit it.
+    let (s, rest) = raw_host_ver(&h, &token, "1.1", &[]).await;
+    assert!(
+        s.contains(" 400") && rest.ends_with("bad host"),
+        "{s} {rest}"
+    );
+    let (s, _) = raw_host_ver(&h, &token, "1.0", &[]).await;
+    assert!(s.contains(" 200"), "h1.0 without Host: {s}");
     for ok in ["a.example", "a.example:8443", "[::1]:8443", "UPPER.Example"] {
         let (s, rest) = raw_host(&h, &token, &[ok]).await;
         assert!(s.contains(" 200"), "{ok}: {s}");

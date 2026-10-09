@@ -121,6 +121,7 @@ fn setup(dir: PathBuf) -> anyhow::Result<()> {
         tenant_rps: 5,
         health_interval_secs: 1,
         default_cooldown_secs: 2,
+        unprobed: vec![],
     };
     let config = dir.join("ferryman.toml");
     proxy_config::write(&pki, &topo, &config)?;

@@ -19,7 +19,7 @@ path = "src/bin/edge-demo/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
-http-body-util = { workspace = true }
+http-body-util = { workspace = true, features = ["channel"] }
 jsonwebtoken = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "http2"] }

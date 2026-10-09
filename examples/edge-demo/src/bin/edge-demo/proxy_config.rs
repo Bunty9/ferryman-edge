@@ -19,6 +19,8 @@ pub struct Topology {
     pub health_interval_secs: u64,
     /// Circuit-breaker cooldown for routes without an override (must be >= 1).
     pub default_cooldown_secs: u64,
+    /// Prefixes written with health_disabled = true (breaker driven by requests only).
+    pub unprobed: Vec<String>,
 }
 
 pub fn write(pki: &Pki, topo: &Topology, path: &Path) -> anyhow::Result<()> {
@@ -49,6 +51,9 @@ pub fn write(pki: &Pki, topo: &Topology, path: &Path) -> anyhow::Result<()> {
         if let Some(c) = cooldown {
             writeln!(s, "cooldown_secs = {c}")?;
         }
+        if topo.unprobed.contains(prefix) {
+            writeln!(s, "health_disabled = true")?;
+        }
     }
     std::fs::write(path, s)?;
     Ok(())
@@ -72,6 +77,7 @@ mod tests {
             tenant_rps: 5,
             health_interval_secs: 1,
             default_cooldown_secs: 2,
+            unprobed: vec![],
         };
         let path = dir.path().join("ferryman.toml");
         write(&pki, &topo, &path).unwrap();

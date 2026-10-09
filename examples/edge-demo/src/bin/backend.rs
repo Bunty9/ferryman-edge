@@ -23,15 +23,19 @@
 //!   this to drive its circuit breaker.
 //! * `GET <anything>/slow?ms=N`: sleeps `N` ms (capped at 10 000), then
 //!   echoes. Used to show graceful shutdown finishing an in-flight request.
+//! * `GET <anything>/sse?secs=N`: `text/event-stream`, one `data: tick i` per
+//!   second for `i` in `0..=N` (N <= 600).
 //! * everything else: `200` JSON echo of what this service saw.
 //!
 //! The request body is streamed and counted, never buffered whole.
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
+use http_body_util::channel::Channel;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -76,7 +80,48 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn echo(
+/// Upper bound for `/sse?secs=N`.
+const MAX_SSE_SECS: u64 = 600;
+
+async fn echo(state: State<Arc<str>>, req: Request) -> Response {
+    if req.uri().path().ends_with("/sse") {
+        return sse(req.uri().query());
+    }
+    match echo_json(state, req).await {
+        Ok(json) => json.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// A slow event stream, like an LLM token stream.
+fn sse(query: Option<&str>) -> Response {
+    let secs = query
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("secs=")))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1)
+        .min(MAX_SSE_SECS);
+    let (mut tx, body) = Channel::<axum::body::Bytes, std::convert::Infallible>::new(1);
+    tokio::spawn(async move {
+        for i in 0..=secs {
+            if tx
+                .send_data(format!("data: tick {i}\n\n").into())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if i < secs {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(axum::body::Body::new(body))
+        .expect("static response")
+}
+
+async fn echo_json(
     State(service): State<Arc<str>>,
     req: Request,
 ) -> Result<Json<Value>, (StatusCode, &'static str)> {

@@ -168,17 +168,18 @@ failures: transport errors, 502–504, timeouts. After `cooldown_secs`
 exactly one request is let through as the probe; its result decides, and a
 late result of an ordinary request can no longer close an open circuit. A
 response that has started streaming never counts against the breaker however
-long it lasts; only an error from the upstream body does (ferryman itself
-never blames after the response head; edge does on purpose). A plain `500`
+long it lasts; only an error from the upstream body does: edge counts an
+upstream response-body error after the head against the breaker, ferryman
+never does (a deliberate difference). A plain `500`
 does not count, and neither does a failure caused by the client's own body
 (size cap, disconnect, stall), even if the upstream had already answered.
 A request that ends without a verdict on the upstream (client body error,
 hang-up, h2 stream reset) hands its admission back: an abandoned half-open
 probe is re-armed at once, at most once per cooldown. An upstream that hangs
 up after the client stalled its upload, or paused reading the response, for
-at least θ = min(1 s, `request_body_idle_timeout_secs` / 2, at least
-100 ms) is not blamed either, nor is a forwarded 502–504 (a gateway whose
-backend gave up on the stalled upload); an upload stall counts if it
+at least θ = max(100 ms, min(1 s, `request_body_idle_timeout_secs` / 2)) is
+not blamed either, nor is a forwarded 502–504 (a gateway whose backend gave
+up on the stalled upload); an upload stall counts if it
 happened at any point of the request, as in ferryman. An upstream that
 fails while the client sends or reads without such a pause generally is
 blamed. Known limits, where the upstream is

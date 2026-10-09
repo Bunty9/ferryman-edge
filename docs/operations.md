@@ -163,8 +163,8 @@ What never counts: client body errors (400), the body cap (413), slow or
 stalled uploads (408), a client hanging up or resetting its h2 stream, and an
 upstream failure (transport error, body error or forwarded 502–504) after
 the client stalled its upload (at any point of the request) or its response
-reads for at least θ = min(1 s, `request_body_idle_timeout_secs` / 2), at
-least 100 ms. When such an outcome ends the request before the response
+reads for at least θ = max(100 ms, min(1 s,
+`request_body_idle_timeout_secs` / 2)). When such an outcome ends the request before the response
 head, the request hands its admission back: if it was the half-open probe,
 the next request probes (at most once per cooldown). A body error after the
 head has no admission left to return; it simply does not count. Known limits, where the upstream
@@ -178,6 +178,7 @@ total request or response deadline that a slow but steady client exceeds.
 | `503 upstream unavailable` right after boot | Three health probes failed before the upstream was up; the breaker closes on the next successful probe (≤ `health_interval_secs`). |
 | `503` persists | Upstream's health path answers 5xx or not at all, or requests keep failing. Check `ferryman_upstream_alive`, then fix the upstream or set the route's `health_path` (or `health_disabled = true`). A disabled upstream is not probed: after a trip it recovers only via the half-open request let through after `cooldown_secs`. |
 | `404 no route` | No prefix matches on a segment boundary (`/svc-a` does not match `/svc-abc`). |
+| `400 bad host` | The `Host` is unusable: duplicate or empty, `*`, userinfo (`u@x`), a path or comma, non-ASCII bytes, an invalid port; or HTTP/1.1 with neither `Host` nor an absolute-form target (HTTP/1.0 may omit it). An empty `Host` is stricter than RFC 9112 §3.2, which allows it when the target's authority is empty. |
 | `400 bad path` | Path has a `.` or `..` segment (also `%2e`), or is ambiguous: read with `%2F` / `%5C` / `\` as `/` or with `;params` dropped, it would match a different route (`/api%2Fsecret` with a `/` catch-all). Send plain `/` separators. |
 | `501 protocol upgrades are not supported` | The request has an `Upgrade` header (e.g. WebSocket) other than `h2c`, or uses `CONNECT`. The proxy can't splice connections. It is checked before route lookup, so an unrouted path also gets 501, not 404. |
 | `401` with a token you believe is valid | Expired (60 s leeway), `nbf` in the future, wrong key, or `iss`/`aud` mismatch. `ferryman_auth_failures_total{reason="invalid"}` counts these. |
