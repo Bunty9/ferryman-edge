@@ -11,10 +11,13 @@
 //! with 408/413 and never touch the breaker. An error from the response body
 //! (not a slow or long one) counts against the breaker. An upstream failure
 //! after the client stalled its upload or its response reads for at least
-//! min(1 s, idle gap / 2) does not: the upstream was reacting to the client.
-//! Known limits: an upstream whose own read/write timeout is under that
-//! threshold can still be blamed for a client stall, and a gateway upstream
-//! answering 502/504 because its backend timed out on a stalled upload is.
+//! θ = min(1 s, idle gap / 2), floored at 100 ms, does not: the upstream was
+//! reacting to the client. Known limits, where the upstream is still blamed:
+//! its own read/write timeout is under θ; it is a gateway answering 502/504
+//! because its backend timed out on a stalled upload; or it has a total
+//! request or response deadline (Go `http.Server` `ReadTimeout` /
+//! `WriteTimeout`) that a slow but steady client exceeds, since every gap is
+//! under θ and the stall exemption does not apply.
 //!
 //! Auth (JWT verify + rate limit + `x-ferryman-tenant` stamping) happens in
 //! `lib.rs` before a request reaches `handle`.
@@ -264,13 +267,21 @@ struct BodyState {
     client_failed: AtomicBool,
 }
 
+/// θ: min(1 s, idle / 2), floored at 100 ms so a zero idle gap cannot turn
+/// response-body blame off entirely.
+fn stall_threshold(idle: Duration) -> Duration {
+    (idle / 2)
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(100))
+}
+
 impl BodyState {
     fn new(idle: Duration) -> Self {
         Self {
             polled: AtomicBool::new(false),
             waiting_since: AtomicU64::new(0),
             base: tokio::time::Instant::now(),
-            stall: (idle / 2).min(Duration::from_secs(1)),
+            stall: stall_threshold(idle),
             client_failed: AtomicBool::new(false),
         }
     }
@@ -690,7 +701,17 @@ pub(crate) async fn handle_checked(
 
 #[cfg(test)]
 mod tests {
-    use super::{bad_path, wants_upgrade};
+    use super::{bad_path, stall_threshold, wants_upgrade};
+    use std::time::Duration;
+
+    #[test]
+    fn stall_threshold_is_clamped() {
+        let ms = Duration::from_millis;
+        assert_eq!(stall_threshold(Duration::ZERO), ms(100));
+        assert_eq!(stall_threshold(ms(100)), ms(100));
+        assert_eq!(stall_threshold(ms(600)), ms(300));
+        assert_eq!(stall_threshold(Duration::from_secs(30)), ms(1000));
+    }
 
     #[test]
     fn upgrade_detection() {

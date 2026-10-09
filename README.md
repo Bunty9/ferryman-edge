@@ -158,11 +158,15 @@ checks recover on the next healthy probe). A plain `500` does not trip it,
 and neither does a failure caused by the client's own body (size cap,
 disconnect, stall), even if the upstream had already answered. An upstream
 that hangs up after the client stalled its upload, or paused reading the
-response, for at least θ = min(1 s, `request_body_idle_timeout_secs` / 2) is
-not blamed either; one that dies while the client keeps sending or reading
-is. Known limits: an upstream whose own read or write timeout is under θ can
-still be blamed for a client stall, and a gateway upstream that answers
-502/504 because its own backend timed out on a stalled upload is blamed. The active health
+response, for at least θ = min(1 s, `request_body_idle_timeout_secs` / 2,
+at least 100 ms) is not blamed either; an upstream that fails while the
+client sends or reads without such a pause generally is. Known limits, where
+the upstream is blamed for what the client did: its own read or write
+timeout is under θ; it is a gateway answering 502/504 because its own
+backend timed out on a stalled upload; or it has a total request or response
+deadline (e.g. Go `http.Server` `ReadTimeout` / `WriteTimeout`) that a slow
+but steady client exceeds, since every gap is under θ and the stall
+exemption does not apply. The active health
 checker (`GET <upstream>/health` every `health_interval_secs`; per-route
 `health_path` / `health_disabled` change or skip the probe) opens and
 closes it too. A route reload keeps breaker state for rules whose prefix,

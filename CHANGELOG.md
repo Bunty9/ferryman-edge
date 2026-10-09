@@ -44,7 +44,12 @@ Both crates share one version. Format follows
 - `upstream_timeout_secs` runs from the end of the upload to the response
   head only; the response body has no deadline (a broken body still counts
   against the breaker, unless the client had stalled its upload or its
-  reads for at least min(1 s, idle gap / 2)). Uploads have their own idle (30 s) and total
+  reads for at least θ = min(1 s, idle gap / 2), floored at 100 ms). Known
+  limits, where the upstream is still blamed: its own read/write timeout
+  is under θ; it is a gateway answering 502/504 because its backend timed
+  out on a stalled upload; or it has a total request or response deadline
+  (Go `http.Server` `ReadTimeout`/`WriteTimeout`) that a slow but steady
+  client exceeds, since every gap is under θ. Uploads have their own idle (30 s) and total
   deadlines and get 408. The total default (`request_body_timeout_secs`)
   rises from 30 s to 300 s.
 

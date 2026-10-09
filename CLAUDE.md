@@ -60,14 +60,16 @@ SIGUSR1 reloads.
   errors, 502–504, response-body errors (an error from the upstream body,
   not a slow or long one), and timeouts after the upload finished, and not
   after the client has stalled its upload or its response reads for at
-  least θ = min(1 s, request_body_idle_timeout / 2) (an upstream that hangs
-  up on a stalled client is reacting to the client). Merely "waiting on the
+  least θ = min(1 s, request_body_idle_timeout / 2), floored at 100 ms
+  (an upstream that hangs up on a stalled client is reacting to the client). Merely "waiting on the
   client" is no excuse: the proxy waits on an actively sending client nearly
   all the time. Known limits: an upstream whose own read/write timeout is
   under θ can still be blamed for a client stall, and a gateway upstream
   answering 502/504 because its backend timed out on a stalled upload is
-  blamed. The upstream timer
-  fires only after the upload finished, or when hyper stopped reading the
+  blamed, as is an upstream with a total request or response deadline (Go
+  `http.Server` `ReadTimeout`/`WriteTimeout`) that a slow but steady client
+  exceeds (every gap is under θ, so the stall exemption does not apply).
+  The upstream timer fires only after the upload finished, or when hyper stopped reading the
   body while the client was not stalling. Client-side failures (body cap
   413, idle/total upload deadline 408, disconnect 400) and elapsed time in
   a response body (a long stream) must not count, or any tenant can open a
