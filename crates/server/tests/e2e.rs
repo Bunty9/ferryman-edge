@@ -235,6 +235,12 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let names = req
+        .headers()
+        .keys()
+        .map(|n| n.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
     if path.starts_with("/slow") || path.starts_with("/flaky/slow") {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
@@ -248,6 +254,7 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .header("x-echo-tenant", tenant)
         .header("x-echo-host", host)
         .header("x-echo-xfh", xfh)
+        .header("x-echo-names", names)
         .body(Full::new(body))
         .unwrap())
 }
@@ -2398,4 +2405,33 @@ async fn upstream_dying_after_an_earlier_client_stall_is_not_blamed() {
     assert!(line.starts_with("HTTP/1.1 502"), "{line}");
     let (s, _) = raw_get(&h, "/dies/after", Some(&token)).await;
     assert!(s.contains(" 200"), "earlier stall: not blamed: {s}");
+}
+
+/// Only the canonical spelling of a header the proxy asserts reaches the
+/// upstream; other headers keep their names.
+#[tokio::test]
+async fn non_canonical_proxy_header_spellings_are_stripped_e2e() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, rest) = raw_get_with(
+        &h,
+        "/svc-a/x",
+        Some(&token),
+        "X_Ferryman_Tenant: victim\r\nX_Forwarded_For: 6.6.6.6\r\nx_custom: 1\r\n",
+    )
+    .await;
+    assert!(s.contains(" 200"), "{s}");
+    let rest = rest.to_ascii_lowercase();
+    let names = rest
+        .lines()
+        .find_map(|l| l.strip_prefix("x-echo-names: "))
+        .unwrap_or_default()
+        .to_string();
+    let names: Vec<&str> = names.split(',').collect();
+    assert!(!names.contains(&"x_ferryman_tenant"), "{names:?}");
+    assert!(!names.contains(&"x_forwarded_for"), "{names:?}");
+    assert!(names.contains(&"x_custom"), "{names:?}");
+    assert!(rest.contains("x-echo-tenant: tenant-a\r\n"), "{rest}");
+    assert!(!rest.contains("victim"), "only the real tenant: {rest}");
+    assert!(rest.contains("x-echo-xff: 127.0.0.1\r\n"), "{rest}");
 }

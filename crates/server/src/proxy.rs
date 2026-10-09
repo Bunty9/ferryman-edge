@@ -96,6 +96,44 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+/// Request headers the proxy asserts to the upstream (it sets or replaces
+/// them itself). Mirrors ferryman's list.
+const PROXY_ASSERTED_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-forwarded-prefix",
+    "x-real-ip",
+    "x-ferryman-tenant",
+];
+
+/// Strip non-canonical spellings of proxy-asserted headers from a client
+/// request, whoever the peer is: only the canonical name, set by the proxy,
+/// may reach the upstream. Header names are already lowercase.
+pub(crate) fn strip_noncanonical_asserted(headers: &mut HeaderMap) {
+    let spelled = |n: &str| {
+        n.contains('_')
+            && PROXY_ASSERTED_HEADERS.iter().any(|h| {
+                h.len() == n.len()
+                    && h.bytes()
+                        .zip(n.bytes())
+                        .all(|(a, b)| a == if b == b'_' { b'-' } else { b })
+            })
+    };
+    let drop: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|n| spelled(n.as_str()))
+        .cloned()
+        .collect();
+    for n in drop {
+        headers.remove(n);
+    }
+}
+
 /// This is the edge: whatever forwarding headers the client sent are
 /// untrusted, so replace them with the peer address instead of appending.
 fn set_forwarded(headers: &mut HeaderMap, ip: IpAddr) {
@@ -841,7 +879,10 @@ pub(crate) async fn handle_checked(
 
 #[cfg(test)]
 mod tests {
-    use super::{bad_host, set_host, stall_threshold, strip_hop_by_hop, wants_upgrade};
+    use super::{
+        bad_host, set_host, stall_threshold, strip_hop_by_hop, strip_noncanonical_asserted,
+        wants_upgrade, PROXY_ASSERTED_HEADERS,
+    };
     use http::{HeaderMap, HeaderValue};
     use std::time::Duration;
 
@@ -965,6 +1006,30 @@ mod tests {
             false,
         );
         assert_eq!(m.get("x-forwarded-host").unwrap(), "[::1]:8443");
+    }
+
+    #[test]
+    fn non_canonical_proxy_header_spellings_are_stripped() {
+        let mut m = HeaderMap::new();
+        for h in PROXY_ASSERTED_HEADERS {
+            m.insert(*h, HeaderValue::from_static("keep"));
+            let alt = h.replace('-', "_");
+            if alt != *h {
+                m.insert(
+                    http::HeaderName::from_bytes(alt.to_ascii_uppercase().as_bytes()).unwrap(),
+                    HeaderValue::from_static("drop"),
+                );
+            }
+        }
+        m.insert("x_custom", HeaderValue::from_static("keep"));
+        m.insert("x-forwarded_for_x", HeaderValue::from_static("keep"));
+        strip_noncanonical_asserted(&mut m);
+        for h in PROXY_ASSERTED_HEADERS {
+            assert_eq!(m.get(*h).unwrap(), "keep", "{h}");
+        }
+        assert!(m.values().all(|v| v == "keep"), "{m:?}");
+        assert!(m.contains_key("x_custom") && m.contains_key("x-forwarded_for_x"));
+        assert_eq!(m.len(), PROXY_ASSERTED_HEADERS.len() + 2);
     }
 
     #[test]
