@@ -74,7 +74,10 @@ pub fn spawn_jwt_reload(pem_path: PathBuf, jwt: Arc<JwtVerifier>) {
                 .map_err(anyhow::Error::from)
                 .and_then(|pem| jwt.reload_key(&pem))
             {
-                Ok(()) => tracing::info!(path = %pem_path.display(), "JWT key reloaded"),
+                Ok(true) => tracing::info!(path = %pem_path.display(), "JWT key reloaded"),
+                Ok(false) => {
+                    tracing::debug!(path = %pem_path.display(), "JWT key unchanged; token cache kept")
+                }
                 Err(e) => {
                     tracing::error!(path = %pem_path.display(), ?e, "JWT key reload failed; keeping old key")
                 }

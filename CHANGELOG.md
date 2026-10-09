@@ -8,6 +8,7 @@ Both crates share one version. Format follows
 ## [Unreleased]
 
 ### Changed (breaking)
+- `JwtVerifier::reload_key` returns `Ok(bool)` (whether the key changed).
 - TLS provider is ring (was aws-lc-rs), across the proxy, tests and
   examples; `deny.toml` bans aws-lc. Library users install
   `rustls::crypto::ring::default_provider()`. No FIPS build, and the
@@ -66,6 +67,8 @@ Both crates share one version. Format follows
   at 30 s and no longer opens the route's breaker for every tenant.
 
 ### Changed
+- SIGUSR1 leaves the JWT key and token cache alone when the PEM file is
+  byte-for-byte unchanged (it used to flush the cache on every reload).
 - `metrics-exporter-prometheus` without its push-gateway client;
   `reqwest` in `ferryman-edge-core` without TLS (health probes are plain
   HTTP). `webpki-roots` and the CDLA-Permissive-2.0 licence allowance are

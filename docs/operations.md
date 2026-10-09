@@ -107,8 +107,9 @@ over for routes whose prefix, upstream, cooldown and health settings
 change.
 
 The JWT public key reloads too (`JWT key reloaded` / `JWT key reload
-failed; keeping old key`). A successful reload clears the verification
-cache. There is a single key and no overlap window: tokens signed by the
+failed; keeping old key`). A reload that changes the key clears the
+verification cache; if the PEM file is byte-for-byte unchanged (for example
+a certificate-renewal reload) the key and cache are left alone. There is a single key and no overlap window: tokens signed by the
 old key are rejected immediately after the reload, so rotate at the IdP
 accordingly (switch signing, then replace the file and signal).
 
