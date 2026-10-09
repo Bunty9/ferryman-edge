@@ -107,7 +107,7 @@ This is a reference, not a hardened service. At minimum:
 - **Timeouts:** add a request/handler timeout, e.g. `tower_http::timeout::TimeoutLayer`. `serve_tls` bounds the handshake and the first request, not slow handlers or slow bodies.
 - **Body limits:** axum's built-in extractors cap bodies at 2 MiB; anything reading the raw body (or with `DefaultBodyLimit::disable`) is unbounded. Set `DefaultBodyLimit` deliberately.
 - **Metrics:** none are exported here; count auth failures, 429s and handshake failures (never label by tenant or path).
-- **Key rotation:** call `JwtVerifier::reload_key(&pem)` from your own trigger (it parses first, keeps the old key on error, and clears the cache). There is no overlap window: tokens signed by the old key fail right after.
+- **Key rotation:** call `JwtVerifier::reload_key(&pem)` from your own trigger (it parses first, keeps the old key on error, and clears the cache; a byte-identical PEM is a no-op and returns `Ok(false)`). There is no overlap window: tokens signed by the old key fail right after.
 - **A real CA:** the demo CA is for demos. Use your own CA and rotate server and client certificates.
 - **Issuer and audience** are required for a reason; keep them.
 
