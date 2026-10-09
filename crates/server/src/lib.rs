@@ -17,7 +17,8 @@
 pub mod proxy;
 pub mod reload;
 
-use ferryman_edge_core::{check, Claims, JwtVerifier, Limiter, Limits, ReloadingTls, SharedTable};
+use ferryman_edge_core::ferryman_core::SharedTable;
+use ferryman_edge_core::{check, Claims, JwtVerifier, Limiter, Limits, ReloadingTls};
 use http::{HeaderValue, Request, Response};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -38,7 +39,7 @@ use tokio_rustls::TlsAcceptor;
 /// Shared upstream client. One instance for the whole process; its pool
 /// keeps idle HTTP/1.1 connections to each upstream (outbound is always
 /// HTTP/1.1).
-pub type UpstreamClient = Client<HttpConnector, proxy::Body>;
+pub type UpstreamClient = Client<HttpConnector, proxy::RequestBody>;
 
 /// Everything a connection/request needs, built once at boot.
 pub struct AppState {
@@ -61,18 +62,12 @@ pub async fn serve(
     serve_with(listener, state, Limits::default(), shutdown).await
 }
 
-/// Limits should come from `parse_config` (or satisfy its ranges): a 0
+/// Limits should come from `EdgeConfig::parse` (or satisfy its ranges): a 0
 /// timeout makes every request or connection time out immediately.
 ///
 /// Accept loop. Runs until `shutdown` resolves, then stops accepting new
 /// connections, lets in-flight ones finish (bounded by
 /// `limits.shutdown_drain_secs`), and returns.
-///
-/// Each h2 stream may buffer up to `limits.max_request_body_bytes` in
-/// collected mode, so `h2_max_concurrent_streams` bounds per-connection body
-/// memory.
-// ponytail: per-connection bound only; add a global in-flight-bytes
-// semaphore if many clients trickling large bodies becomes a real threat.
 pub async fn serve_with(
     listener: TcpListener,
     state: Arc<AppState>,
@@ -84,11 +79,15 @@ pub async fn serve_with(
     let mut http = auto::Builder::new(TokioExecutor::new());
     http.http1()
         .timer(TokioTimer::new())
-        // hyper adds this to `now()` unchecked; cap unvalidated library
-        // limits at parse_config's maximum so it cannot overflow.
-        .header_read_timeout(Duration::from_secs(
-            limits.first_request_timeout_secs.min(86_400),
-        ));
+        // Keep-alive idle timeout; hyper re-arms it whenever a connection goes
+        // idle (ROADMAP F1/E9). hyper adds it to `now()` unchecked, so cap it.
+        .header_read_timeout(
+            state
+                .table
+                .load()
+                .keepalive_timeout()
+                .min(Duration::from_secs(86_400)),
+        );
     http.http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
@@ -227,6 +226,8 @@ async fn route_request(
     // stamped value.
     let upgrade = proxy::wants_upgrade(&req);
     proxy::strip_hop_by_hop(req.headers_mut());
+    // Also run by `set_forwarded` (for `proxy::handle` callers); idempotent.
+    proxy::strip_noncanonical_asserted(req.headers_mut());
     // Stamp the tenant for the upstream; discard whatever the client sent
     // to close the obvious spoofing hole.
     req.headers_mut().remove("x-ferryman-tenant");

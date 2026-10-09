@@ -1,6 +1,6 @@
 # ferryman-edge
 
-mTLS-terminating L7 reverse proxy in Rust: rustls 0.23 (aws-lc-rs) mTLS,
+mTLS-terminating L7 reverse proxy in Rust: rustls 0.23 (ring) mTLS,
 in-line RS256 JWT auth (moka cache), per-tenant governor rate limit,
 per-upstream circuit breaker, SIGUSR1 hot reload. Behaviour and config are
 documented in `README.md` and `docs/operations.md`; `PROGRESS.md` tracks
@@ -13,16 +13,13 @@ cargo lives in `~/.cargo/bin` (not on the default PATH in some shells).
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features ferryman-edge/boxed_body -- -D warnings
 cargo test --workspace
-cargo test --workspace --features ferryman-edge/boxed_body
 cargo deny check
 cargo bench -p ferryman-edge-core --bench jwt_verify
 ```
 
 CI runs all of these (nextest instead of `cargo test`) plus an mTLS smoke
-job. Always check both feature sets: `boxed_body` changes the body type and
-the error paths in `crates/server/src/proxy.rs`.
+job.
 
 Manual end-to-end: `scripts/gen-test-certs.sh`, run the server with
 `config.toml`, serve an upstream on :8001 that answers `/health`, then
@@ -32,17 +29,21 @@ SIGUSR1 reloads.
 
 ## Layout
 
-- `crates/core` — primitives, no HTTP serving: `route.rs` (RouteTable +
-  lock-free breaker), `jwt.rs`, `ratelimit.rs`, `tls.rs` (ReloadingTls),
-  `health.rs`, `config.rs`. JWT test keys in `crates/core/tests/fixtures`.
+- `crates/core` — primitives, no HTTP serving: `config.rs` (`EdgeConfig`
+  two-pass parse over `ferryman_core::ConfigToml`; `reject_unsupported`
+  lists core keys edge does not implement yet), `jwt.rs`, `ratelimit.rs`,
+  `tls.rs` (ReloadingTls). Routing, breaker and health come from
+  `ferryman-core` (re-exported as `ferryman_edge_core::ferryman_core`; the
+  server crate uses the re-export, never a direct dependency). JWT test
+  keys in `crates/core/tests/fixtures`.
 - `crates/server/src/lib.rs` — accept loop (`serve` / `serve_with`) and
   auth middleware; `proxy.rs` — per-request forwarding; `reload.rs` —
   SIGUSR1 route + JWT key reload; `main.rs` — boot only.
 - `examples/edge-demo` (`ferryman-edge-demo`, publish = false): `backend`
   sample upstream + `edge-demo` driver (`setup` | `token` | `run`). `run`
-  spawns the real proxy binary and checks every feature; CI runs it for
-  both body modes. `examples/embed-core`: ferryman-edge-core in an axum
-  service. Behaviour changes to the request path must keep
+  spawns the real proxy binary and checks every feature; CI runs it.
+  `examples/embed-core`: ferryman-edge-core in an axum service. Behaviour
+  changes to the request path must keep
   `cargo build -p ferryman-edge -p ferryman-edge-demo && target/debug/edge-demo run`
   green; update its scenarios and README when behaviour changes.
 - `crates/server/tests/e2e.rs` — in-process end-to-end tests with
@@ -52,22 +53,61 @@ SIGUSR1 reloads.
 ## Invariants — keep these when changing the request path
 
 - Hop-by-hop headers are stripped in `lib.rs` *before* `x-ferryman-tenant`
-  is stamped; otherwise `Connection: x-ferryman-tenant` deletes it.
-- The 400 bad-path and 501 upgrade/CONNECT checks run in `proxy::handle_checked`
-  (called by `handle` and `handle_with`)
-  *before* `RouteTable::lookup` (a request that returns without reporting
-  back would leak the half-open probe slot). `Upgrade` is stripped as
+  is stamped; otherwise `Connection: x-ferryman-tenant` deletes it. Right
+  after that strip, `proxy::strip_noncanonical_asserted` drops
+  non-canonical spellings of the headers in `PROXY_ASSERTED_HEADERS` (for
+  every peer; any name that differs from a listed one but matches it with
+  non-alphanumeric bytes read as `-`). `set_forwarded` runs it again (for
+  `proxy::handle` callers; idempotent) and removes every listed canonical
+  name not in `SET_BY_PROXY`. Keep a header in the list whenever the proxy
+  starts asserting it. Request trailers are dropped in `RequestBody`.
+- Order in `proxy::handle_checked` (called by `handle` and `handle_with`):
+  `bad_path` → `ambiguous_route` (both 400 bad path, both from
+  `ferryman_core::path`, both on the raw path; `ambiguous_route` relies on
+  `bad_path` having run) → Host validation (400 bad host) → 501
+  upgrade/CONNECT → 413 declared length → `lookup` (404) →
+  `Upstream::try_acquire` (503). Everything before `try_acquire` needs no
+  admission. `Upgrade` is stripped as
   hop-by-hop, so `lib.rs` computes `proxy::wants_upgrade` before stripping
   and passes it to `handle_checked`; `h2c` is exempt.
-- Only upstream-caused failures may call `Upstream::mark_failed`: transport
-  errors, 502–504, response-body errors, and timeouts after the upload
-  finished. Client-side failures (body cap, disconnect, slow upload, 408)
-  must not, or any tenant can open a route's breaker for everyone.
-- The client body is read (under its own deadline) before
-  `RouteTable::lookup`, because lookup may admit the request as the
-  breaker's single half-open probe, and that probe must report back.
-- `lookup` never falls through to a shorter prefix when the matching
-  upstream isn't routable; it returns `None` (503).
+- Only upstream-caused failures may count against the breaker: transport
+  errors, 502–504, response-body errors (an error from the upstream body,
+  not a slow or long one), and timeouts after the upload finished, and not
+  after the client has stalled its upload or its response reads for at
+  least θ = min(1 s, request_body_idle_timeout / 2), floored at 100 ms
+  (an upstream that hangs up on a stalled client is reacting to the client). Merely "waiting on the
+  client" is no excuse: the proxy waits on an actively sending client nearly
+  all the time. Known limits: an upstream whose own read/write timeout is
+  under θ can still be blamed for a client stall, and a gateway upstream
+  answering 502/504 because its backend timed out on a stalled upload is
+  blamed, as is an upstream with a total request or response deadline (Go
+  `http.Server` `ReadTimeout`/`WriteTimeout`) that a slow but steady client
+  exceeds (every gap is under θ, so the stall exemption does not apply).
+  The upstream timer fires only after the upload finished, or when hyper stopped reading the
+  body while the client was not stalling. Client-side failures (body cap
+  413, idle/total upload deadline 408, disconnect 400) and elapsed time in
+  a response body (a long stream) must not count, or any tenant can open a
+  route's breaker for everyone. They must not record success either, or a
+  client could close an open breaker by aborting an upload. An upload
+  stall counts if it lasted at least θ at any point of the request
+  (`BodyState::stalled_during_request`, ferryman's rule), on every blame
+  path: transport error, forwarded 502–504 and response-body error. Edge's
+  own 504 timer still counts. Edge also blames response-body errors after the head;
+  ferryman does not (deliberate difference).
+- Every admission goes into a `proxy::Ticket` right after `try_acquire`;
+  only upstream-caused outcomes call `success` / `failure`, exactly once.
+  A ticket dropped without a verdict (client fault, stall-exempt upstream
+  failure, handler future dropped by a hang-up or h2 reset) calls
+  `Upstream::release`. Never release for an upstream timeout or error, and
+  never call `record_*` on an `Upstream` directly in the request path,
+  except `WatchedBody`'s one `record_failure(Admission::Normal)` for a
+  body error after the head (skipped when the head already counted as a
+  failure: one request, one failure).
+- Bodies stream; nothing is buffered.
+- Pass `RouteTable::lookup` the raw path (core normalises it for matching
+  only) and forward the raw path. `lookup` ignores breaker state and never
+  falls through to a shorter prefix (core's guarantee); an open circuit is
+  a 503 from `try_acquire`.
 - Outbound requests are downgraded to HTTP/1.1; hyper-util rejects
   h2-versioned requests on HTTP/1 upstream connections.
 - Metric labels stay bounded: `status`, upstream `host:port`, fixed
@@ -83,8 +123,17 @@ SIGUSR1 reloads.
   branch fires; re-check state inside the branch.
 - jsonwebtoken 9 only checks `iss`/`aud` when present unless they are in
   `required_spec_claims` (`with_issuer`/`with_audience` handle this).
-- Dockerfile builder and distroless runtime must share a Debian release
-  (glibc); both are bookworm.
+- The image is `scratch` + static musl and runs as 65532; anything mounted
+  into it must be readable by that uid. The Dockerfile sets
+  `RUSTUP_TOOLCHAIN=stable` because `rust-toolchain.toml` would otherwise
+  switch cargo to a toolchain without the musl target.
+- `ferryman-core` comes from a git rev until 0.3.0 is on crates.io
+  (`deny.toml` `allow-git`); the release task switches it to the registry.
+  Its breaker opens after 3 consecutive failures by default: e2e blame
+  tests use `strict()` (threshold 1) so one wrong blame shows as a 503.
+  Routes on one `host:port` share a breaker and must agree on cooldown and
+  health keys, so tests that need isolated breakers spawn separate
+  upstreams.
 - Running the server in the background from a tool call: redirect its
   stdout/stderr to a file, or a trailing `| tail` waits forever.
 
@@ -101,7 +150,7 @@ absolute or they break in the book. Build locally with
 ## Releasing
 
 Both crates share one version. Publishing is done by
-`.github/workflows/release.yml` (jobs verify, attest, publish, release; the
+`.github/workflows/release.yml` (jobs verify, binaries, attest, publish, release; the
 publish job is idempotent, so a failed run is recovered by re-running it)
 on a `v*` tag push, through crates.io Trusted Publishing (OIDC; environment
 `release`); there is no registry token secret. The crates.io
@@ -111,7 +160,8 @@ tag publishes irreversibly: never push one without an explicit request. `cargo p
 safe. When bumping, change `[workspace.package] version` and the
 `version` on server's `ferryman-edge-core` dependency together, and add a
 `## [X.Y.Z]` section to `CHANGELOG.md` (the verify job requires it and
-uses it as the GitHub release notes). Checklist: `docs/publishing.md`.
+uses it as the GitHub release notes). Release binaries are Unix-only
+(no Windows: SIGUSR1). Checklist: `docs/publishing.md`.
 
 ## Commits
 

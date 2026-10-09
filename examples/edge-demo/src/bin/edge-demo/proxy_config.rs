@@ -1,6 +1,7 @@
 //! Write `ferryman.toml` for a given topology.
 //!
-//! The schema is `ConfigToml` in `ferryman-edge-core`. Paths are written
+//! The schema is `EdgeConfig` in `ferryman-edge-core` (edge tables plus
+//! `ferryman_core::ConfigToml`). Paths are written
 //! absolute so the proxy can be started from any working directory.
 
 use crate::pki::Pki;
@@ -18,6 +19,8 @@ pub struct Topology {
     pub health_interval_secs: u64,
     /// Circuit-breaker cooldown for routes without an override (must be >= 1).
     pub default_cooldown_secs: u64,
+    /// Prefixes written with health_disabled = true (breaker driven by requests only).
+    pub unprobed: Vec<String>,
 }
 
 pub fn write(pki: &Pki, topo: &Topology, path: &Path) -> anyhow::Result<()> {
@@ -28,8 +31,9 @@ pub fn write(pki: &Pki, topo: &Topology, path: &Path) -> anyhow::Result<()> {
     // Top-level keys must come before any [table].
     writeln!(s, "health_interval_secs = {}", topo.health_interval_secs)?;
     writeln!(s, "default_cooldown_secs = {}", topo.default_cooldown_secs)?;
+    writeln!(s, "\n[limits]")?;
     writeln!(s, "tenant_rps = {}", topo.tenant_rps)?;
-    writeln!(s, "\n[tls]")?;
+    writeln!(s, "\n[mtls]")?;
     writeln!(s, "cert_path = {:?}", abs("server.crt")?)?;
     writeln!(s, "key_path = {:?}", abs("server.key")?)?;
     // Every client cert must chain to this CA; nothing else is accepted.
@@ -46,6 +50,9 @@ pub fn write(pki: &Pki, topo: &Topology, path: &Path) -> anyhow::Result<()> {
         writeln!(s, "upstream = \"http://{addr}\"")?;
         if let Some(c) = cooldown {
             writeln!(s, "cooldown_secs = {c}")?;
+        }
+        if topo.unprobed.contains(prefix) {
+            writeln!(s, "health_disabled = true")?;
         }
     }
     std::fs::write(path, s)?;
@@ -70,15 +77,16 @@ mod tests {
             tenant_rps: 5,
             health_interval_secs: 1,
             default_cooldown_secs: 2,
+            unprobed: vec![],
         };
         let path = dir.path().join("ferryman.toml");
         write(&pki, &topo, &path).unwrap();
-        let cfg: ferryman_edge_core::ConfigToml =
-            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            ferryman_edge_core::build_table(&cfg).unwrap().rules.len(),
-            2
-        );
-        assert_eq!(cfg.jwt.audience.as_deref(), Some("ferryman-edge"));
+        let c = ferryman_edge_core::EdgeConfig::parse(&std::fs::read_to_string(&path).unwrap())
+            .unwrap();
+        assert!(c.deprecations.is_empty(), "{:?}", c.deprecations);
+        // One item per distinct upstream; the two routes use different ports.
+        let t = ferryman_edge_core::ferryman_core::build_table(c.core, None).unwrap();
+        assert_eq!(t.upstreams().count(), 2);
+        assert_eq!(c.jwt.audience.as_deref(), Some("ferryman-edge"));
     }
 }

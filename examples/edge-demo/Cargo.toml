@@ -19,23 +19,20 @@ path = "src/bin/edge-demo/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
-http-body-util = { workspace = true }
+http-body-util = { workspace = true, features = ["channel"] }
 jsonwebtoken = { workspace = true }
 rcgen = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls-tls", "http2"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "http2"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
-# RSA-2048 keygen for the JWT issuer key (rcgen cannot generate RSA keys).
-aws-lc-rs = "1"
-# PEM-wrap the DER that aws-lc-rs hands back.
-pem = "3"
+# SHA-256 of the presented server certificate (cert-rotation check).
+ring = "0.17"
 
 [dev-dependencies]
 # Same repo crates the proxy is built from, by path *and* version: delete
 # `path = ...` and this is a plain crates.io dependency.
 ferryman-edge-core = { path = "../../crates/core", version = "0.1" }
 tempfile = "3"
-toml = { workspace = true }

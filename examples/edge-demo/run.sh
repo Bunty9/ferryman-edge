@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Build the proxy and the demo, then run the end-to-end walkthrough.
-# Extra args go to `cargo build`, e.g. `./run.sh --release` or
-# `./run.sh --features ferryman-edge/boxed_body`.
+# Extra args go to `cargo build`, e.g. `./run.sh --release`.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PATH="$HOME/.cargo/bin:$PATH"

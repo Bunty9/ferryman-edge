@@ -1,41 +1,61 @@
-//! Per-request handler. Looks up the routing table, rebuilds the URI for
-//! the chosen upstream, strips hop-by-hop headers, forwards via the shared
-//! hyper client, records metrics, and turns transport errors / 502-504 into
-//! circuit-breaker trips.
+//! Per-request handler. Rejects everything that needs no upstream (bad or
+//! ambiguous path, bad Host, upgrade, declared oversized body) *before*
+//! route lookup, then streams the request to the chosen upstream and the
+//! response back, and turns upstream-caused failures into circuit-breaker
+//! failures.
 //!
-//! Body buffering is cfg-gated:
-//!   - `default`: collect the body once into a `Full<Bytes>`. Lower code
-//!     complexity, faster for typical JSON.
-//!   - `boxed_body`: forward streamed via `BoxBody`. Lower steady-state
-//!     allocations for large payloads.
+//! Admission: `RouteTable::lookup` picks the route; `Upstream::try_acquire`
+//! is the last gate before forwarding. Its ticket reports exactly once (see
+//! `Ticket`); a request that ends without a verdict on the upstream
+//! releases it instead.
 //!
-//! Numbers from spec: boxed ≈ +200µs at 10 MB; collected ≈ +80µs at 1 KB
-//! but allocates ~req_size. Default off — defended in README.
+//! Bodies always stream; nothing is buffered. `upstream_timeout` starts
+//! when the client has finished uploading and ends at the upstream's
+//! response head. The response body has no deadline, so a long SSE stream
+//! or download is never cut and never trips the breaker. The upload has
+//! its own idle and total deadlines and an optional size cap. Those fail
+//! with 408/413 and never touch the breaker. An error from the response body
+//! (not a slow or long one) counts against the breaker. An upstream failure
+//! after the client stalled its upload or its response reads for at least
+//! θ = min(1 s, idle gap / 2), floored at 100 ms, does not: the upstream was
+//! reacting to the client. The upload stall counts if it happened at any
+//! point of the request, not only if it is still going on, and it also
+//! exempts a forwarded 502–504 (a gateway whose backend gave up on the
+//! stalled upload). Known limits, where the
+//! upstream is still blamed: its own read/write timeout is under θ; or it
+//! has a total request or response deadline (Go `http.Server` `ReadTimeout`
+//! / `WriteTimeout`) that a slow but steady client exceeds, since every gap
+//! is under θ and the stall exemption does not apply.
 //!
 //! Auth (JWT verify + rate limit + `x-ferryman-tenant` stamping) happens in
-//! `lib.rs` before a request reaches `handle` — by the time we're here the
-//! caller is authenticated and within quota.
+//! `lib.rs` before a request reaches `handle`.
 
-use ferryman_edge_core::{Limits, SharedTable};
+use ferryman_edge_core::ferryman_core::path::{ambiguous_route, bad_path};
+use ferryman_edge_core::ferryman_core::{Admission, SharedTable, Upstream};
+use ferryman_edge_core::Limits;
 use http::{HeaderMap, HeaderValue};
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::Bytes;
-use hyper::body::Incoming;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
+// Trait methods (`poll_frame`, `is_end_stream`, `size_hint`) on `Incoming`,
+// without shadowing the `Body` alias below.
+use hyper::body::Body as _;
+use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use std::future::Future;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::oneshot;
+use tokio::time::Sleep;
 
-#[cfg(feature = "boxed_body")]
 pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
-
-#[cfg(not(feature = "boxed_body"))]
-pub type Body = Full<Bytes>;
-#[cfg(feature = "boxed_body")]
-pub type Body = http_body_util::combinators::BoxBody<Bytes, BoxErr>;
+/// Every response body: a streamed upstream body or a local error page.
+pub type Body = BoxBody<Bytes, BoxErr>;
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -67,15 +87,85 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
         headers.remove(*name);
     }
     for name in extra {
+        // The proxy relies on `Host`; a client must not delete it by naming
+        // it in `Connection`.
+        if name == "host" {
+            continue;
+        }
         headers.remove(name.as_str());
     }
 }
 
+/// Request headers the proxy asserts to the upstream (it sets or replaces
+/// them itself). Mirrors ferryman's list.
+const PROXY_ASSERTED_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-forwarded-prefix",
+    "x-real-ip",
+    "x-ferryman-tenant",
+];
+
+/// Of [`PROXY_ASSERTED_HEADERS`], the ones the proxy sets on every forwarded
+/// request (`set_host`, `set_forwarded`, the tenant stamp in `lib.rs`). The
+/// rest are removed outright.
+const SET_BY_PROXY: &[&str] = &[
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-ferryman-tenant",
+];
+
+/// Strip non-canonical spellings of proxy-asserted headers from a client
+/// request, whoever the peer is: only the canonical name, set by the proxy,
+/// may reach the upstream. A name is a spelling of a listed header when it
+/// differs from it but matches once normalised: every non-alphanumeric byte
+/// becomes `-`, runs of `-` collapse, and leading and trailing `-` go.
+/// Header names are already lowercase. Idempotent, and never touches a
+/// canonical name.
+pub(crate) fn strip_noncanonical_asserted(headers: &mut HeaderMap) {
+    let spelled = |n: &str| {
+        if PROXY_ASSERTED_HEADERS.contains(&n) {
+            return false;
+        }
+        let mut norm = String::with_capacity(n.len());
+        for b in n.bytes() {
+            let b = if b.is_ascii_alphanumeric() { b } else { b'-' };
+            if b != b'-' || !(norm.is_empty() || norm.ends_with('-')) {
+                norm.push(b as char);
+            }
+        }
+        PROXY_ASSERTED_HEADERS.contains(&norm.trim_end_matches('-'))
+    };
+    let drop: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|n| spelled(n.as_str()))
+        .cloned()
+        .collect();
+    for n in drop {
+        headers.remove(n);
+    }
+}
+
 /// This is the edge: whatever forwarding headers the client sent are
-/// untrusted, so replace them with the peer address instead of appending.
+/// untrusted. Non-canonical spellings of every proxy-asserted header go, the
+/// canonical ones the proxy does not set (`forwarded`, `x-real-ip`,
+/// `x-forwarded-port`/`-ssl`/`-scheme`/`-prefix`) go, and
+/// `x-forwarded-for` / `x-forwarded-proto` are replaced with the peer
+/// address and `https`. Runs after `set_host`, which owns
+/// `x-forwarded-host`; the tenant header is stamped by the caller.
 fn set_forwarded(headers: &mut HeaderMap, ip: IpAddr) {
-    headers.remove("forwarded");
-    headers.remove("x-real-ip");
+    strip_noncanonical_asserted(headers);
+    for h in PROXY_ASSERTED_HEADERS {
+        if !SET_BY_PROXY.contains(h) {
+            headers.remove(*h);
+        }
+    }
     headers.insert(
         "x-forwarded-for",
         HeaderValue::from_str(&ip.to_string()).expect("an IP is a valid header value"),
@@ -83,12 +173,6 @@ fn set_forwarded(headers: &mut HeaderMap, ip: IpAddr) {
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
 }
 
-#[cfg(not(feature = "boxed_body"))]
-pub(crate) fn text_body(bytes: Bytes) -> Body {
-    Full::new(bytes)
-}
-
-#[cfg(feature = "boxed_body")]
 pub(crate) fn text_body(bytes: Bytes) -> Body {
     Full::new(bytes)
         .map_err(|never: std::convert::Infallible| -> BoxErr { match never {} })
@@ -102,64 +186,101 @@ fn plain(status: u16, msg: &'static [u8]) -> anyhow::Result<Response<Body>> {
         .body(text_body(Bytes::from_static(msg)))?)
 }
 
-/// True if `path` could be read as a dot segment (`.`/`..`) by a normalising
-/// upstream, under the variants exercised by the tests
-/// below. Detection only; the forwarded path is never rewritten.
-fn bad_path(path: &str) -> bool {
-    let b = path.as_bytes();
-    let (mut start, mut i) = (0, 0);
-    while i <= b.len() {
-        let sep = match b[i..] {
-            [] => Some(0),
-            [b'/' | b'\\', ..] => Some(1),
-            [b'%', b'2', b'f' | b'F', ..] | [b'%', b'5', b'c' | b'C', ..] => Some(3),
-            [b'%', b'0', b'0', ..] | [b'%', b'u' | b'U', ..] => return true,
-            [b'%', b'2', b'5', b'2', b'e' | b'E' | b'f' | b'F', ..]
-            | [b'%', b'2', b'5', b'5', b'c' | b'C', ..] => return true,
-            _ => None,
-        };
-        match sep {
-            Some(n) => {
-                if dot_piece(&b[start..i]) {
-                    return true;
-                }
-                i += n.max(1);
-                start = i;
+/// A local error answer labelled with the upstream (`host:port`).
+fn upstream_error(status: u16, msg: &'static [u8], host: String) -> anyhow::Result<Response<Body>> {
+    metrics::counter!("ferryman_requests_total", "status" => status.to_string(), "upstream" => host)
+        .increment(1);
+    Ok(Response::builder()
+        .status(status)
+        .body(text_body(Bytes::from_static(msg)))?)
+}
+
+/// One admitted request's breaker report, created right after
+/// `Upstream::try_acquire`. `success` and `failure` take `self`, so the
+/// admission reports at most once. Dropped without a verdict (client body
+/// error 400/408/413, an upload stall the upstream reacted to, or the
+/// handler future dropped because the client hung up or reset its h2
+/// stream before the upstream answered), it hands the admission back with
+/// `Upstream::release`: core re-arms a half-open probe slot at most once per
+/// cooldown, and a normal admission is a no-op. Upstream timeouts and
+/// errors never get here; they call `failure`.
+struct Ticket {
+    upstream: Upstream,
+    admission: Option<Admission>,
+}
+
+impl Ticket {
+    fn new(upstream: Upstream, admission: Admission) -> Self {
+        Self {
+            upstream,
+            admission: Some(admission),
+        }
+    }
+
+    fn success(mut self) {
+        if let Some(a) = self.admission.take() {
+            self.upstream.record_success(a);
+        }
+    }
+
+    fn failure(mut self) {
+        if let Some(a) = self.admission.take() {
+            self.upstream.record_failure(a);
+        }
+    }
+
+    /// No verdict on the upstream: hand the admission back (see `Drop`).
+    fn release(self) {}
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if let Some(a) = self.admission.take() {
+            self.upstream.release(a);
+        }
+    }
+}
+
+/// Why the proxy failed the client's upload. Never the upstream's fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadError {
+    TooLarge,
+    IdleTimeout,
+    TotalTimeout,
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UploadError::TooLarge => "request body too large",
+            UploadError::IdleTimeout => "request body idle timeout",
+            UploadError::TotalTimeout => "request body total timeout",
+        })
+    }
+}
+
+impl std::error::Error for UploadError {}
+
+/// The status for a failed `client.request` that the *client* caused:
+/// its body hit the cap (413), stalled or over-ran its deadline (408), or
+/// broke off (400; hyper reports a failing outgoing body as a user error).
+/// `None` means the upstream's fault. Client-caused failures must never
+/// reach the breaker, or any tenant could open a route for everyone.
+fn client_fault(e: &(dyn std::error::Error + 'static)) -> Option<(u16, &'static [u8])> {
+    if let Some(u) = error_chain(e).find_map(|c| c.downcast_ref::<UploadError>()) {
+        return Some(match u {
+            UploadError::TooLarge => (413, &b"payload too large"[..]),
+            UploadError::IdleTimeout | UploadError::TotalTimeout => {
+                (408, &b"request body timeout"[..])
             }
-            None => i += 1,
-        }
+        });
     }
-    false
-}
-
-/// `.` or `..` once parameters and encodings handled by `bad_path` are
-/// accounted for.
-fn dot_piece(piece: &[u8]) -> bool {
-    let end = piece.iter().position(|&c| c == b';').unwrap_or(piece.len());
-    let b = &piece[..end];
-    let (mut i, mut dots) = (0, 0);
-    while i < b.len() {
-        match b[i..] {
-            [b'.', ..] => i += 1,
-            [b'%', b'2', b'e' | b'E', ..] => i += 3,
-            _ => return false,
-        }
-        dots += 1;
-    }
-    matches!(dots, 1 | 2)
-}
-
-/// True when a client-request failure was caused by *our* side of the
-/// exchange — the inbound body hit the size cap or the client went away
-/// mid-upload (hyper reports both as a user body error) — rather than by
-/// the upstream. Those must not trip the upstream's breaker, or any
-/// authenticated client could open it for every tenant.
-fn is_client_body_error(e: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain(e).any(|c| {
-        c.is::<LengthLimitError>()
-            || c.downcast_ref::<hyper::Error>()
+    error_chain(e)
+        .any(|c| {
+            c.downcast_ref::<hyper::Error>()
                 .is_some_and(|h| h.is_user())
-    })
+        })
+        .then_some((400, &b"request body error"[..]))
 }
 
 fn error_chain<'a>(
@@ -186,263 +307,165 @@ pub(crate) fn wants_upgrade<B>(req: &Request<B>) -> bool {
             .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"))
 }
 
-/// Handle a single inbound request. Hop-by-hop headers are expected to be
-/// stripped by the caller (before it stamps `x-ferryman-tenant`); this entry
-/// point detects upgrades from whatever headers are still present.
-pub async fn handle(
-    table: SharedTable,
-    client: Client<HttpConnector, Body>,
-    req: Request<Incoming>,
-    peer_ip: IpAddr,
-) -> Result<Response<Body>, anyhow::Error> {
-    handle_with(table, client, req, peer_ip, &Limits::default()).await
+/// The client's request body, streamed to the upstream. It enforces the
+/// optional size cap, the idle deadline between frames and the total
+/// deadline, and it signals end-of-stream so `upstream_timer` starts
+/// only once the upload is complete. Never buffers.
+///
+/// The total deadline also runs while the upstream drains the body slowly: an
+/// upload that takes longer than it because the upstream reads slowly gets a
+/// 408, which touches no breaker.
+pub struct RequestBody {
+    inner: Incoming,
+    remaining: Option<u64>,
+    idle: Duration,
+    deadline: tokio::time::Instant,
+    // Armed only while waiting on the client, so a slow upstream connect or
+    // an upstream that is not reading is never blamed on the client.
+    idle_sleep: Option<Pin<Box<Sleep>>>,
+    total_sleep: Option<Pin<Box<Sleep>>>,
+    eos: Option<oneshot::Sender<()>>,
+    state: Arc<BodyState>,
 }
 
-/// `handle` with explicit [`Limits`] (body cap, body-read and upstream
-/// timeouts). Limits should come from `parse_config` (or satisfy its ranges):
-/// a 0 timeout makes every request time out immediately.
-pub async fn handle_with(
-    table: SharedTable,
-    client: Client<HttpConnector, Body>,
-    req: Request<Incoming>,
-    peer_ip: IpAddr,
-    limits: &Limits,
-) -> Result<Response<Body>, anyhow::Error> {
-    let upgrade = wants_upgrade(&req);
-    handle_checked(table, client, req, peer_ip, upgrade, limits).await
+/// What the timer and the blame checks can see of the body: whether hyper
+/// polled it, and since when the last poll has been left waiting on the
+/// client (rather than hyper having stopped reading because the upstream
+/// isn't draining it).
+struct BodyState {
+    polled: AtomicBool,
+    /// Start of the current wait on the client, as nanoseconds since `base`
+    /// plus one; 0 while not waiting. Set on a `Pending` poll, cleared by
+    /// any `Ready` (frame, end of stream, error).
+    waiting_since: AtomicU64,
+    base: tokio::time::Instant,
+    /// How long a client must stall (upload, or pulling the response) before
+    /// an upstream failure is put down to that stall: min(1 s, idle gap / 2).
+    stall: Duration,
+    /// The request body yielded an error (cap, deadline, client broke off).
+    client_failed: AtomicBool,
+    /// Sticky: a finished wait on the client lasted at least `stall`.
+    stalled_once: AtomicBool,
 }
 
-/// `handle` with the upgrade check done by the caller, who saw the headers
-/// before they were stripped.
-pub(crate) async fn handle_checked(
-    table: SharedTable,
-    client: Client<HttpConnector, Body>,
-    req: Request<Incoming>,
-    peer_ip: IpAddr,
-    upgrade: bool,
-    limits: &Limits,
-) -> Result<Response<Body>, anyhow::Error> {
-    let max_body = limits.max_request_body_bytes as usize;
-    let started = std::time::Instant::now();
-    let snapshot = table.load();
-    let path = req.uri().path().to_string();
+/// θ: min(1 s, idle / 2), floored at 100 ms so a zero idle gap cannot turn
+/// response-body blame off entirely.
+fn stall_threshold(idle: Duration) -> Duration {
+    (idle / 2)
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(100))
+}
 
-    // Must stay before `RouteTable::lookup`: lookup can admit this request as
-    // the breaker's single half-open probe, and a 400 would never report back.
-    if bad_path(&path) {
-        return plain(400, b"bad path");
+impl BodyState {
+    fn new(idle: Duration) -> Self {
+        Self {
+            polled: AtomicBool::new(false),
+            waiting_since: AtomicU64::new(0),
+            base: tokio::time::Instant::now(),
+            stall: stall_threshold(idle),
+            client_failed: AtomicBool::new(false),
+            stalled_once: AtomicBool::new(false),
+        }
     }
 
-    // Also before `lookup`, for the same reason: a 501 never reports back, so
-    // it must not hold the half-open probe slot. Route-agnostic by design.
-    if upgrade {
-        return plain(501, b"protocol upgrades are not supported");
+    fn now_mark(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1)
     }
 
-    // Fast rejection for a declared oversized body. `forward_body` below is
-    // the backstop for chunked uploads that lie about (or omit) it.
-    if req
-        .headers()
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|len| len > limits.max_request_body_bytes)
-    {
-        return plain(413, b"payload too large");
+    /// The last poll of the upload was left waiting on the client. During a
+    /// normal upload this is true most of the time (the proxy drains the
+    /// client faster than it sends), so it is no excuse for an upstream
+    /// failure on its own; see [`Self::client_stalled`].
+    fn waiting_on_client(&self) -> bool {
+        self.waiting_since.load(Ordering::Acquire) != 0
     }
 
-    // Deal with the client's body *before* route lookup: lookup may admit
-    // this request as the breaker's half-open probe, and a probe that ends
-    // in a client-side 408/413/400 would never report back. The body read
-    // has its own deadline so a slow uploader can't eat into (and then be
-    // blamed as) the upstream's time budget.
-    let (mut parts, body) = req.into_parts();
-    let body_timeout = Duration::from_secs(limits.request_body_timeout_secs);
-    let (fwd_body, upload_done) =
-        match tokio::time::timeout(body_timeout, forward_body(body, max_body)).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-                return plain(413, b"payload too large");
-            }
-            Ok(Err(_)) => return plain(400, b"request body error"),
-            Err(_) => return plain(408, b"request body timeout"),
+    /// The proxy has been waiting on the client's next upload frame for at
+    /// least `stall`. An upstream that gives up now (its own read timeout,
+    /// say) is reacting to the client's stall, so it is not blamed. An
+    /// upstream that dies while the client keeps sending is.
+    fn client_stalled(&self) -> bool {
+        self.stalled_for(self.waiting_since.load(Ordering::Acquire))
+    }
+
+    /// The client stalled its upload for at least `stall` at some point of
+    /// this request, or is stalling now (ferryman's rule). Every blame path
+    /// checks this: an upstream that hangs up, breaks its body, or (as a
+    /// gateway) answers 502–504 after such a stall may be reacting to it, so
+    /// it is not blamed. One whose client never paused that long is.
+    fn stalled_during_request(&self) -> bool {
+        self.stalled_once.load(Ordering::Acquire) || self.client_stalled()
+    }
+
+    /// A wait that started at `since` (a `now_mark`, 0 = none) has lasted
+    /// at least `stall`.
+    fn stalled_for(&self, since: u64) -> bool {
+        since != 0 && Duration::from_nanos(self.now_mark().saturating_sub(since)) >= self.stall
+    }
+}
+
+/// End-of-upload signal for [`upstream_timer`].
+pub(crate) struct Eos {
+    rx: oneshot::Receiver<()>,
+    state: Arc<BodyState>,
+}
+
+impl RequestBody {
+    fn new(inner: Incoming, cap: Option<u64>, idle: Duration, total: Duration) -> (Self, Eos) {
+        let (tx, rx) = oneshot::channel();
+        let state = Arc::new(BodyState::new(idle));
+        let mut b = Self {
+            inner,
+            remaining: cap,
+            idle,
+            deadline: tokio::time::Instant::now() + total,
+            idle_sleep: None,
+            total_sleep: None,
+            eos: Some(tx),
+            state: state.clone(),
         };
-
-    let upstream = match snapshot.lookup(&path) {
-        Some(u) => u.clone(),
-        // A prefix matched but its upstream's breaker is open: 503.
-        None if snapshot.has_prefix(&path) => return plain(503, b"upstream unavailable"),
-        None => return plain(404, b"no route"),
-    };
-
-    // Rebuild URI: upstream scheme+authority + original path+query. Inbound
-    // HTTP/2 requests carry the proxy's own scheme/authority in `parts.uri`,
-    // so this is always a full rebuild, never a patch.
-    let mut up_parts = upstream.uri.clone().into_parts();
-    up_parts.path_and_query = parts.uri.path_and_query().cloned();
-    parts.uri = http::Uri::from_parts(up_parts)?;
-    // hyper-util's legacy Client rejects an HTTP/2-versioned request over
-    // an HTTP/1 connection (UserUnsupportedVersion) — upstreams here are
-    // plain http://, so always downgrade.
-    parts.version = http::Version::HTTP_11;
-    if let Some(authority) = upstream.uri.authority() {
-        parts.headers.insert(
-            http::header::HOST,
-            HeaderValue::from_str(authority.as_str())?,
-        );
+        b.signal_if_done();
+        (b, Eos { rx, state })
     }
-    set_forwarded(&mut parts.headers, peer_ip);
 
-    // The upstream's budget starts now: round trip plus (collected mode)
-    // the response body.
-    // Unvalidated library limits must not panic: fall back to ~30 years out.
-    let now = tokio::time::Instant::now();
-    let deadline = now
-        .checked_add(Duration::from_secs(limits.upstream_timeout_secs))
-        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30));
-    let fwd = Request::from_parts(parts, fwd_body);
-
-    // host:port, so two upstreams on one host stay distinct series.
-    let host = upstream
-        .uri
-        .authority()
-        .map_or_else(String::new, |a| a.to_string());
-    let resp = match tokio::time::timeout_at(deadline, client.request(fwd)).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) if is_client_body_error(&e) => {
-            let too_large = error_chain(&e).any(|c| c.is::<LengthLimitError>());
-            return if too_large {
-                plain(413, b"payload too large")
-            } else {
-                plain(400, b"request body error")
-            };
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(upstream = %host, error = %e, "upstream request failed");
-            upstream.mark_failed();
-            metrics::counter!("ferryman_requests_total", "status" => "502", "upstream" => host)
-                .increment(1);
-            return Ok(Response::builder()
-                .status(502)
-                .body(text_body(Bytes::from_static(b"bad gateway")))?);
-        }
-        Err(_) => {
-            // In streaming mode the upload runs inside this deadline; only
-            // blame the upstream if the client had finished sending.
-            if upload_done.load(Ordering::Acquire) {
-                upstream.mark_failed();
+    fn signal_if_done(&mut self) {
+        if self.inner.is_end_stream() {
+            if let Some(tx) = self.eos.take() {
+                let _ = tx.send(());
             }
-            metrics::counter!("ferryman_requests_total", "status" => "504", "upstream" => host)
-                .increment(1);
-            return Ok(Response::builder()
-                .status(504)
-                .body(text_body(Bytes::from_static(b"upstream timeout")))?);
         }
-    };
-
-    let status = resp.status();
-    let (mut resp_parts, resp_body) = resp.into_parts();
-    strip_hop_by_hop(&mut resp_parts.headers);
-    // Don't echo the upstream's HTTP version (e.g. an HTTP/1.0 upstream)
-    // back to the client; hyper picks the wire version.
-    resp_parts.version = http::Version::default();
-
-    #[cfg(not(feature = "boxed_body"))]
-    let out_body: Body = match tokio::time::timeout_at(deadline, resp_body.collect()).await {
-        Ok(Ok(collected)) => Full::new(collected.to_bytes()),
-        Ok(Err(_)) | Err(_) => {
-            upstream.mark_failed();
-            metrics::counter!("ferryman_requests_total", "status" => "502", "upstream" => host)
-                .increment(1);
-            return Ok(Response::builder()
-                .status(502)
-                .body(text_body(Bytes::from_static(b"bad gateway")))?);
-        }
-    };
-    #[cfg(feature = "boxed_body")]
-    let out_body: Body = resp_body.map_err(Into::into).boxed();
-
-    // Only gateway-class 5xx mean "this upstream is unhealthy"; a 500 is an
-    // application bug on one request and must not blackhole the whole route
-    // for a cooldown.
-    if matches!(status.as_u16(), 502..=504) {
-        upstream.mark_failed();
-    } else {
-        upstream.mark_success();
-    }
-    metrics::histogram!("ferryman_request_duration_seconds", "upstream" => host.clone())
-        .record(started.elapsed().as_secs_f64());
-    metrics::counter!(
-        "ferryman_requests_total",
-        "status" => status.as_u16().to_string(),
-        "upstream" => host
-    )
-    .increment(1);
-
-    Ok(Response::from_parts(resp_parts, out_body))
-}
-
-// ----- Body forwarding strategies ------------------------------------------
-//
-// Cargo feature `boxed_body` enables streaming forwarding (low alloc, good for
-// big payloads). Default off => collect body once (smaller code, faster for
-// JSON < 256 KB). Hiring-panel question to anticipate: "why is the default
-// off?" — see README "Design tradeoffs".
-
-/// Whether the client finished sending its body. Collected mode always has
-/// by the time the upstream is dialed; streaming mode flips it when the
-/// body reaches end-of-stream.
-type UploadDone = Arc<AtomicBool>;
-
-#[cfg(not(feature = "boxed_body"))]
-async fn forward_body(body: Incoming, max_body: usize) -> anyhow::Result<(Body, UploadDone)> {
-    match Limited::new(body, max_body).collect().await {
-        Ok(collected) => Ok((
-            Full::new(collected.to_bytes()),
-            Arc::new(AtomicBool::new(true)),
-        )),
-        Err(e) => match e.downcast::<LengthLimitError>() {
-            Ok(too_large) => Err(anyhow::Error::new(*too_large)),
-            Err(other) => Err(anyhow::anyhow!("{other}")),
-        },
     }
 }
 
-// A chunked upload with no Content-Length that exceeds the body cap is cut
-// mid-stream by `Limited`; `is_client_body_error` maps that to 413 (or 400
-// for a client disconnect) and keeps it off the breaker.
-#[cfg(feature = "boxed_body")]
-async fn forward_body(body: Incoming, max_body: usize) -> anyhow::Result<(Body, UploadDone)> {
-    let inner = Limited::new(body, max_body);
-    // hyper never polls a body that already reports end-of-stream (e.g. a
-    // GET), so seed the flag rather than waiting for a poll.
-    let done: UploadDone = Arc::new(AtomicBool::new(hyper::body::Body::is_end_stream(&inner)));
-    let body = TrackEnd {
-        inner,
-        done: done.clone(),
-    };
-    Ok((body.boxed(), done))
-}
-
-/// Body wrapper that records when the inner body reaches end-of-stream.
-#[cfg(feature = "boxed_body")]
-struct TrackEnd<B> {
-    inner: B,
-    done: UploadDone,
-}
-
-#[cfg(feature = "boxed_body")]
-impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
-    type Data = B::Data;
-    type Error = B::Error;
+impl hyper::body::Body for RequestBody {
+    type Data = Bytes;
+    type Error = BoxErr;
 
     fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        if matches!(polled, std::task::Poll::Ready(None)) || self.inner.is_end_stream() {
-            self.done.store(true, Ordering::Release);
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxErr>>> {
+        let this = self.get_mut();
+        let polled = this.poll_inner(cx);
+        let state = &this.state;
+        match polled {
+            Poll::Pending => {
+                if state.waiting_since.load(Ordering::Acquire) == 0 {
+                    state
+                        .waiting_since
+                        .store(state.now_mark(), Ordering::Release);
+                }
+            }
+            Poll::Ready(ref r) => {
+                if state.stalled_for(state.waiting_since.swap(0, Ordering::AcqRel)) {
+                    state.stalled_once.store(true, Ordering::Release);
+                }
+                if matches!(r, Some(Err(_))) {
+                    state.client_failed.store(true, Ordering::Release);
+                }
+            }
         }
         polled
     }
@@ -451,14 +474,640 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
         self.inner.is_end_stream()
     }
 
-    fn size_hint(&self) -> hyper::body::SizeHint {
+    fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
 }
 
+impl RequestBody {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxErr>>> {
+        let this = self;
+        this.state.polled.store(true, Ordering::Release);
+        if tokio::time::Instant::now() >= this.deadline {
+            return Poll::Ready(Some(Err(UploadError::TotalTimeout.into())));
+        }
+        // Trailers are dropped: the upstream gets only the body data.
+        loop {
+            break match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
+                    this.idle_sleep = None;
+                    continue;
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    this.idle_sleep = None;
+                    if let (Some(left), Some(data)) = (this.remaining.as_mut(), frame.data_ref()) {
+                        let n = data.len() as u64;
+                        if n > *left {
+                            return Poll::Ready(Some(Err(UploadError::TooLarge.into())));
+                        }
+                        *left -= n;
+                    }
+                    // The last frame of a content-length body may not be
+                    // followed by another poll, so check here as well as on None.
+                    this.signal_if_done();
+                    Poll::Ready(Some(Ok(frame)))
+                }
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(None) => {
+                    if let Some(tx) = this.eos.take() {
+                        let _ = tx.send(());
+                    }
+                    Poll::Ready(None)
+                }
+                Poll::Pending => {
+                    let idle = this.idle;
+                    let idle_sleep = this
+                        .idle_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                    if idle_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(UploadError::IdleTimeout.into())));
+                    }
+                    let deadline = this.deadline;
+                    let total_sleep = this
+                        .total_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+                    if total_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(UploadError::TotalTimeout.into())));
+                    }
+                    Poll::Pending
+                }
+            };
+        }
+    }
+}
+
+/// Completes when the request must fail as an upstream timeout (504).
+/// That is `upstream_timeout` after the upload finished, or a whole window
+/// in which hyper stopped reading the body while the client was not the
+/// one stalling (the upstream is not draining it). A merely slow client is
+/// left to the body's own deadlines (408).
+async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
+    let Eos { mut rx, state } = eos;
+    loop {
+        tokio::select! {
+            r = &mut rx => {
+                // Sender dropped without EOS: the body failed, and the
+                // request future reports that. Never time out for it.
+                if r.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                break;
+            }
+            () = tokio::time::sleep(upstream_timeout) => {
+                if !state.polled.swap(false, Ordering::AcqRel)
+                    && !state.waiting_on_client()
+                {
+                    return;
+                }
+            }
+        }
+    }
+    tokio::time::sleep(upstream_timeout).await;
+}
+
+/// The upstream's response body. An error from it (reset, truncated chunked
+/// stream) is the upstream's fault and counts against the breaker, once, as
+/// an ordinary (`Admission::Normal`) failure: the head already gave the
+/// ticket's verdict. A slow or long body is never blamed, and a client that
+/// goes away drops the body without a poll error. (ferryman itself never
+/// blames after the head; edge does on purpose.)
+///
+/// Not blamed either: an error after the client was slow to pull the
+/// response. hyper polls this body only when the client side can take more,
+/// so a gap of at least `stall` between a frame (or the head) and the next
+/// poll means the client paused reading; an upstream with a write timeout
+/// then hangs up, reacting to that client.
+struct WatchedBody {
+    inner: Incoming,
+    upstream: Upstream,
+    request: Arc<BodyState>,
+    /// This request already counted one failure (its head, or an earlier
+    /// body error); never count another.
+    failed: bool,
+    /// When the head or the last frame was handed on and not yet followed
+    /// by another poll.
+    ready_at: Option<tokio::time::Instant>,
+    /// Sticky: the client once took at least `stall` to pull the next frame.
+    client_stalled_reading: bool,
+}
+
+impl hyper::body::Body for WatchedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        let now = tokio::time::Instant::now();
+        if let Some(t) = this.ready_at.take() {
+            if now - t >= this.request.stall {
+                this.client_stalled_reading = true;
+            }
+        }
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(_))) = &polled {
+            this.ready_at = Some(now);
+        }
+        // The upstream may answer before it has read the whole upload. If the
+        // client then aborts or stalls, hyper tears the connection down and
+        // surfaces a plain "connection error" here, with no trace of the
+        // client's error in its source chain. So besides the head's
+        // classifier, check whether the request body itself failed.
+        if let Poll::Ready(Some(Err(e))) = &polled {
+            if !this.failed
+                && client_fault(e).is_none()
+                && !this.request.client_failed.load(Ordering::Acquire)
+                && !this.request.stalled_during_request()
+                && !this.client_stalled_reading
+            {
+                this.failed = true;
+                this.upstream.record_failure(Admission::Normal);
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn declared_len<B>(req: &Request<B>) -> Option<u64> {
+    req.headers()
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Handle a single inbound request with [`Limits::default`]. Hop-by-hop
+/// headers are expected to be stripped by the caller (before it stamps
+/// `x-ferryman-tenant`); upgrades are detected from what is still present.
+pub async fn handle(
+    table: SharedTable,
+    client: Client<HttpConnector, RequestBody>,
+    req: Request<Incoming>,
+    peer_ip: IpAddr,
+) -> anyhow::Result<Response<Body>> {
+    handle_with(table, client, req, peer_ip, &Limits::default()).await
+}
+
+/// `handle` with explicit [`Limits`] (body cap).
+pub async fn handle_with(
+    table: SharedTable,
+    client: Client<HttpConnector, RequestBody>,
+    req: Request<Incoming>,
+    peer_ip: IpAddr,
+    limits: &Limits,
+) -> anyhow::Result<Response<Body>> {
+    let upgrade = wants_upgrade(&req);
+    handle_checked(table, client, req, peer_ip, upgrade, limits).await
+}
+
+/// The `Host` the upstream sees, and `x-forwarded-host` (E1).
+///
+/// By default this is the client's host: the request-target authority
+/// (h2 `:authority`, or an HTTP/1 absolute-form URI) wins over `Host`, per
+/// RFC 9112 section 3.2.2. `rewrite_host` sends the upstream's own
+/// authority instead (the 0.1.x behaviour). A client-sent
+/// `x-forwarded-host` is always replaced.
+///
+/// This is the only place `rewrite_host` is interpreted.
+fn set_host(
+    headers: &mut HeaderMap,
+    client_uri: &http::Uri,
+    upstream_uri: &http::Uri,
+    rewrite_host: bool,
+) {
+    let client_host = client_uri
+        .authority()
+        .and_then(host_value)
+        .or_else(|| headers.get(http::header::HOST).and_then(parse_host));
+    headers.remove("x-forwarded-host");
+    if let Some(h) = &client_host {
+        headers.insert("x-forwarded-host", h.clone());
+    }
+    let host = if rewrite_host {
+        upstream_uri.authority().and_then(host_value)
+    } else {
+        client_host
+    };
+    match host {
+        Some(h) => {
+            headers.insert(http::header::HOST, h);
+        }
+        None => {
+            headers.remove(http::header::HOST);
+        }
+    }
+}
+
+/// A `Host` header value as `host[:port]`; `None` unless it is a bare
+/// authority (no userinfo, list or path).
+fn parse_host(v: &HeaderValue) -> Option<HeaderValue> {
+    if v.as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'@' | b',' | b'/') || *b >= 0x80)
+    {
+        return None;
+    }
+    let s = v.to_str().ok()?;
+    // Whatever follows the host part (after `]` for an IPv6 literal) must be
+    // `:` plus a 1-5 digit port that fits u16; `Authority` alone accepts
+    // `a:b`, `x:99999` and `x:`.
+    let rest = if s.starts_with('[') {
+        s.find(']').map(|i| &s[i + 1..])?
+    } else {
+        s.find(':').map_or("", |i| &s[i..])
+    };
+    if !rest.is_empty() {
+        let port = rest.strip_prefix(':')?;
+        if port.len() > 5
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return None;
+        }
+    }
+    if s == "*" {
+        return None;
+    }
+    http::uri::Authority::try_from(v.as_bytes())
+        .ok()
+        .and_then(|a| host_value(&a))
+}
+
+/// More than one `Host`, or (when the request target has no authority, so
+/// the header is what gets used) one that is not a plain authority. Checked
+/// before `lookup`, so the 400 cannot leak a half-open probe slot.
+fn bad_host(headers: &HeaderMap, uri: &http::Uri, version: http::Version) -> bool {
+    let mut it = headers.get_all(http::header::HOST).iter();
+    match (it.next(), it.next()) {
+        // RFC 9112 section 3.2: HTTP/1.1 needs a Host or an absolute target.
+        (None, _) => version == http::Version::HTTP_11 && uri.authority().is_none(),
+        (Some(v), None) => uri.authority().is_none() && parse_host(v).is_none(),
+        _ => true,
+    }
+}
+
+/// `host[:port]` of an authority, without userinfo.
+fn host_value(a: &http::uri::Authority) -> Option<HeaderValue> {
+    let s = match a.port() {
+        Some(p) => format!("{}:{p}", a.host()),
+        None => a.host().to_string(),
+    };
+    HeaderValue::from_str(&s).ok()
+}
+
+/// `handle` with the upgrade check done by the caller, who saw the headers
+/// before they were stripped.
+pub(crate) async fn handle_checked(
+    table: SharedTable,
+    client: Client<HttpConnector, RequestBody>,
+    req: Request<Incoming>,
+    peer_ip: IpAddr,
+    upgrade: bool,
+    limits: &Limits,
+) -> anyhow::Result<Response<Body>> {
+    let started = std::time::Instant::now();
+    // `load_full`: the snapshot is held across awaits.
+    let snapshot = table.load_full();
+    let path = req.uri().path().to_string();
+
+    // Everything that needs no upstream is rejected before admission
+    // (`try_acquire` may hand this request the breaker's single half-open
+    // probe), in this order: bad path, ambiguous route (both on the raw
+    // path; `ambiguous_route` relies on `bad_path` having run), Host,
+    // upgrade, declared body size.
+    if bad_path(&path) || ambiguous_route(&snapshot, &path) {
+        return plain(400, b"bad path");
+    }
+    if bad_host(req.headers(), req.uri(), req.version()) {
+        return plain(400, b"bad host");
+    }
+    if upgrade {
+        return plain(501, b"protocol upgrades are not supported");
+    }
+    if let Some(max) = limits.max_request_body_bytes {
+        if declared_len(&req).is_some_and(|len| len > max) {
+            return plain(413, b"payload too large");
+        }
+    }
+
+    // `lookup` takes the raw path and normalises it for matching only; it
+    // ignores breaker state and never falls through to a shorter prefix.
+    let Some(route) = snapshot.lookup(&path) else {
+        return plain(404, b"no route");
+    };
+    let rewrite_host = route.rewrite_host;
+    let upstream = route.upstream.clone();
+    // The last gate. From here on this request holds an admission (maybe
+    // the half-open probe) and reports it exactly once through `ticket`;
+    // every early return, `?` or dropped future releases it.
+    let Some(admission) = upstream.try_acquire() else {
+        return plain(503, b"upstream unavailable");
+    };
+    let ticket = Ticket::new(upstream.clone(), admission);
+
+    let (mut parts, body) = req.into_parts();
+    let (body, eos) = RequestBody::new(
+        body,
+        limits.max_request_body_bytes,
+        snapshot.request_body_idle_timeout(),
+        snapshot.request_body_timeout(),
+    );
+
+    // Rebuild URI: upstream scheme+authority + original path+query. Inbound
+    // HTTP/2 requests carry the proxy's own authority in `parts.uri`, so
+    // this is always a full rebuild, never a patch.
+    let mut up_parts = upstream.uri.clone().into_parts();
+    up_parts.path_and_query = parts.uri.path_and_query().cloned();
+    set_host(&mut parts.headers, &parts.uri, &upstream.uri, rewrite_host);
+    parts.uri = http::Uri::from_parts(up_parts)?;
+    // hyper-util's legacy Client rejects an HTTP/2-versioned request on an
+    // HTTP/1 connection; upstreams here are plain http://, so downgrade.
+    parts.version = http::Version::HTTP_11;
+    set_forwarded(&mut parts.headers, peer_ip);
+
+    // host:port, so two upstreams on one host stay distinct series.
+    let host = upstream.name.clone();
+    let client_state = eos.state.clone();
+    let fwd = Request::from_parts(parts, body);
+    let result = tokio::select! {
+        r = client.request(fwd) => Some(r),
+        () = upstream_timer(eos, snapshot.upstream_timeout) => None,
+    };
+    let resp = match result {
+        Some(Ok(resp)) => resp,
+        Some(Err(e)) => {
+            if let Some((status, msg)) = client_fault(&e) {
+                // No verdict: not `failure` (the upstream is not at fault)
+                // and not `success` (a client must not close an open breaker
+                // by aborting an upload).
+                ticket.release();
+                return plain(status, msg);
+            }
+            tracing::warn!(upstream = %host, error = %e, "upstream request failed");
+            // An upstream that drops the connection after the client stalled
+            // its upload for `stall` (now or earlier in the request) may be
+            // reacting to that stall: answer 502, blame no one.
+            if client_state.stalled_during_request() {
+                ticket.release();
+            } else {
+                ticket.failure();
+            }
+            return upstream_error(502, b"bad gateway", host);
+        }
+        None => {
+            ticket.failure();
+            return upstream_error(504, b"upstream timeout", host);
+        }
+    };
+
+    let status = resp.status();
+    // Health is judged on the response head; the body then streams with no
+    // deadline. Only gateway-class 5xx mean "this upstream is unhealthy": a
+    // 500 is one request's bug and must not blackhole the route. A gateway
+    // answering 502–504 after the client stalled its upload is passing on
+    // its backend's reaction to that stall: no verdict (and never success).
+    // A head that already counted as a failure must not count again if its
+    // body then breaks: one request, one failure.
+    let mut head_failed = false;
+    if matches!(status.as_u16(), 502..=504) {
+        if client_state.stalled_during_request() {
+            ticket.release();
+        } else {
+            ticket.failure();
+            head_failed = true;
+        }
+    } else {
+        ticket.success();
+    }
+    let (mut resp_parts, resp_body) = resp.into_parts();
+    let resp_body = WatchedBody {
+        inner: resp_body,
+        upstream: upstream.clone(),
+        request: client_state,
+        failed: head_failed,
+        // The gap between the head and the first body poll counts too.
+        ready_at: Some(tokio::time::Instant::now()),
+        client_stalled_reading: false,
+    };
+    strip_hop_by_hop(&mut resp_parts.headers);
+    // Don't echo the upstream's HTTP version back; hyper picks the wire version.
+    resp_parts.version = http::Version::default();
+    metrics::histogram!("ferryman_request_duration_seconds", "upstream" => host.clone())
+        .record(started.elapsed().as_secs_f64());
+    metrics::counter!(
+        "ferryman_requests_total",
+        "status" => status.as_u16().to_string(),
+        "upstream" => host
+    )
+    .increment(1);
+    Ok(Response::from_parts(
+        resp_parts,
+        resp_body.map_err(Into::into).boxed(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bad_path, wants_upgrade};
+    use super::{
+        bad_host, set_host, stall_threshold, strip_hop_by_hop, strip_noncanonical_asserted,
+        wants_upgrade, PROXY_ASSERTED_HEADERS,
+    };
+    use http::{HeaderMap, HeaderValue};
+    use std::time::Duration;
+
+    #[test]
+    fn stall_threshold_is_clamped() {
+        let ms = Duration::from_millis;
+        assert_eq!(stall_threshold(Duration::ZERO), ms(100));
+        assert_eq!(stall_threshold(ms(100)), ms(100));
+        assert_eq!(stall_threshold(ms(600)), ms(300));
+        assert_eq!(stall_threshold(Duration::from_secs(30)), ms(1000));
+    }
+
+    #[test]
+    fn host_policy() {
+        let up: http::Uri = "http://10.0.0.5:8001".parse().unwrap();
+        let get = |h: &HeaderMap, n: &str| h.get(n).unwrap().to_str().unwrap().to_string();
+
+        // Origin-form: the Host header is kept; a client XFH is replaced.
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("app.example"));
+        h.insert("x-forwarded-host", HeaderValue::from_static("evil.example"));
+        set_host(&mut h, &"/x".parse().unwrap(), &up, false);
+        assert_eq!(get(&h, "host"), "app.example");
+        assert_eq!(get(&h, "x-forwarded-host"), "app.example");
+
+        // A request-target authority (h2 :authority, absolute-form) wins.
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("ignored.example"));
+        let abs: http::Uri = "https://api.example:8443/x".parse().unwrap();
+        set_host(&mut h, &abs, &up, false);
+        assert_eq!(get(&h, "host"), "api.example:8443");
+
+        // rewrite_host: upstream authority as Host, client host in XFH.
+        set_host(&mut h, &abs, &up, true);
+        assert_eq!(get(&h, "host"), "10.0.0.5:8001");
+        assert_eq!(get(&h, "x-forwarded-host"), "api.example:8443");
+
+        // Userinfo never reaches a header.
+        let mut h = HeaderMap::new();
+        set_host(
+            &mut h,
+            &"http://u:p@a.example/x".parse().unwrap(),
+            &up,
+            false,
+        );
+        assert_eq!(get(&h, "host"), "a.example");
+
+        // No host at all: no Host header and no XFH.
+        let mut h = HeaderMap::new();
+        set_host(&mut h, &"/x".parse().unwrap(), &up, false);
+        assert!(h.get("host").is_none() && h.get("x-forwarded-host").is_none());
+    }
+
+    #[test]
+    fn host_validation() {
+        const V: http::Version = http::Version::HTTP_11;
+        let h = |vals: &[&str]| {
+            let mut m = HeaderMap::new();
+            for v in vals {
+                m.append("host", HeaderValue::from_str(v).unwrap());
+            }
+            m
+        };
+        for bad in [
+            "a.example, b.example",
+            "u@x",
+            "x/y",
+            "",
+            "a:b",
+            "x:99999",
+            "x:",
+            "*",
+            "[::1]:",
+        ] {
+            assert!(bad_host(&h(&[bad]), &"/".parse().unwrap(), V), "{bad:?}");
+        }
+        assert!(bad_host(
+            &h(&["a.example", "b.example"]),
+            &"/".parse().unwrap(),
+            V
+        ));
+        for ok in [
+            "a.example",
+            "a.example:8443",
+            "x:8443",
+            "[::1]",
+            "[::1]:8443",
+            "LOCALHOST",
+        ] {
+            assert!(!bad_host(&h(&[ok]), &"/".parse().unwrap(), V), "{ok:?}");
+        }
+        // No Host: an error on HTTP/1.1 only.
+        assert!(bad_host(&HeaderMap::new(), &"/".parse().unwrap(), V));
+        assert!(!bad_host(
+            &HeaderMap::new(),
+            &"/".parse().unwrap(),
+            http::Version::HTTP_10
+        ));
+        assert!(!bad_host(
+            &HeaderMap::new(),
+            &"http://a.example/".parse().unwrap(),
+            V
+        ));
+        // With a URI authority the header is not used, so it is not judged.
+        assert!(!bad_host(
+            &h(&["u@x"]),
+            &"http://a.example/".parse().unwrap(),
+            V
+        ));
+        assert!(bad_host(
+            &h(&["a", "b"]),
+            &"http://a.example/".parse().unwrap(),
+            V
+        ));
+        // The validated value is what gets forwarded.
+        let mut m = h(&["[::1]:8443"]);
+        set_host(
+            &mut m,
+            &"/x".parse().unwrap(),
+            &"http://u:1".parse().unwrap(),
+            false,
+        );
+        assert_eq!(m.get("x-forwarded-host").unwrap(), "[::1]:8443");
+    }
+
+    #[test]
+    fn non_canonical_proxy_header_spellings_are_stripped() {
+        let mut m = HeaderMap::new();
+        for h in PROXY_ASSERTED_HEADERS {
+            m.insert(*h, HeaderValue::from_static("keep"));
+            let alt = h.replace('-', "_");
+            if alt != *h {
+                m.insert(
+                    http::HeaderName::from_bytes(alt.to_ascii_uppercase().as_bytes()).unwrap(),
+                    HeaderValue::from_static("drop"),
+                );
+            }
+        }
+        // Other separators, and mixed ones, are spellings too.
+        for h in PROXY_ASSERTED_HEADERS {
+            for alt in [
+                h.replace('-', "."),
+                h.replacen('-', ".", 1).replace('-', "_"),
+            ] {
+                if alt != *h {
+                    m.insert(
+                        http::HeaderName::from_bytes(alt.as_bytes()).unwrap(),
+                        HeaderValue::from_static("drop"),
+                    );
+                }
+            }
+        }
+        for alt in [
+            "x__forwarded_for",
+            "x._forwarded-for",
+            "-x-ferryman-tenant",
+            "x-forwarded-for-",
+        ] {
+            m.insert(
+                http::HeaderName::from_bytes(alt.as_bytes()).unwrap(),
+                HeaderValue::from_static("drop"),
+            );
+        }
+        m.insert("x_custom", HeaderValue::from_static("keep"));
+        m.insert("x-forwarded_for_x", HeaderValue::from_static("keep"));
+        m.insert("x.custom", HeaderValue::from_static("keep"));
+        assert!(m.contains_key("x.ferryman.tenant") && m.contains_key("x.forwarded_for"));
+        strip_noncanonical_asserted(&mut m);
+        for h in PROXY_ASSERTED_HEADERS {
+            assert_eq!(m.get(*h).unwrap(), "keep", "{h}");
+        }
+        assert!(m.values().all(|v| v == "keep"), "{m:?}");
+        assert!(m.contains_key("x_custom") && m.contains_key("x-forwarded_for_x"));
+        assert_eq!(m.len(), PROXY_ASSERTED_HEADERS.len() + 3);
+    }
+
+    #[test]
+    fn connection_cannot_delete_host() {
+        let mut m = HeaderMap::new();
+        m.insert("host", HeaderValue::from_static("a.example"));
+        m.insert("connection", HeaderValue::from_static("Host, x-other"));
+        m.insert("x-other", HeaderValue::from_static("1"));
+        strip_hop_by_hop(&mut m);
+        assert!(m.get("host").is_some() && m.get("x-other").is_none());
+    }
 
     #[test]
     fn upgrade_detection() {
@@ -477,76 +1126,5 @@ mod tests {
         assert!(!wants_upgrade(&get(Some("h2c"))));
         assert!(!wants_upgrade(&get(Some("H2C"))));
         assert!(!wants_upgrade(&get(None)));
-    }
-
-    #[test]
-    fn dot_segments_are_rejected() {
-        for p in [
-            "/svc-a/../svc-b",
-            "/svc-a/./x",
-            "/svc-a/%2e%2e/svc-b",
-            "/svc-a/%2E/x",
-            "/api/../admin",
-            "/api/%2e%2e/admin",
-            "/api/..%2fadmin",
-            "/api/./../admin",
-            "/api/..",
-            "/api/%2E%2E/x",
-            "/api/%2e%2E/x",
-            "/api/.%2e/x",
-            "/api/..;/admin",
-            "/api/.;x/y",
-            "/api/%2e%2e;/x",
-            "/api/..%5cx",
-            "/api/..%5Cx",
-            "/api/a\\..\\b",
-            "/api/%2e/x",
-            "/..",
-            "/api/a%2f..",
-            "/api/%2e%2e%2f",
-            "/api/..%00",
-            "/api/.%00.",
-            "/api/%u002e%u002e",
-            "/api/%U002e",
-            "/api/%252e%252e",
-            "/api/%252E",
-            "/api/%252f",
-            "/api/%252F",
-            "/api/%255c",
-            "/api/a%00b",
-            "/api/a%5c..",
-            "/api/a%5C..%5Cb",
-        ] {
-            assert!(bad_path(p), "{p}");
-        }
-    }
-
-    #[test]
-    fn legitimate_paths_are_allowed() {
-        for p in [
-            "/svc-a/x",
-            "/svc-a/.hidden",
-            "/svc-a/a..b",
-            "/a..b/",
-            "/.well-known/acme",
-            "/file.tar.gz",
-            "/api/v1.2/x",
-            "/",
-            "/api/...",
-            "/api/a;..",
-            "/api/%2e%2e%2e/x",
-            "/api/%41/x",
-            "/api/.a/x",
-            "/api/a%2/",
-            "/api/v4/projects/group%2Fproject",
-            "/api/queues/%2F/q",
-            "/@scope%2fpkg",
-            "/%2F",
-            "/api/%25",
-            "/api/100%25",
-            "/api/%c0%ae",
-        ] {
-            assert!(!bad_path(p), "{p}");
-        }
     }
 }

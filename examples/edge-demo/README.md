@@ -13,9 +13,10 @@ The example crate is `ferryman-edge-demo`, with two binaries:
 
 ## What you will see
 
-`edge-demo run` starts three backends and the proxy on free ports, then walks
-through eleven scenarios, printing `✓` / `✗` per check and exiting non-zero if
-any fails (about 5 seconds):
+`edge-demo run` starts four backends and the proxy on free ports, then walks
+through thirteen scenarios, printing `✓` / `✗` per check and exiting non-zero if
+any fails (65 checks, about 75 seconds, most of it the 65 s SSE stream;
+`EDGE_DEMO_SSE_SECS=3` shortens it to about 10 s):
 
 1. **mTLS**: valid cert over HTTP/2 and HTTP/1.1 works; no cert and a cert
    from another CA are refused.
@@ -23,17 +24,32 @@ any fails (about 5 seconds):
    and wrongly-signed tokens are all 401; a valid one is 200.
 3. **Identity propagation**: the backend sees `x-ferryman-tenant` equal to the
    JWT `sub` (client-supplied values are discarded), the peer IP in
-   `x-forwarded-for`, and `x-forwarded-proto: https`.
+   `x-forwarded-for`, and `x-forwarded-proto: https`. `Host` is the one the
+   client used (h2 `:authority`), and `x-forwarded-host` carries it (a forged
+   one is replaced).
 4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected; a WebSocket upgrade is 501.
-5. **Bodies**: 6 MiB passes intact, 9 MiB is 413.
-6. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.
-7. **Circuit breaker + health checks**: kill a backend, watch 503 and the
+5. **Bodies**: 6, 9 and 50 MiB pass intact (no size cap by default).
+6. **Streaming**: a 65 s SSE response runs through `upstream_timeout_secs = 30`
+   and leaves the breaker closed.
+7. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.
+8. **Circuit breaker + health checks**: kill a backend, watch 503 and the
    `ferryman_circuit_state` gauge, restart it, watch recovery.
-8. **Hot reload (routes)**: add a route, `SIGUSR1`, it is live.
-9. **Hot reload (certificate)**: rotate the server cert, `SIGUSR1`, new
-   handshakes present it; existing clients keep working.
-10. **Metrics**: Prometheus text on a separate port.
-11. **Graceful shutdown**: `SIGTERM` lets an in-flight request finish.
+9. **Breaker admission**: with threshold 3, a dead unprobed backend gives 502,
+   502, 502, then 503; one probe after the cooldown closes the circuit.
+10. **Hot reload (routes)**: add a route, `SIGUSR1`, it is live.
+11. **Hot reload (certificate)**: rotate the server cert, `SIGUSR1`, new
+    handshakes present it; existing clients keep working.
+12. **Metrics**: Prometheus text on a separate port.
+13. **Graceful shutdown**: `SIGTERM` lets an in-flight request finish.
+
+### 0.2.0 exit criterion 8
+
+| Criterion | Scenario / check |
+| --- | --- |
+| SSE response streams for more than 60 s | Streaming: 66 events over 65 s through `upstream_timeout_secs = 30`, breaker still closed (`EDGE_DEMO_SSE_SECS` shortens it locally) |
+| 50 MiB upload accepted | Bodies: "50 MiB binary upload arrives whole" |
+| `Host` preserved | Identity: Host and `x-forwarded-host` are the client's |
+| Breaker obeys Admission, threshold 3 | Breaker admission: 502, 502, 502, 503; one probe after the cooldown closes it |
 
 ## Run it
 
@@ -105,7 +121,7 @@ edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/ordersX
 edge --path-as-is -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/orders/../inventory
 edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" -H 'Upgrade: websocket' -H 'Connection: Upgrade' $P/orders/ws
 
-# 5. bodies: 9 MiB is refused with 413
+# 5. bodies: 9 MiB passes (no size cap by default)
 head -c 9437184 /dev/zero | edge -o /dev/null -w '%{http_code}\n' -X POST --data-binary @- \
   -H "$AUTH" $P/orders/upload
 
@@ -116,8 +132,8 @@ seq 8 | xargs -P8 -I{} curl -sS --cacert $D/ca.crt --cert $D/client.crt --key $D
 #   5 200
 #   3 429      (typically; a token refills every 200 ms, so a slow run can show 6 x 200)
 
-# 7. circuit breaker: kill inventory, wait two health intervals -> 503
-kill $INVENTORY; sleep 2
+# 7. circuit breaker: kill inventory, wait three failed health probes -> 503
+kill $INVENTORY; sleep 4
 edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/inventory/x
 curl -s 127.0.0.1:9090/metrics | grep '^ferryman_circuit_state'   # ...} 1 = open
 target/debug/backend --name inventory --bind 127.0.0.1:9102 & INVENTORY=$!
@@ -152,7 +168,8 @@ Prometheus. From the repository root:
 cargo run -q -p ferryman-edge-demo --bin edge-demo -- setup
 
 # First build compiles both images in release mode: expect several minutes.
-docker compose -f examples/edge-demo/compose/docker-compose.yml up -d --build
+DEMO_UID=$(id -u) DEMO_GID=$(id -g) \
+  docker compose -f examples/edge-demo/compose/docker-compose.yml up -d --build
 
 TOKEN=$(cargo run -q -p ferryman-edge-demo --bin edge-demo -- token --sub acme)
 MTLS="--cacert examples/edge-demo/.demo/ca.crt --cert examples/edge-demo/.demo/client.crt --key examples/edge-demo/.demo/client.key"
@@ -188,7 +205,7 @@ material, routes and the JWT key.
 
 ## Adapting this to your project
 
-- **PKI**: replace the generated files with your own CA. `[tls] client_ca_path`
+- **PKI**: replace the generated files with your own CA. `[mtls] client_ca_path`
   is the CA that signs *client* certificates; `cert_path`/`key_path` is the
   server leaf your clients will verify (its SANs must match how they connect).
   Renew by replacing the files and sending `SIGUSR1`.
@@ -202,18 +219,6 @@ material, routes and the JWT key.
   re-authenticate. That is only safe when the proxy is the only thing that can
   reach them (private network, no published ports). If clients can reach a backend directly they can forge the
   header.
-- **Tuning**: `tenant_rps`, `health_interval_secs`, `default_cooldown_secs` and
+- **Tuning**: `[limits] tenant_rps`, `health_interval_secs`, `default_cooldown_secs` and
   per-route `cooldown_secs` are in the config; the full reference is in
   [docs/operations.md](https://github.com/Bunty9/ferryman-edge/blob/main/docs/operations.md).
-
-## Streaming mode
-
-By default the proxy buffers request bodies (fast for typical JSON). Build it
-with `--features ferryman-edge/boxed_body` for streaming forwarding; the demo
-passes unchanged:
-
-```bash
-examples/edge-demo/run.sh --features ferryman-edge/boxed_body
-```
-
-The trade-offs are in the [main README](https://github.com/Bunty9/ferryman-edge/blob/main/README.md).

@@ -1,7 +1,7 @@
 # ferryman-edge
 
 > Programmable mTLS L7 reverse proxy in Rust — extends [`ferryman`](../ferryman/)
-> (P2) with rustls 0.23 + aws-lc-rs mTLS termination, in-line RS256 JWT
+> (P2) with rustls 0.23 + ring mTLS termination, in-line RS256 JWT
 > validation with an LRU verification cache, per-tenant GCRA rate
 > limiting, and a SIGUSR1-driven hot-reload that flips cert chains and
 > routing tables without dropping live connections. Pingora-class chops at
@@ -41,14 +41,14 @@ Cloudflare Pingora team to reply.
                        |
                        v
               +--------+---------+
-              | RouteService     |
-              | (P2's table)     |
+              | ferryman-core    |  routing table, breaker,
+              | 0.3 RouteTable   |  health checks
               +--------+---------+
                        |
                        v
               +--------+---------+
               | hyper client     |  pool: 1 conn per upstream * N
-              | HTTP/2 multiplex |  feature flag: boxed_body vs collected
+              | HTTP/2 multiplex |
               +--------+---------+
                        |
                        v
@@ -61,13 +61,14 @@ Cloudflare Pingora team to reply.
 | --------------------- | --------------------------------------------------------- |
 | Async runtime         | `tokio` 1.47 (full)                                       |
 | HTTP server           | `hyper` 1.5 + `hyper-util`                                |
-| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26 |
+| TLS / mTLS            | `rustls` 0.23 (`ring` provider) + `tokio-rustls` 0.26 |
 | AuthN                 | `jsonwebtoken` 9 + `moka` 0.12 (`future` cache, 10k × 5min) |
 | Rate limit            | `governor` 0.7 (keyed GCRA)                               |
+| Routing / breaker     | `ferryman-core` 0.3 (prefix table, Admission-ticket breaker, health checks, core config) |
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |
 | Observability         | `tracing` + `metrics-exporter-prometheus` 0.16            |
 | CLI                   | `clap` 4                                                  |
-| Container build       | `cargo-chef` multi-stage; **distroless** final (NOT scratch — aws-lc-rs needs libc) |
+| Container build       | `cargo-chef` multi-stage; static musl binary in a `scratch` final image, running as `65532:65532` |
 | Deploy                | Fly.io 2-region (`sin` + `iad`)                           |
 | CI                    | GHA (stable + beta) + `cargo-deny` + `cargo-nextest` + criterion (non-blocking) + mTLS smoke |
 
@@ -77,9 +78,18 @@ Pinned versions live in [`Cargo.toml`](https://github.com/Bunty9/ferryman-edge/b
 
 ## Install
 
+Prebuilt binaries (static Linux musl x86_64/aarch64; macOS x86_64/aarch64,
+which link the system libSystem) are attached to every GitHub release with `SHA256SUMS` and build
+provenance (`gh attestation verify <file> --repo Bunty9/ferryman-edge`):
+
 ```bash
-cargo install ferryman-edge      # installs the `ferryman-edge-server` binary
+cargo binstall ferryman-edge     # or: cargo install ferryman-edge
+docker build -t ferryman-edge .  # static binary in scratch, runs as 65532
 ```
+
+All three give you the `ferryman-edge-server` binary. Verify a download
+with `sha256sum -c SHA256SUMS --ignore-missing` (or `shasum -a 256 -c` on
+macOS) and `gh attestation verify`.
 
 The reusable pieces (TLS reload, JWT verifier, rate limiter, routing +
 circuit breaker) are published separately as
@@ -128,18 +138,21 @@ Every request passes the same gates, in order:
 | --- | --- | --- |
 | TLS handshake, client cert must chain to `client_ca_path` (10 s by default; `tls_handshake_timeout_secs`) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
 | `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
-| Per-tenant GCRA limit keyed by `sub` (`tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
-| No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
+| Per-tenant GCRA limit keyed by `sub` (`[limits] tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
+| No `.` / `..` path segments (incl. `%2e`), and no ambiguous route: a path that an upstream reading `%2F` / `%5C` / `\` as `/` or dropping `;params` would send to a different route (`/api%2Fsecret` next to a `/` catch-all) | `400` bad path | `ferryman_requests_total{status}` |
+| One valid `Host` (or a request-target authority); HTTP/1.1 needs one | `400` bad host | `ferryman_requests_total{status}` |
 | Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
-| Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
-| Body ≤ 8 MiB (default; `max_request_body_bytes`) | `413` | |
-| Client body read within 30 s by default (collected mode; read before route lookup) | `408` slow client, `400` body error | |
-| Upstream round trip within 30 s by default, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
+| Longest-prefix route on a path-segment boundary, matched on a normalised path (`%XX` of unreserved characters decoded, `//` merged; the upstream still gets the raw path); no fall-through to a shorter prefix | `404` no route | |
+| Breaker admission (`Upstream::try_acquire`) | `503` circuit open | |
+| Body ≤ `max_request_body_bytes` if set (no cap by default; declared Content-Length checked before routing, chunked bodies mid-stream) | `413` | |
+| Upload: ≤ 30 s between body frames, ≤ 300 s total (`request_body_idle_timeout_secs` / `request_body_timeout_secs`) | `408` slow client, `400` body error | |
+| Upstream response head within 30 s of the end of the upload (`upstream_timeout_secs`); the response body then streams with no deadline | `502` transport error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
 
 On the way through, the proxy strips hop-by-hop headers (both directions,
 including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
-(any client-supplied value is dropped first). It rewrites `Host` to the
-upstream, replaces `x-forwarded-for` with the peer IP (dropping client-sent
+(any client-supplied value is dropped first). It keeps the client's `Host` (h2 `:authority` included) and sets
+`x-forwarded-host` to it, dropping any client-sent value (per-route
+`rewrite_host = true` sends the upstream authority instead), replaces `x-forwarded-for` with the peer IP (dropping client-sent
 `Forwarded` / `X-Real-IP`), sets `x-forwarded-proto: https`, and downgrades
 the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
 (`h2` or `http/1.1`). A connection with no request within 10 s (default;
@@ -147,29 +160,48 @@ the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
 handshake is closed (this also covers a stalled h2 preface); h2 connections
 then get keep-alive pings and a 64-stream cap.
 
-Each upstream has a Closed / Open / HalfOpen circuit breaker
+Each upstream `host:port` has one Closed / Open / HalfOpen circuit breaker
+from ferryman-core 0.3, shared by every route that uses it
 (`ferryman_circuit_state{upstream}`: 0/1/2; `cooldown_secs` must be ≥ 1).
-A transport error, a 502–504, or a timeout opens it — under `boxed_body` a
-timeout only counts if the client had finished uploading; after `cooldown_secs` exactly one request is let through
-as the probe. A plain `500` does not trip it, and neither does a failure
-caused by the client's own body (size cap, disconnect). The active health
-checker (`GET <upstream>/health` every `health_interval_secs`; per-route
-`health_path` / `health_disabled` change or skip the probe) opens and
-closes it too. A route reload keeps breaker state for rules whose prefix,
-upstream, cooldown, and health settings (`health_path` / `health_disabled`,
-compared by effective value) are unchanged.
+It opens after `failure_threshold` (default 3) consecutive upstream
+failures: transport errors, 502–504, timeouts. After `cooldown_secs`
+exactly one request is let through as the probe; its result decides, and a
+late result of an ordinary request can no longer close an open circuit. A
+response that has started streaming never counts against the breaker however
+long it lasts; only an error from the upstream body does: edge counts an
+upstream response-body error after the head against the breaker, ferryman
+never does (a deliberate difference). A plain `500`
+does not count, and neither does a failure caused by the client's own body
+(size cap, disconnect, stall), even if the upstream had already answered.
+A request that ends without a verdict on the upstream (client body error,
+hang-up, h2 stream reset) hands its admission back: an abandoned half-open
+probe is re-armed at once, at most once per cooldown. An upstream that hangs
+up after the client stalled its upload, or paused reading the response, for
+at least θ = max(100 ms, min(1 s, `request_body_idle_timeout_secs` / 2)) is
+not blamed either, nor is a forwarded 502–504 (a gateway whose backend gave
+up on the stalled upload); an upload stall counts if it
+happened at any point of the request, as in ferryman. An upstream that
+fails while the client sends or reads without such a pause generally is
+blamed. Known limits, where the upstream is blamed for what the client did: its own read or write timeout is under θ;
+or it has a total request or response deadline (e.g. Go `http.Server`
+`ReadTimeout` / `WriteTimeout`) that a slow but steady client exceeds, since
+every gap is under θ and the stall exemption does not apply. The active
+health checker (`GET <upstream>/health` every `health_interval_secs`, all
+upstreams concurrently; per-route `health_path` / `health_disabled` change
+or skip the probe) opens and closes it too: any status below 500 counts as
+up. A route reload keeps breaker state per upstream `host:port`, so an open
+circuit stays open even when its routes change.
 
 SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
 25 s by default (`shutdown_drain_secs`). SIGUSR1 reloads TLS material, the
 routing table (including per-route `health_path` / `health_disabled`) and
 the JWT public key (read from the boot-time path; the token cache is
-cleared). `[limits]`, `issuer` /
-`audience`, `tenant_rps` and `health_interval_secs` are read once at boot.
+cleared). `[limits]`, `issuer` / `audience`,
+`health_interval_secs` and `keepalive_timeout_secs` are read once at boot.
 
-Route prefixes match the raw, undecoded request path and are not access
-control: every route shares the same mTLS + JWT + rate-limit policy, so do
-not rely on prefixes to separate privileges. Normalised matching is planned
-before any per-route policy.
+Every route shares one mTLS + JWT + rate-limit policy; prefixes are
+routing, not access control. Matching is case-sensitive, so an upstream that
+folds case (`/API/x`) can still see a path the proxy routed elsewhere.
 
 Set `[jwt] issuer` and `audience` for anything beyond local dev — without
 them, any token signed by the issuer key is accepted, whichever service it
@@ -179,26 +211,16 @@ was minted for.
 
 P4 makes three decisions worth defending in a hiring loop.
 
-### (a) `boxed_body` is off by default
+### (a) Bodies always stream
 
-Cargo feature `boxed_body` swaps the upstream client to
-`http_body_util::BoxBody` and streams request and response bodies. With it
-off, the proxy collects each body once into a `Full<Bytes>` before
-forwarding. Both builds enforce the request body cap (8 MiB by default, configurable via `[limits]`); under streaming, a
-chunked upload with no `Content-Length` that exceeds it is cut mid-stream
-and answered `413`, without counting against the upstream's breaker.
-Streaming mode has no separate body-read deadline: a slow upload runs
-inside the upstream budget (`upstream_timeout_secs`, default 30 s) and ends as `504`.
-
-Estimates from the design spec (not yet measured here): `boxed` adds ~200 µs per request at 10 MB; `collected`
-adds ~80 µs at 1 KB but allocates ~`req_size`. For an internal proxy
-fronting JSON APIs under ~256 KB the collected path wins on code
-complexity, allocator pressure (because the JSON allocator already paid
-the cost), and steady-state latency. Pingora picks streaming for
-general-purpose CDN traffic where payloads skew big and bimodal; that
-calculus inverts for an internal API edge. Flip the feature on (`cargo
-build --features boxed_body`) when your p99 latency tells you the
-collect-first cost dominates.
+Requests and responses stream frame by frame; nothing is buffered. An
+SSE or LLM response, a large download and a 50 MiB upload all pass with
+constant memory. The breaker judges an upstream on its response head (and
+on a body error after it): the deadline runs from the end of the upload to
+the head, so a long stream is never cut and never opens the circuit. 0.1.x buffered by
+default (the `boxed_body` feature streamed); buffering cut every stream
+at 30 s and opened the breaker for all tenants on a slow body, so it is
+gone.
 
 ### (b) SIGUSR1 reload over filesystem-watch
 
@@ -221,20 +243,17 @@ Both cert reload (`tls::ReloadingTls`) and route reload
 (`server/src/reload.rs`) share the same signal — one trigger swaps both
 surfaces atomically from the operator's perspective.
 
-### (c) rustls + aws-lc-rs over OpenSSL
+### (c) rustls + ring over OpenSSL and aws-lc-rs
 
-* **Pure-Rust audit story.** rustls is the only TLS stack with a clean
-  memory-safety argument all the way to the cipher implementations
-  (`aws-lc-rs` is the AWS-libcrypto Rust binding; ring is the historical
-  alternative). For an edge proxy that terminates customer-data TLS, that
-  argument matters more than the C/Go ecosystem's parity.
-* **FIPS path.** `aws-lc-rs` has a FIPS-mode build via the same crate.
-  No swap-out at deploy time, no separate provider — flip a feature flag
-  and recompile. OpenSSL FIPS 3.0 modules ship, but the build process is
-  brittle and OS-distribution-specific.
-* **Cost.** Distroless final image instead of scratch (`aws-lc-rs` needs
-  libc + dynamic loader). ~12 MB extra over a musl/scratch build. Worth
-  it for the audit + FIPS leverage.
+* **Pure-Rust audit story.** rustls with ring keeps the TLS stack in
+  Rust plus ring's small, audited assembly.
+* **Static builds.** ring builds for musl with only `musl-gcc`, which
+  gives the static release binaries and the `scratch` image. aws-lc-rs
+  needs a C toolchain (and CMake on some targets) per target and would
+  keep the image on glibc/distroless.
+* **Cost.** No FIPS build and no post-quantum `X25519MLKEM768` key
+  exchange by default (rustls offers it only with aws-lc-rs). An opt-in
+  `tls-aws-lc` feature may be added on request.
 
 ## Benchmarks
 
@@ -278,7 +297,7 @@ ferryman-edge/
   benches/
     wrk2.lua                       # throughput script (non-mTLS listeners only)
     reload.sh                      # zero-loss reload check (curl workers + kill -USR1)
-  Dockerfile                       # cargo-chef multi-stage, distroless final
+  Dockerfile                       # cargo-chef multi-stage, static musl in scratch
   fly.toml                         # Fly.io 2-region (sin + iad)
   deny.toml                        # cargo-deny config
   rust-toolchain.toml              # stable channel
@@ -299,7 +318,7 @@ ferryman-edge/
 ## Roadmap
 
 Phase 1 (scaffold) and Phase 2 (mTLS + JWT + rate limit on the real
-request path, circuit breaker, streaming `boxed_body`, e2e tests) are
+request path, circuit breaker, streaming bodies, e2e tests) are
 done. Open: mTLS-capable throughput numbers against the 50k rps / p99
 targets, and the Fly.io 2-region deploy. See [`PROGRESS.md`](./PROGRESS.md).
 

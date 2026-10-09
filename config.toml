@@ -1,28 +1,29 @@
-# ferryman-edge routing config. Hot-reloaded on SIGUSR1.
+# ferryman-edge config. Hot-reloaded on SIGUSR1 (routes, top-level timeouts,
+# TLS material and the JWT key); [limits], [jwt] issuer/audience,
+# health_interval_secs and keepalive_timeout_secs are boot-only.
 #
 # mTLS terminate -> JWT verify (RS256, moka-cached) -> per-tenant rate limit
-# (governor, keyed by Claims.sub) -> prefix-longest-match routing with the
-# P2 circuit breaker. Reload TLS, routes and the JWT key with:
+# (governor, keyed by Claims.sub) -> prefix-longest-match routing with a
+# per-upstream circuit breaker. Reload with:
 #   kill -USR1 $(pidof ferryman-edge-server)
 
 health_interval_secs = 5
 default_cooldown_secs = 30
+# Commented values are the defaults (1..=86400 seconds).
+# upstream_timeout_secs          = 30   # end of upload -> response head
+# keepalive_timeout_secs         = 10   # HTTP/1 idle keep-alive
+# request_body_idle_timeout_secs = 30   # longest gap between body frames
+# request_body_timeout_secs      = 300  # whole upload
 
-# Per-tenant requests/sec cap, keyed by JWT `sub` claim.
-tenant_rps = 1000
-
-# Boot-only limits (a change needs a restart; SIGUSR1 does not reload them).
-# Commented values are the defaults. Durations are 1..=86400 seconds.
-# [limits]
-# max_request_body_bytes     = 8388608   # 1..=1 GiB
-# request_body_timeout_secs  = 30
-# upstream_timeout_secs      = 30
+[limits]
+tenant_rps = 1000                       # per JWT `sub`; 0 disables
+# max_request_body_bytes     = 8388608  # optional cap; unset = no cap
 # tls_handshake_timeout_secs = 10
-# first_request_timeout_secs = 10        # also the HTTP/1 header-read timeout
+# first_request_timeout_secs = 10
 # h2_max_concurrent_streams  = 64
 # shutdown_drain_secs        = 25
 
-[tls]
+[mtls]
 cert_path      = "certs/server.crt"
 key_path       = "certs/server.key"
 client_ca_path = "certs/ca-bundle.crt"

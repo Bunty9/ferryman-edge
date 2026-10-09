@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What the sample backend saw (see `backend.rs`).
 #[derive(Deserialize)]
@@ -24,6 +24,7 @@ struct Echo {
     path: String,
     tenant: Option<String>,
     host: Option<String>,
+    forwarded_host: Option<String>,
     forwarded_for: Option<String>,
     forwarded_proto: Option<String>,
     body_bytes: usize,
@@ -88,9 +89,9 @@ impl Demo {
     async fn start(dir: PathBuf) -> anyhow::Result<Demo> {
         let pki = Pki::generate(&dir)?;
 
-        // Distinct free ports: proxy, metrics and three backends.
+        // Distinct free ports: proxy, metrics and four backends.
         let mut ports = Vec::new();
-        while ports.len() < 5 {
+        while ports.len() < 6 {
             let p = free_port()?;
             if !ports.contains(&p) {
                 ports.push(p);
@@ -101,6 +102,7 @@ impl Demo {
             ("orders", ports[2]),
             ("inventory", ports[3]),
             ("payments", ports[4]),
+            ("ledger", ports[5]),
         ]
         .into();
 
@@ -114,10 +116,12 @@ impl Demo {
             routes: vec![
                 ("/orders".into(), backend_addrs["orders"], None),
                 ("/inventory".into(), backend_addrs["inventory"], Some(2)),
+                ("/ledger".into(), backend_addrs["ledger"], Some(2)),
             ],
             tenant_rps: 5,
             health_interval_secs: 1,
             default_cooldown_secs: 2,
+            unprobed: vec!["/ledger".into()],
         };
         let config = dir.join("ferryman.toml");
         proxy_config::write(&pki, &topo, &config)?;
@@ -248,8 +252,10 @@ async fn all_scenarios(d: &mut Demo) -> anyhow::Result<()> {
     identity(d).await?;
     routing(d).await?;
     bodies(d).await?;
+    streaming(d).await?;
     rate_limit(d).await?;
     circuit_breaker(d).await?;
+    breaker_threshold(d).await?;
     reload_routes(d).await?;
     reload_cert(d).await?;
     metrics(d).await?;
@@ -440,7 +446,6 @@ async fn jwt(d: &mut Demo) -> anyhow::Result<()> {
 async fn identity(d: &mut Demo) -> anyhow::Result<()> {
     d.scenario("Identity propagation: the backend sees the proxy's view, not the client's");
     let sub = "acme-corp";
-    let orders = d.backend_addrs["orders"].to_string();
 
     // h2: the client lies about who it is and where it came from.
     let resp = d
@@ -450,6 +455,7 @@ async fn identity(d: &mut Demo) -> anyhow::Result<()> {
         .bearer_auth(d.edge.token(sub)?)
         .header("x-ferryman-tenant", "admin")
         .header("x-forwarded-for", "6.6.6.6")
+        .header("x-forwarded-host", "evil.example")
         .send()
         .await?;
     let e: Echo = resp.json().await?;
@@ -458,10 +464,16 @@ async fn identity(d: &mut Demo) -> anyhow::Result<()> {
         e.tenant.as_deref() == Some(sub),
         format!("{:?}", e.tenant),
     );
+    let client_host = d.edge.addr.to_string();
     d.check(
-        "Host is the upstream authority from config",
-        e.host.as_deref() == Some(&orders),
+        "Host is the one the client used (h2 :authority), not the upstream's",
+        e.host.as_deref() == Some(&client_host),
         format!("{:?}", e.host),
+    );
+    d.check(
+        "x-forwarded-host carries the same host",
+        e.forwarded_host.as_deref() == Some(&client_host), // not the forged one
+        format!("{:?}", e.forwarded_host),
     );
     d.check(
         "x-forwarded-for is the peer IP, not the client's claim",
@@ -543,7 +555,7 @@ async fn routing(d: &mut Demo) -> anyhow::Result<()> {
 // 5 ---------------------------------------------------------------------
 
 async fn bodies(d: &mut Demo) -> anyhow::Result<()> {
-    d.scenario("Bodies: forwarded intact up to 8 MiB, refused beyond");
+    d.scenario("Bodies: streamed both ways, no size cap by default");
     let sub = "tenant-bodies";
     let edge = d.edge.clone();
     let token = edge.token(sub)?;
@@ -569,6 +581,8 @@ async fn bodies(d: &mut Demo) -> anyhow::Result<()> {
     for (name, len, json) in [
         ("64 KiB JSON", 64 << 10, true),
         ("6 MiB binary", 6 << 20, false),
+        ("9 MiB binary", 9 << 20, false),
+        ("50 MiB binary", 50 << 20, false),
     ] {
         let resp = post(len, json).await?;
         let status = resp.status().as_u16();
@@ -579,8 +593,6 @@ async fn bodies(d: &mut Demo) -> anyhow::Result<()> {
             format!("{status}, backend counted {}", e.body_bytes),
         );
     }
-    let status = post(9 << 20, false).await?.status().as_u16();
-    d.check_status("9 MiB upload is refused before routing", status, 413);
     Ok(())
 }
 
@@ -721,6 +733,92 @@ async fn circuit_breaker(d: &mut Demo) -> anyhow::Result<()> {
         r.is_ok(),
         format!("{r:?}"),
     );
+    Ok(())
+}
+
+// exit criterion 8 -------------------------------------------------------
+
+async fn streaming(d: &mut Demo) -> anyhow::Result<()> {
+    let secs: u64 = std::env::var("EDGE_DEMO_SSE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65);
+    d.scenario(&format!(
+        "Streaming: a {secs} s SSE response outlives upstream_timeout_secs (30 s) and leaves the breaker closed"
+    ));
+    let started = Instant::now();
+    let mut resp = d
+        .edge
+        .client
+        .get(d.edge.url(&format!("/orders/events/sse?secs={secs}")))
+        .bearer_auth(d.edge.token("tenant-sse")?)
+        // The client's default 30 s timeout covers the whole body.
+        .timeout(Duration::from_secs(secs + 30))
+        .send()
+        .await?;
+    let status = resp.status().as_u16();
+    let mut text = String::new();
+    while let Some(chunk) = resp.chunk().await? {
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    let ticks = text.matches("data: tick").count() as u64;
+    d.check(
+        &format!("all {} events arrive", secs + 1),
+        status == 200 && ticks == secs + 1,
+        format!("{status}, {ticks} events"),
+    );
+    d.check(
+        "the stream stayed open the whole time",
+        started.elapsed() >= Duration::from_secs(secs),
+        format!("{:?}", started.elapsed()),
+    );
+    let s = d
+        .edge
+        .status("/orders/after-sse", "tenant-sse-after")
+        .await?;
+    d.check_status("orders is still routable", s, 200);
+    let g = gauge(
+        &d.metrics_text().await?,
+        "ferryman_circuit_state",
+        d.backend_addrs["orders"],
+    );
+    d.check(
+        "orders' breaker is still closed",
+        g == Some(0.0),
+        format!("{g:?}"),
+    );
+    Ok(())
+}
+
+async fn breaker_threshold(d: &mut Demo) -> anyhow::Result<()> {
+    d.scenario(
+        "Breaker admission: opens on the 3rd consecutive failure, one probe after the cooldown",
+    );
+    let addr = d.backend_addrs["ledger"];
+    d.backends
+        .get_mut("ledger")
+        .context("ledger backend")?
+        .kill();
+    let mut got = Vec::new();
+    for i in 0..4 {
+        got.push(
+            d.edge
+                .status("/ledger/x", &format!("tenant-threshold-{i}"))
+                .await?,
+        );
+    }
+    d.check(
+        "502, 502, 502, then 503",
+        got == [502, 502, 502, 503],
+        format!("{got:?}"),
+    );
+    d.backends
+        .insert("ledger", spawn_backend("ledger", addr, &d.dir).await?);
+    tokio::time::sleep(Duration::from_millis(2100)).await; // cooldown_secs = 2
+    let s = d.edge.status("/ledger/x", "tenant-threshold-probe").await?;
+    d.check_status("after the cooldown the single probe succeeds", s, 200);
+    let s = d.edge.status("/ledger/x", "tenant-threshold-after").await?;
+    d.check_status("and the circuit is closed again", s, 200);
     Ok(())
 }
 

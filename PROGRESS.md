@@ -15,8 +15,8 @@
 - [x] `crates/core/src/route.rs` — `Upstream`, `RouteTable`, `SharedTable`
       (verbatim from P2).
 - [x] `crates/core/src/health.rs` — `health_loop` (verbatim from P2).
-- [x] `crates/core/src/config.rs` — extended `ConfigToml` with `TlsToml`,
-      `JwtToml`, `tenant_rps`.
+- [x] `crates/core/src/config.rs` — `EdgeConfig` (0.2.0): `[mtls]` (alias `[tls]`),
+      `[jwt]`, `[limits] tenant_rps` over the core-shaped `ConfigToml`.
 - [x] `crates/core/src/tls.rs` — `build_mtls_config` + `ReloadingTls`
       (SIGUSR1 reload).
 - [x] `crates/core/src/jwt.rs` — `Claims`, `JwtVerifier` with moka LRU.
@@ -115,7 +115,7 @@
 ## Examples
 
 - [x] `examples/edge-demo`: `edge-demo run` checks every feature
-      against the real binary (56 checks, ~4 s; CI runs both body modes).
+      against the real binary (65 checks, ~73 s, mostly the 65 s SSE stream; one body mode).
       Manual walkthrough and docker-compose topology (proxy + 3 backends +
       Prometheus) verified by hand 2026-09-30.
 - [x] `examples/embed-core`: ferryman-edge-core in an axum service, 8 tests.

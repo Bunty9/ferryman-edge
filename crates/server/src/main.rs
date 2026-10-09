@@ -5,13 +5,10 @@
 //! rate-limiter GC), then hand off to `ferryman_edge::serve_with` for the
 //! accept loop and per-request pipeline.
 
-use arc_swap::ArcSwap;
 use clap::Parser;
 use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
-use ferryman_edge_core::{
-    build_limiter, build_table_ext, health_loop, parse_config, spawn_gc, JwtVerifier, Limiter,
-    ReloadingTls, SharedTable,
-};
+use ferryman_edge_core::ferryman_core::{build_table, health_loop};
+use ferryman_edge_core::{build_limiter, spawn_gc, EdgeConfig, JwtVerifier, Limiter, ReloadingTls};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -27,7 +24,11 @@ use tracing_subscriber::EnvFilter;
 const LIMITER_GC_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
-#[command(name = "ferryman-edge-server", about = "programmable mTLS L7 proxy")]
+#[command(
+    name = "ferryman-edge-server",
+    version,
+    about = "programmable mTLS L7 proxy"
+)]
 struct Args {
     /// Path to the TOML config (TLS paths, JWKS path, routes, rps cap).
     #[arg(long, env = "FERRYMAN_EDGE_CONFIG", default_value = "config.toml")]
@@ -48,14 +49,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Install the aws-lc-rs default crypto provider for rustls before any
-    // ServerConfig is built. Both the aws-lc-rs and ring provider features of
-    // rustls are enabled in this build (ring via reqwest's rustls-tls in
-    // ferryman-edge-core), so rustls cannot pick a process default on its
-    // own; install it explicitly.
-    rustls::crypto::aws_lc_rs::default_provider()
+    // ring is the only rustls provider compiled in (deny.toml bans aws-lc),
+    // so rustls could pick it on its own; installing it explicitly keeps the
+    // choice visible and fails loudly if a second provider ever sneaks in.
+    rustls::crypto::ring::default_provider()
         .install_default()
-        .map_err(|_| anyhow::anyhow!("failed to install aws-lc-rs crypto provider"))?;
+        .map_err(|_| anyhow::anyhow!("failed to install the ring crypto provider"))?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -66,20 +65,31 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Prometheus exporter binds its own listener so the proxy is unaffected
+    // by /metrics scrape traffic. Installed first: ferryman-core writes the
+    // breaker gauges as soon as a table exists.
+    PrometheusBuilder::new()
+        .with_http_listener(args.metrics_bind)
+        .install()?;
+    tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
+
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let raw = std::fs::read_to_string(&args.config)?;
-    let (cfg, ext) = parse_config(&raw)?;
-    let interval = Duration::from_secs(cfg.health_interval_secs);
+    let cfg = EdgeConfig::parse(&raw)?;
+    for d in &cfg.deprecations {
+        tracing::warn!(config = %args.config.display(), "{d}");
+    }
+    let interval = Duration::from_secs(cfg.core.health_interval_secs);
 
     // Routing table (atomic hot-swap).
-    let table = build_table_ext(&cfg, &ext)?;
-    let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
+    let shared = reload::new_shared(build_table(cfg.core.clone(), None)?);
+    shared.load().publish_gauges();
 
     // mTLS material + reloading wrapper. SIGUSR1 swaps cert/key/ca atomically.
     let tls = ReloadingTls::new(
-        &cfg.tls.cert_path,
-        &cfg.tls.key_path,
-        &cfg.tls.client_ca_path,
+        &cfg.mtls.cert_path,
+        &cfg.mtls.key_path,
+        &cfg.mtls.client_ca_path,
     )?;
 
     // JWT verifier: RSA pub key read at boot and re-read from the same path
@@ -98,17 +108,10 @@ async fn main() -> anyhow::Result<()> {
     // Per-tenant rate limiter, keyed by `Claims::sub`. `None` when
     // `tenant_rps == 0` — rate limiting is disabled outright rather than
     // silently clamped to 1 rps.
-    let limiter: Option<Arc<Limiter>> = build_limiter(cfg.tenant_rps);
+    let limiter: Option<Arc<Limiter>> = build_limiter(cfg.limits.tenant_rps);
     if let Some(l) = &limiter {
         spawn_gc(l.clone(), LIMITER_GC_INTERVAL);
     }
-
-    // Prometheus exporter binds its own listener so the proxy is unaffected
-    // by /metrics scrape traffic.
-    PrometheusBuilder::new()
-        .with_http_listener(args.metrics_bind)
-        .install()?;
-    tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
 
     // Background tasks: active health checker + SIGUSR1-driven route reload.
     tokio::spawn(health_loop(shared.clone(), interval));
@@ -130,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, "ferryman-edge-server listening (mTLS)");
 
-    serve_with(listener, state, ext.limits.clone(), shutdown_signal()).await;
+    serve_with(listener, state, cfg.limits.clone(), shutdown_signal()).await;
     Ok(())
 }
 

@@ -12,6 +12,12 @@ ignore = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# One TLS provider across the tree: ring. aws-lc-rs needs a C toolchain per
+# target and kept the image on glibc/distroless (ROADMAP A2/E7).
+deny = [
+    { crate = "aws-lc-rs", reason = "ring is the only TLS provider" },
+    { crate = "aws-lc-sys", reason = "ring is the only TLS provider" },
+]
 
 [licenses]
 version = 2
@@ -26,12 +32,12 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
-    # webpki-roots (Mozilla CA bundle data), pulled in by reqwest rustls-tls (core health
-    # probes, dev-deps, examples) and metrics-exporter-prometheus (server).
-    "CDLA-Permissive-2.0",
 ]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Temporary: ferryman-core comes from a git rev until 0.3.0 is on
+# crates.io; remove this when the dependency switches to the registry.
+allow-git = ["https://github.com/Bunty9/ferryman"]

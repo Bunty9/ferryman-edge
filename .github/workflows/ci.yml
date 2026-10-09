@@ -32,12 +32,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo clippy (boxed_body)
-        run: cargo clippy --workspace --all-targets --features ferryman-edge/boxed_body -- -D warnings
       - name: cargo nextest
         run: cargo nextest run --workspace --no-fail-fast
-      - name: cargo nextest (boxed_body)
-        run: cargo nextest run --workspace --no-fail-fast --features ferryman-edge/boxed_body
 
   # nextest does not run doctests.
   doctest:
@@ -111,87 +107,96 @@ jobs:
         run: cargo bench --workspace --no-run
 
   examples:
-    name: edge-demo walkthrough (${{ matrix.body }})
+    name: edge-demo walkthrough
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - body: collected
-            features: ""
-          - body: boxed_body
-            features: "--features ferryman-edge/boxed_body"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build proxy + demo
-        run: cargo build -p ferryman-edge -p ferryman-edge-demo ${{ matrix.features }}
+        run: cargo build -p ferryman-edge -p ferryman-edge-demo
       - name: Run every feature end to end
         run: target/debug/edge-demo run
       - name: Upload demo logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: edge-demo-logs-${{ matrix.body }}
+          name: edge-demo-logs
           path: examples/edge-demo/.demo/run/*.log
 
-  mtls-smoke:
-    name: mTLS smoke (curl --cacert --cert --key)
+  # The release matrix (release.yml `binaries`, incl. the x86_64 musl smoke
+  # that replaced the old mtls-smoke job), exercised on every PR and
+  # push to main so a broken target is found before a tag. Builds and smoke
+  # tests only: no attestation, no publishing, no secrets.
+  binaries:
+    name: binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    env:
+      TARGET: ${{ matrix.target }}
+      # cc-rs would look for aarch64-linux-musl-gcc when the host is gnu;
+      # musl-tools only ships musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl-tools, openssl, curl
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools openssl curl python3
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-auditable
+      - name: Build
+        run: cargo auditable build --locked --release -p ferryman-edge --target "$TARGET"
+      - name: Smoke-test the binary
+        if: contains(matrix.target, 'linux-musl')
+        run: bash scripts/smoke.sh "target/$TARGET/release/ferryman-edge-server"
+
+  image:
+    name: container image (scratch, non-root)
     runs-on: ubuntu-latest
     needs: test
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install openssl + curl
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Build
+        run: docker build -t ferryman-edge:ci .
+      - name: Runs as 65532 and the static binary starts in scratch
+        run: |
+          set -euo pipefail
+          user=$(docker inspect -f '{{.Config.User}}' ferryman-edge:ci)
+          [ "$user" = "65532:65532" ] || { echo "image user is '$user', want 65532:65532"; exit 1; }
+          docker run --rm ferryman-edge:ci --version
+      - name: Install openssl, curl, python3 for the smoke
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssl curl python3
-      - name: Generate test cert chain
-        run: bash scripts/gen-test-certs.sh
-      - name: Build server
-        run: cargo build --release -p ferryman-edge
-      - name: Boot upstream + server in background
-        run: |
-          mkdir -p /tmp/up/svc-a
-          echo ok > /tmp/up/health
-          echo hello > /tmp/up/svc-a/hello
-          (cd /tmp/up && python3 -m http.server 8001 --bind 127.0.0.1 > /tmp/upstream.log 2>&1 &)
-          ./target/release/ferryman-edge-server --config config.toml \
-              --bind 127.0.0.1:8443 --metrics-bind 127.0.0.1:9090 > /tmp/server.log 2>&1 &
-          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
-          up=0
-          for _ in $(seq 1 20); do
-            if (echo > /dev/tcp/127.0.0.1/8443) 2>/dev/null; then up=1; break; fi
-            sleep 0.5
-          done
-          [ "$up" = 1 ] || { echo "server did not start"; cat /tmp/server.log; exit 1; }
-          # First health tick may race the upstream boot and open the
-          # breaker; wait one interval (health_interval_secs = 5).
-          sleep 6
-      - name: mTLS + JWT smoke
-        run: |
-          set -euo pipefail
-          C="--cacert certs/ca.crt --cert certs/client.crt --key certs/client.key"
-          TOKEN=$(bash scripts/mint-jwt.sh smoke-tenant 300)
-          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || true; }
-          check() { [ "$1" = "$2" ] || { echo "FAIL $3: got $1 want $2"; exit 1; }; echo "ok $3 ($1)"; }
-          check "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" 200 "valid cert + JWT (h2)"
-          check "$(code --http1.1 $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" 200 "valid cert + JWT (h1.1)"
-          check "$(code $C https://localhost:8443/svc-a/hello)" 401 "missing JWT"
-          check "$(code $C -H 'Authorization: Bearer nope' https://localhost:8443/svc-a/hello)" 401 "bad JWT"
-          check "$(code --cacert certs/ca.crt https://localhost:8443/svc-a/hello)" 000 "no client cert"
-          check "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/nope)" 404 "unknown route"
-          metrics=$(curl -sf 127.0.0.1:9090/metrics)
-          grep -q ferryman_requests_total <<<"$metrics"
-          kill -USR1 "$SERVER_PID"; sleep 1
-          check "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" 200 "after SIGUSR1 reload"
-      - name: Server logs
-        if: failure()
-        run: cat /tmp/server.log /tmp/upstream.log || true
-      - name: Tear down
-        if: always()
-        run: kill "$SERVER_PID" || true
+      - name: mTLS + JWT smoke through the container (read-only, uid 65532)
+        run: SMOKE_IMAGE=ferryman-edge:ci bash scripts/smoke.sh
