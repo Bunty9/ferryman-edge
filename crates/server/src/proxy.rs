@@ -124,18 +124,23 @@ const SET_BY_PROXY: &[&str] = &[
 /// Strip non-canonical spellings of proxy-asserted headers from a client
 /// request, whoever the peer is: only the canonical name, set by the proxy,
 /// may reach the upstream. A name is a spelling of a listed header when it
-/// differs from it but matches once every non-alphanumeric byte is read as
-/// `-`. Header names are already lowercase. Idempotent, and never touches a
+/// differs from it but matches once normalised: every non-alphanumeric byte
+/// becomes `-`, runs of `-` collapse, and leading and trailing `-` go.
+/// Header names are already lowercase. Idempotent, and never touches a
 /// canonical name.
 pub(crate) fn strip_noncanonical_asserted(headers: &mut HeaderMap) {
     let spelled = |n: &str| {
-        PROXY_ASSERTED_HEADERS.iter().any(|h| {
-            *h != n
-                && h.len() == n.len()
-                && h.bytes()
-                    .zip(n.bytes())
-                    .all(|(a, b)| a == if b.is_ascii_alphanumeric() { b } else { b'-' })
-        })
+        if PROXY_ASSERTED_HEADERS.contains(&n) {
+            return false;
+        }
+        let mut norm = String::with_capacity(n.len());
+        for b in n.bytes() {
+            let b = if b.is_ascii_alphanumeric() { b } else { b'-' };
+            if b != b'-' || !(norm.is_empty() || norm.ends_with('-')) {
+                norm.push(b as char);
+            }
+        }
+        PROXY_ASSERTED_HEADERS.contains(&norm.trim_end_matches('-'))
     };
     let drop: Vec<http::HeaderName> = headers
         .keys()
@@ -1069,6 +1074,17 @@ mod tests {
                     );
                 }
             }
+        }
+        for alt in [
+            "x__forwarded_for",
+            "x._forwarded-for",
+            "-x-ferryman-tenant",
+            "x-forwarded-for-",
+        ] {
+            m.insert(
+                http::HeaderName::from_bytes(alt.as_bytes()).unwrap(),
+                HeaderValue::from_static("drop"),
+            );
         }
         m.insert("x_custom", HeaderValue::from_static("keep"));
         m.insert("x-forwarded_for_x", HeaderValue::from_static("keep"));

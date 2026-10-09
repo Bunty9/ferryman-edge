@@ -164,11 +164,11 @@ stalled uploads (408), a client hanging up or resetting its h2 stream, and an
 upstream failure (transport error, body error or forwarded 502–504) after
 the client stalled its upload (at any point of the request) or its response
 reads for at least θ = max(100 ms, min(1 s,
-`request_body_idle_timeout_secs` / 2)). When such an outcome ends the request before the response
-head, the request hands its admission back: if it was the half-open probe,
-the next request probes (at most once per cooldown). A body error after the
-head has no admission left to return; it simply does not count. Known limits, where the upstream
-is still blamed: its own read or write timeout is under θ, or it enforces a
+`request_body_idle_timeout_secs` / 2)). When such an outcome ends the
+request before the response head, the request hands its admission back: if
+it was the half-open probe, the next request probes (at most once per
+cooldown). A body error after the head has no admission left to return; it
+simply does not count. Known limits, where the upstream is still blamed: its own read or write timeout is under θ, or it enforces a
 total request or response deadline that a slow but steady client exceeds.
 
 ## Troubleshooting

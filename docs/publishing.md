@@ -59,9 +59,8 @@ Starting with 0.1.1, releases are published by CI, not from a laptop. Pushing a
 1. **verify** (`contents: read`): the tag must point at a commit on `main`
    and equal the workspace version, and `CHANGELOG.md` must have a
    non-empty section for that version (its text becomes the release
-   notes). Tests run in both body modes, then
-   `cargo package -p ferryman-edge-core -p ferryman-edge --locked` packages
-   and builds both crates in isolation. The two `.crate` files and the
+   notes). `cargo package -p ferryman-edge-core -p ferryman-edge --locked`
+   packages and builds both crates in isolation. The two `.crate` files and the
    release notes are uploaded as artifacts.
 2. **binaries** (`contents: read`, no OIDC; one job per target): builds
    `cargo auditable build --release --locked` for

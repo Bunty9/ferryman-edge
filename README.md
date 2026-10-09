@@ -182,8 +182,7 @@ not blamed either, nor is a forwarded 502–504 (a gateway whose backend gave
 up on the stalled upload); an upload stall counts if it
 happened at any point of the request, as in ferryman. An upstream that
 fails while the client sends or reads without such a pause generally is
-blamed. Known limits, where the upstream is
-blamed for what the client did: its own read or write timeout is under θ;
+blamed. Known limits, where the upstream is blamed for what the client did: its own read or write timeout is under θ;
 or it has a total request or response deadline (e.g. Go `http.Server`
 `ReadTimeout` / `WriteTimeout`) that a slow but steady client exceeds, since
 every gap is under θ and the stall exemption does not apply. The active
@@ -216,9 +215,9 @@ P4 makes three decisions worth defending in a hiring loop.
 
 Requests and responses stream frame by frame; nothing is buffered. An
 SSE or LLM response, a large download and a 50 MiB upload all pass with
-constant memory. The breaker judges an upstream on its response head:
-the deadline runs from the end of the upload to the head, so a long
-stream is never cut and never opens the circuit. 0.1.x buffered by
+constant memory. The breaker judges an upstream on its response head (and
+on a body error after it): the deadline runs from the end of the upload to
+the head, so a long stream is never cut and never opens the circuit. 0.1.x buffered by
 default (the `boxed_body` feature streamed); buffering cut every stream
 at 30 s and opened the breaker for all tenants on a slow body, so it is
 gone.
