@@ -27,7 +27,6 @@ use hyper_util::client::legacy::Client;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[cfg(feature = "boxed_body")]
 pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
@@ -199,7 +198,7 @@ pub async fn handle(
 }
 
 /// `handle` with explicit [`Limits`] (body cap, body-read and upstream
-/// timeouts). Limits should come from `parse_config` (or satisfy its ranges):
+/// timeouts). Limits should come from `EdgeConfig::parse` (or satisfy its ranges):
 /// a 0 timeout makes every request time out immediately.
 pub async fn handle_with(
     table: SharedTable,
@@ -257,7 +256,7 @@ pub(crate) async fn handle_checked(
     // has its own deadline so a slow uploader can't eat into (and then be
     // blamed as) the upstream's time budget.
     let (mut parts, body) = req.into_parts();
-    let body_timeout = Duration::from_secs(limits.request_body_timeout_secs);
+    let body_timeout = snapshot.request_body_timeout();
     let (fwd_body, upload_done) =
         match tokio::time::timeout(body_timeout, forward_body(body, max_body)).await {
             Ok(Ok(b)) => b,
@@ -295,11 +294,7 @@ pub(crate) async fn handle_checked(
 
     // The upstream's budget starts now: round trip plus (collected mode)
     // the response body.
-    // Unvalidated library limits must not panic: fall back to ~30 years out.
-    let now = tokio::time::Instant::now();
-    let deadline = now
-        .checked_add(Duration::from_secs(limits.upstream_timeout_secs))
-        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30));
+    let deadline = tokio::time::Instant::now() + snapshot.upstream_timeout;
     let fwd = Request::from_parts(parts, fwd_body);
 
     // host:port, so two upstreams on one host stay distinct series.

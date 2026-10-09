@@ -25,6 +25,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 const CLOSED: u8 = 0;
 const OPEN: u8 = 1;
@@ -168,15 +169,60 @@ fn matches_prefix(path: &str, prefix: &str) -> bool {
 }
 
 /// Routing decisions table. `rules` is sorted DESC by prefix length at
-/// construction time so iteration order is the lookup order.
+/// construction time so iteration order is the lookup order. Timeout
+/// names and defaults follow ferryman-core 0.3, and they reload with the
+/// table.
 pub struct RouteTable {
     pub rules: Vec<(String, Upstream)>,
+    /// From the end of the client's upload to the upstream's response head.
+    pub upstream_timeout: Duration,
+    keepalive_timeout: Duration,
+    request_body_idle_timeout: Duration,
+    request_body_timeout: Duration,
 }
 
 impl RouteTable {
+    /// Timeouts default to upstream 30 s, keep-alive 10 s, body idle 30 s,
+    /// body total 300 s.
     pub fn new(mut rules: Vec<(String, Upstream)>) -> Self {
         rules.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
-        Self { rules }
+        Self {
+            rules,
+            upstream_timeout: Duration::from_secs(30),
+            keepalive_timeout: Duration::from_secs(10),
+            request_body_idle_timeout: Duration::from_secs(30),
+            request_body_timeout: Duration::from_secs(300),
+        }
+    }
+
+    pub fn with_keepalive_timeout(mut self, d: Duration) -> Self {
+        self.keepalive_timeout = d;
+        self
+    }
+
+    pub fn with_request_body_idle_timeout(mut self, d: Duration) -> Self {
+        self.request_body_idle_timeout = d;
+        self
+    }
+
+    pub fn with_request_body_timeout(mut self, d: Duration) -> Self {
+        self.request_body_timeout = d;
+        self
+    }
+
+    /// HTTP/1 keep-alive idle timeout.
+    pub fn keepalive_timeout(&self) -> Duration {
+        self.keepalive_timeout
+    }
+
+    /// Longest gap between request-body frames.
+    pub fn request_body_idle_timeout(&self) -> Duration {
+        self.request_body_idle_timeout
+    }
+
+    /// Total time allowed to receive a request body.
+    pub fn request_body_timeout(&self) -> Duration {
+        self.request_body_timeout
     }
 
     /// The upstream for the most specific matching prefix, if that upstream

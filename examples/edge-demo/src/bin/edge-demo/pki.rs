@@ -2,7 +2,7 @@
 //! chain, and RSA keys for signing JWTs (committed test-only fixtures).
 //!
 //! Everything is written as PEM files into one directory, because that is
-//! exactly how the proxy consumes them (`[tls]` and `[jwt]` in its config).
+//! exactly how the proxy consumes them (`[mtls]` and `[jwt]` in its config).
 //! In production these come from your CA and identity provider; the demo
 //! only generates them so it can run with no setup.
 

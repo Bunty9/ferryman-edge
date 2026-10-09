@@ -188,7 +188,7 @@ material, routes and the JWT key.
 
 ## Adapting this to your project
 
-- **PKI**: replace the generated files with your own CA. `[tls] client_ca_path`
+- **PKI**: replace the generated files with your own CA. `[mtls] client_ca_path`
   is the CA that signs *client* certificates; `cert_path`/`key_path` is the
   server leaf your clients will verify (its SANs must match how they connect).
   Renew by replacing the files and sending `SIGUSR1`.
@@ -202,7 +202,7 @@ material, routes and the JWT key.
   re-authenticate. That is only safe when the proxy is the only thing that can
   reach them (private network, no published ports). If clients can reach a backend directly they can forge the
   header.
-- **Tuning**: `tenant_rps`, `health_interval_secs`, `default_cooldown_secs` and
+- **Tuning**: `[limits] tenant_rps`, `health_interval_secs`, `default_cooldown_secs` and
   per-route `cooldown_secs` are in the config; the full reference is in
   [docs/operations.md](https://github.com/Bunty9/ferryman-edge/blob/main/docs/operations.md).
 

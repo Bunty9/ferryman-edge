@@ -61,7 +61,7 @@ pub async fn serve(
     serve_with(listener, state, Limits::default(), shutdown).await
 }
 
-/// Limits should come from `parse_config` (or satisfy its ranges): a 0
+/// Limits should come from `EdgeConfig::parse` (or satisfy its ranges): a 0
 /// timeout makes every request or connection time out immediately.
 ///
 /// Accept loop. Runs until `shutdown` resolves, then stops accepting new
@@ -84,11 +84,15 @@ pub async fn serve_with(
     let mut http = auto::Builder::new(TokioExecutor::new());
     http.http1()
         .timer(TokioTimer::new())
-        // hyper adds this to `now()` unchecked; cap unvalidated library
-        // limits at parse_config's maximum so it cannot overflow.
-        .header_read_timeout(Duration::from_secs(
-            limits.first_request_timeout_secs.min(86_400),
-        ));
+        // Keep-alive idle timeout; hyper re-arms it whenever a connection goes
+        // idle (ROADMAP F1/E9). hyper adds it to `now()` unchecked, so cap it.
+        .header_read_timeout(
+            state
+                .table
+                .load()
+                .keepalive_timeout()
+                .min(Duration::from_secs(86_400)),
+        );
     http.http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(H2_KEEPALIVE_INTERVAL)

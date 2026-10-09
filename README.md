@@ -128,7 +128,7 @@ Every request passes the same gates, in order:
 | --- | --- | --- |
 | TLS handshake, client cert must chain to `client_ca_path` (10 s by default; `tls_handshake_timeout_secs`) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
 | `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
-| Per-tenant GCRA limit keyed by `sub` (`tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
+| Per-tenant GCRA limit keyed by `sub` (`[limits] tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
 | No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
 | Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
@@ -163,8 +163,8 @@ SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
 25 s by default (`shutdown_drain_secs`). SIGUSR1 reloads TLS material, the
 routing table (including per-route `health_path` / `health_disabled`) and
 the JWT public key (read from the boot-time path; the token cache is
-cleared). `[limits]`, `issuer` /
-`audience`, `tenant_rps` and `health_interval_secs` are read once at boot.
+cleared). `[limits]`, `issuer` / `audience`,
+`health_interval_secs` and `keepalive_timeout_secs` are read once at boot.
 
 Route prefixes match the raw, undecoded request path and are not access
 control: every route shares the same mTLS + JWT + rate-limit policy, so do

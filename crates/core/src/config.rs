@@ -1,33 +1,65 @@
-//! TOML config schema for ferryman-edge.
+//! TOML config for ferryman-edge: one file, two owners (ROADMAP A7).
 //!
-//! Extends P2's `ferryman-core::config::ConfigToml` with:
-//!   - `[tls]`           : cert, key, client_ca paths for mTLS termination.
-//!   - `jwks_path`       : RSA public-key PEM used by `JwtVerifier`.
-//!   - per-tenant rps cap: applied by the `governor`-based rate limiter.
-//!
-//! The reload path stays simple: SIGUSR1 triggers a full re-read of this
-//! file. See `crates/server/src/reload.rs` for why FS-watch is not used in
-//! P4 (k8s ConfigMap mounts emit unhelpful events).
+//! [`EdgeConfig::parse`] reads the file into a `toml::Table`, removes the
+//! edge-only keys and deserialises them into edge structs: `[mtls]` (or its
+//! deprecated alias `[tls]`), `[jwt]` and `[limits]` (which also holds
+//! `tenant_rps`). What remains is [`ConfigToml`], the proxy-core schema. It
+//! mirrors ferryman-core 0.3 key for key, so the rebase onto it swaps the
+//! type without a schema change. Every table rejects unknown keys. serde
+//! cannot combine `flatten` with `deny_unknown_fields`, hence two passes.
+//! Deprecated spellings still load. Each one adds a line to
+//! [`EdgeConfig::deprecations`], which the binary logs as a warning.
 
 use crate::route::{RouteTable, Upstream};
+use anyhow::{bail, ensure, Context};
 use serde::Deserialize;
+use std::time::Duration;
 
-/// Top-level config file.
+/// Upper bound for every duration key, so `Duration` arithmetic can't overflow.
+const MAX_SECS: u64 = 86_400;
+const MAX_BODY: u64 = 1 << 30;
+
+/// The whole config file.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct EdgeConfig {
+    /// Top-level keys and `[[routes]]`: routing, breaker, health, timeouts.
+    pub core: ConfigToml,
+    /// `[mtls]`: the server identity and the client CA.
+    pub mtls: MtlsToml,
+    /// `[jwt]`: RS256 verification.
+    pub jwt: JwtToml,
+    /// `[limits]`: connection limits and the per-tenant rate. Boot-only.
+    pub limits: Limits,
+    /// Deprecated spellings found in the file, one readable line each.
+    pub deprecations: Vec<String>,
+}
+
+/// Top-level keys and `[[routes]]`. Names, defaults and meaning follow
+/// ferryman-core 0.3's `ConfigToml`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigToml {
-    /// Active health-check interval in seconds.
+    /// Active health-check interval in seconds. Boot-only.
     #[serde(default = "default_health_interval")]
     pub health_interval_secs: u64,
-    /// Default circuit-breaker cooldown if a route doesn't override.
+    /// Breaker cooldown for routes that don't set `cooldown_secs`.
     #[serde(default = "default_cooldown")]
     pub default_cooldown_secs: u64,
-    /// Per-tenant rate limit, requests/sec. `0` disables rate limiting.
-    #[serde(default = "default_rps")]
-    pub tenant_rps: u32,
-    /// mTLS material — required when `--bind-mtls` is enabled.
-    pub tls: TlsToml,
-    /// JWT issuer public key (RSA PEM) for in-line token validation.
-    pub jwt: JwtToml,
+    /// Upstream deadline, from the end of the client's upload to the
+    /// upstream's response head.
+    #[serde(default = "default_upstream_timeout")]
+    pub upstream_timeout_secs: u64,
+    /// HTTP/1 keep-alive idle timeout (also the header-read timeout of
+    /// later requests on a connection). Boot-only.
+    #[serde(default = "default_keepalive")]
+    pub keepalive_timeout_secs: u64,
+    /// Longest gap between request-body frames.
+    #[serde(default = "default_body_idle")]
+    pub request_body_idle_timeout_secs: u64,
+    /// Total time allowed to receive a request body.
+    #[serde(default = "default_body_total")]
+    pub request_body_timeout_secs: u64,
     pub routes: Vec<RouteToml>,
 }
 
@@ -37,24 +69,53 @@ fn default_health_interval() -> u64 {
 fn default_cooldown() -> u64 {
     30
 }
-fn default_rps() -> u32 {
-    1_000
+fn default_upstream_timeout() -> u64 {
+    30
+}
+fn default_keepalive() -> u64 {
+    10
+}
+fn default_body_idle() -> u64 {
+    30
+}
+fn default_body_total() -> u64 {
+    300
 }
 
-/// mTLS material loaded by `tls::build_mtls_config`.
+/// One `[[routes]]` entry.
 #[derive(Debug, Clone, Deserialize)]
-pub struct TlsToml {
+#[serde(deny_unknown_fields)]
+pub struct RouteToml {
+    /// Path prefix to match (e.g. `/svc-a`).
+    pub prefix: String,
+    /// Upstream URI, e.g. `http://localhost:8001`.
+    pub upstream: String,
+    /// Per-route circuit-breaker cooldown override.
+    #[serde(default)]
+    pub cooldown_secs: Option<u64>,
+    /// Health probe path. `None` = `/health`.
+    #[serde(default)]
+    pub health_path: Option<String>,
+    /// Skip active health probing for this route.
+    #[serde(default)]
+    pub health_disabled: bool,
+}
+
+/// `[mtls]` (deprecated alias `[tls]`): material for `tls::build_mtls_config`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MtlsToml {
     /// Server certificate chain (PEM, may be a bundle).
     pub cert_path: String,
     /// Server private key (PEM, PKCS#8 or RSA).
     pub key_path: String,
-    /// Client-CA bundle — every accepted client cert must chain to one of
-    /// these roots. May include intermediates.
+    /// Client-CA bundle: every accepted client cert must chain to one of these.
     pub client_ca_path: String,
 }
 
-/// JWT verification config.
+/// `[jwt]`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtToml {
     /// Path to the RSA public key PEM used for RS256 verification.
     pub jwks_path: String,
@@ -67,252 +128,338 @@ pub struct JwtToml {
     pub audience: Option<String>,
 }
 
-/// One routing rule.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RouteToml {
-    /// Path prefix to match (e.g. `/svc-a`).
-    pub prefix: String,
-    /// Upstream URI, e.g. `http://localhost:8001`.
-    pub upstream: String,
-    /// Per-route circuit-breaker cooldown override.
-    #[serde(default)]
-    pub cooldown_secs: Option<u64>,
-}
-
-/// Keys added after 0.1.1, parsed from the same TOML string as
-/// [`ConfigToml`] (which ignores unknown keys). Kept in separate
-/// `#[non_exhaustive]` types so the 0.1.1 structs stay unchanged. Use
-/// [`parse_config`] to get both.
-#[derive(Debug, Clone, Deserialize, Default)]
-#[non_exhaustive]
-pub struct ConfigExt {
-    /// `[limits]`. Boot-only: not re-read on SIGUSR1.
-    #[serde(default)]
-    pub limits: Limits,
-    /// Health keys of each `[[routes]]` table, matched to
-    /// [`ConfigToml::routes`] by `prefix`. Reloaded on SIGUSR1.
-    #[serde(default)]
-    pub routes: Vec<RouteExt>,
-}
-
-/// `[limits]` table. Defaults equal the 0.1.1 hard-coded values.
+/// `[limits]`. Boot-only: not re-read on SIGUSR1.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Max client request body, bytes (<= 1 GiB).
     pub max_request_body_bytes: u64,
-    /// Deadline for reading the client request body.
-    pub request_body_timeout_secs: u64,
-    /// Deadline for the upstream response.
-    pub upstream_timeout_secs: u64,
     /// TLS handshake deadline.
     pub tls_handshake_timeout_secs: u64,
-    /// Deadline for the first request on a connection (also the HTTP/1
-    /// header-read timeout).
+    /// Deadline for the first request on a connection.
     pub first_request_timeout_secs: u64,
     /// HTTP/2 max concurrent streams per connection.
     pub h2_max_concurrent_streams: u32,
     /// Graceful-shutdown drain window.
     pub shutdown_drain_secs: u64,
+    /// Per-tenant requests/second, keyed by JWT `sub`. `0` disables.
+    pub tenant_rps: u32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_request_body_bytes: 8 * 1024 * 1024,
-            request_body_timeout_secs: 30,
-            upstream_timeout_secs: 30,
             tls_handshake_timeout_secs: 10,
             first_request_timeout_secs: 10,
             h2_max_concurrent_streams: 64,
             shutdown_drain_secs: 25,
+            tenant_rps: 1_000,
         }
     }
 }
 
-/// Per-route health keys; other `[[routes]]` keys are ignored here.
-#[derive(Debug, Clone, Deserialize)]
-#[non_exhaustive]
-pub struct RouteExt {
-    /// Prefix of the route these keys belong to.
-    pub prefix: String,
-    /// Health probe path. `None` = `/health`.
-    #[serde(default)]
-    pub health_path: Option<String>,
-    /// Skip active health probing for this route.
-    #[serde(default)]
-    pub health_disabled: bool,
-}
-
-const MAX_SECS: u64 = 86_400;
-const MAX_BODY: u64 = 1 << 30;
-
-impl ConfigExt {
-    fn validate(&self, cfg: &ConfigToml) -> anyhow::Result<()> {
-        let l = &self.limits;
+impl Limits {
+    fn validate(&self) -> anyhow::Result<()> {
         for (key, v) in [
-            ("request_body_timeout_secs", l.request_body_timeout_secs),
-            ("upstream_timeout_secs", l.upstream_timeout_secs),
-            ("tls_handshake_timeout_secs", l.tls_handshake_timeout_secs),
-            ("first_request_timeout_secs", l.first_request_timeout_secs),
-            ("shutdown_drain_secs", l.shutdown_drain_secs),
+            (
+                "tls_handshake_timeout_secs",
+                self.tls_handshake_timeout_secs,
+            ),
+            (
+                "first_request_timeout_secs",
+                self.first_request_timeout_secs,
+            ),
+            ("shutdown_drain_secs", self.shutdown_drain_secs),
         ] {
-            anyhow::ensure!(
+            ensure!(
                 (1..=MAX_SECS).contains(&v),
                 "limits.{key} must be between 1 and {MAX_SECS}"
             );
         }
-        anyhow::ensure!(
-            (1..=MAX_BODY).contains(&l.max_request_body_bytes),
+        ensure!(
+            (1..=MAX_BODY).contains(&self.max_request_body_bytes),
             "limits.max_request_body_bytes must be between 1 and {MAX_BODY}"
         );
-        anyhow::ensure!(
-            l.h2_max_concurrent_streams > 0,
+        ensure!(
+            self.h2_max_concurrent_streams > 0,
             "limits.h2_max_concurrent_streams must be at least 1"
         );
-        anyhow::ensure!(
-            cfg.health_interval_secs > 0,
-            "health_interval_secs must be at least 1"
-        );
-        for r in &self.routes {
-            // Typo guard. Unreachable via parse_config (same tables), but
-            // ConfigExt is Deserialize, so it can come from elsewhere.
-            anyhow::ensure!(
-                cfg.routes.iter().any(|c| c.prefix == r.prefix),
-                "route {:?}: health keys match no [[routes]] prefix",
-                r.prefix
-            );
-            if let Some(p) = &r.health_path {
-                anyhow::ensure!(
-                    p.starts_with('/')
-                        && !p.contains(['?', '#'])
-                        && p.parse::<http::uri::PathAndQuery>().is_ok(),
-                    "route {}: health_path {p:?} must start with '/' and contain no '?' or '#'",
-                    r.prefix
-                );
-            }
-        }
         Ok(())
     }
 }
 
-/// Parse and validate both config views from one TOML string.
-pub fn parse_config(raw: &str) -> anyhow::Result<(ConfigToml, ConfigExt)> {
-    let cfg: ConfigToml = toml::from_str(raw)?;
-    let ext: ConfigExt = toml::from_str(raw)?;
-    ext.validate(&cfg)?;
-    Ok((cfg, ext))
+impl EdgeConfig {
+    /// Parse and validate the edge tables; the core part is validated by
+    /// [`build_table`].
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        let mut top: toml::Table = raw.parse().context("config is not valid TOML")?;
+        let mut deprecations = Vec::new();
+
+        let mtls = match (top.remove("mtls"), top.remove("tls")) {
+            (Some(_), Some(_)) => {
+                bail!("both [mtls] and its deprecated alias [tls] are set; keep [mtls]")
+            }
+            (Some(t), None) => t,
+            (None, Some(t)) => {
+                deprecations.push("[tls] is deprecated: rename the table to [mtls]".to_string());
+                t
+            }
+            (None, None) => bail!("missing [mtls] table (cert_path, key_path, client_ca_path)"),
+        };
+        let jwt = top
+            .remove("jwt")
+            .context("missing [jwt] table (jwks_path)")?;
+        let mut limits = match top.remove("limits") {
+            None => toml::Table::new(),
+            Some(toml::Value::Table(t)) => t,
+            Some(_) => bail!("limits must be a table"),
+        };
+        if let Some(v) = top.remove("tenant_rps") {
+            ensure!(
+                !limits.contains_key("tenant_rps"),
+                "tenant_rps is set at the top level (deprecated) and in [limits]; keep [limits] tenant_rps"
+            );
+            deprecations.push(
+                "top-level tenant_rps is deprecated: move it to [limits] tenant_rps".to_string(),
+            );
+            limits.insert("tenant_rps".into(), v);
+        }
+        for key in ["upstream_timeout_secs", "request_body_timeout_secs"] {
+            if let Some(v) = limits.remove(key) {
+                ensure!(
+                    !top.contains_key(key),
+                    "{key} is set in [limits] (deprecated) and at the top level; keep the top-level key"
+                );
+                deprecations.push(format!(
+                    "[limits] {key} is deprecated: move it to the top level"
+                ));
+                top.insert(key.into(), v);
+            }
+        }
+
+        let limits: Limits = toml::Value::Table(limits)
+            .try_into()
+            .context("in [limits]")?;
+        limits.validate()?;
+        Ok(Self {
+            core: toml::Value::Table(top).try_into()?,
+            mtls: mtls.try_into().context("in [mtls]")?,
+            jwt: jwt.try_into().context("in [jwt]")?,
+            limits,
+            deprecations,
+        })
+    }
 }
 
-/// Build a [`RouteTable`] from a parsed [`ConfigToml`]. Returns an error if
-/// any upstream URI fails to parse or has no authority (e.g. a relative
-/// path with no scheme/host — nothing the proxy could dial) — the caller
-/// should keep the old table in that case. Same as [`build_table_ext`] with
-/// [`ConfigExt::default`].
+/// Validate the core keys and build a [`RouteTable`]. On error the caller
+/// keeps its old table.
 pub fn build_table(cfg: &ConfigToml) -> anyhow::Result<RouteTable> {
-    build_table_ext(cfg, &ConfigExt::default())
-}
-
-/// [`build_table`] plus the per-route health keys from `ext`. With
-/// duplicate prefixes the first `ext` entry for a prefix applies to all
-/// rules with that prefix (the first rule wins lookups anyway).
-pub fn build_table_ext(cfg: &ConfigToml, ext: &ConfigExt) -> anyhow::Result<RouteTable> {
-    ext.validate(cfg)?;
-    let default_cooldown = cfg.default_cooldown_secs;
+    for (key, v) in [
+        ("health_interval_secs", cfg.health_interval_secs),
+        ("default_cooldown_secs", cfg.default_cooldown_secs),
+        ("upstream_timeout_secs", cfg.upstream_timeout_secs),
+        ("keepalive_timeout_secs", cfg.keepalive_timeout_secs),
+        (
+            "request_body_idle_timeout_secs",
+            cfg.request_body_idle_timeout_secs,
+        ),
+        ("request_body_timeout_secs", cfg.request_body_timeout_secs),
+    ] {
+        ensure!(
+            (1..=MAX_SECS).contains(&v),
+            "{key} must be between 1 and {MAX_SECS}"
+        );
+    }
     let mut rules = Vec::with_capacity(cfg.routes.len());
     for r in &cfg.routes {
-        let uri: http::Uri = r.upstream.parse()?;
-        if uri.authority().is_none() {
-            anyhow::bail!(
-                "route {:?}: upstream {:?} has no authority (scheme://host)",
-                r.prefix,
-                r.upstream
-            );
-        }
-        let cooldown = r.cooldown_secs.unwrap_or(default_cooldown);
-        // 0 would let every caller through as a "probe": the breaker would
-        // be silently disabled.
-        anyhow::ensure!(
+        let uri: http::Uri = r
+            .upstream
+            .parse()
+            .with_context(|| format!("route {:?}: invalid upstream {:?}", r.prefix, r.upstream))?;
+        ensure!(
+            uri.authority().is_some(),
+            "route {:?}: upstream {:?} has no authority (scheme://host)",
+            r.prefix,
+            r.upstream
+        );
+        let cooldown = r.cooldown_secs.unwrap_or(cfg.default_cooldown_secs);
+        // 0 would let every caller through as a "probe".
+        ensure!(
             cooldown > 0,
             "route {}: cooldown_secs must be at least 1",
             r.prefix
         );
-        let mut up = Upstream::new(uri, cooldown);
-        if let Some(x) = ext.routes.iter().find(|x| x.prefix == r.prefix) {
-            up = up.with_health(x.health_path.clone(), x.health_disabled);
+        if let Some(p) = &r.health_path {
+            ensure!(
+                p.starts_with('/')
+                    && !p.contains(['?', '#'])
+                    && p.parse::<http::uri::PathAndQuery>().is_ok(),
+                "route {}: health_path {p:?} must start with '/' and contain no '?' or '#'",
+                r.prefix
+            );
         }
+        let up = Upstream::new(uri, cooldown).with_health(r.health_path.clone(), r.health_disabled);
         rules.push((r.prefix.clone(), up));
     }
-    Ok(RouteTable::new(rules))
+    let secs = Duration::from_secs;
+    let mut table = RouteTable::new(rules)
+        .with_keepalive_timeout(secs(cfg.keepalive_timeout_secs))
+        .with_request_body_idle_timeout(secs(cfg.request_body_idle_timeout_secs))
+        .with_request_body_timeout(secs(cfg.request_body_timeout_secs));
+    table.upstream_timeout = secs(cfg.upstream_timeout_secs);
+    Ok(table)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn repo_config_toml_parses_and_builds() {
-        let raw = include_str!("../../../config.toml");
-        let cfg: ConfigToml = toml::from_str(raw).expect("config.toml should parse");
-        build_table(&cfg).expect("build_table should succeed for config.toml");
+    /// A config file exactly as 0.1.2 documented it.
+    const V012: &str = r#"
+health_interval_secs = 5
+default_cooldown_secs = 30
+tenant_rps = 7
+
+[limits]
+upstream_timeout_secs = 12
+request_body_timeout_secs = 40
+max_request_body_bytes = 1024
+
+[tls]
+cert_path = "c"
+key_path = "k"
+client_ca_path = "ca"
+
+[jwt]
+jwks_path = "j"
+
+[[routes]]
+prefix = "/svc-a"
+upstream = "http://localhost:8001"
+health_path = "/ready"
+"#;
+
+    /// New-style config with an extra line in each section.
+    fn cfg(top: &str, mtls: &str, jwt: &str, limits: &str, route: &str) -> String {
+        format!(
+            "{top}\n[mtls]\ncert_path = \"c\"\nkey_path = \"k\"\nclient_ca_path = \"ca\"\n{mtls}\n\
+             [jwt]\njwks_path = \"j\"\n{jwt}\n[limits]\n{limits}\n\
+             [[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://localhost:8001\"\n{route}\n"
+        )
     }
 
     #[test]
-    fn build_table_rejects_upstream_without_authority() {
-        let cfg = ConfigToml {
-            health_interval_secs: 5,
-            default_cooldown_secs: 30,
-            tenant_rps: 1000,
-            tls: TlsToml {
-                cert_path: "certs/server.crt".into(),
-                key_path: "certs/server.key".into(),
-                client_ca_path: "certs/ca-bundle.crt".into(),
-            },
-            jwt: JwtToml {
-                jwks_path: "certs/jwt-pub.pem".into(),
-                issuer: None,
-                audience: None,
-            },
-            routes: vec![RouteToml {
-                prefix: "/svc-a".into(),
-                upstream: "/no-authority-here".into(),
-                cooldown_secs: None,
-            }],
-        };
-        assert!(build_table(&cfg).is_err());
+    fn repo_config_toml_parses_without_warnings_and_builds() {
+        let c = EdgeConfig::parse(include_str!("../../../config.toml")).unwrap();
+        assert!(c.deprecations.is_empty(), "{:?}", c.deprecations);
+        build_table(&c.core).unwrap();
     }
 
     #[test]
-    fn build_table_rejects_zero_cooldown() {
-        let raw = include_str!("../../../config.toml").replace(
-            "upstream = \"http://localhost:8001\"",
-            "upstream = \"http://localhost:8001\"\ncooldown_secs = 0",
-        );
-        let cfg: ConfigToml = toml::from_str(&raw).unwrap();
-        assert!(build_table(&cfg).is_err());
-    }
-
-    fn base() -> String {
-        include_str!("../../../config.toml").to_string()
+    fn edge_0_1_2_config_loads_with_deprecation_warnings() {
+        let c = EdgeConfig::parse(V012).unwrap();
+        assert_eq!(c.mtls.cert_path, "c");
+        assert_eq!(c.limits.tenant_rps, 7);
+        assert_eq!(c.limits.max_request_body_bytes, 1024);
+        assert_eq!(c.core.upstream_timeout_secs, 12);
+        assert_eq!(c.core.request_body_timeout_secs, 40);
+        assert_eq!(c.deprecations.len(), 4, "{:?}", c.deprecations);
+        for want in [
+            "[mtls]",
+            "[limits] tenant_rps",
+            "upstream_timeout_secs",
+            "request_body_timeout_secs",
+        ] {
+            assert!(
+                c.deprecations.iter().any(|d| d.contains(want)),
+                "{want}: {:?}",
+                c.deprecations
+            );
+        }
+        build_table(&c.core).unwrap();
     }
 
     #[test]
-    fn shipped_config_has_default_limits() {
-        let (_, ext) = parse_config(&base()).unwrap();
-        let l = &ext.limits;
-        assert_eq!(l.max_request_body_bytes, 8 * 1024 * 1024);
+    fn defaults_match_ferryman_core() {
+        let c = EdgeConfig::parse(&cfg("", "", "", "", "")).unwrap();
+        let k = &c.core;
         assert_eq!(
             (
-                l.request_body_timeout_secs,
-                l.upstream_timeout_secs,
+                k.health_interval_secs,
+                k.default_cooldown_secs,
+                k.upstream_timeout_secs,
+                k.keepalive_timeout_secs,
+                k.request_body_idle_timeout_secs,
+                k.request_body_timeout_secs
+            ),
+            (5, 30, 30, 10, 30, 300)
+        );
+        let l = &c.limits;
+        assert_eq!(
+            (
                 l.tls_handshake_timeout_secs,
                 l.first_request_timeout_secs,
                 l.h2_max_concurrent_streams,
-                l.shutdown_drain_secs
+                l.shutdown_drain_secs,
+                l.tenant_rps
             ),
-            (30, 30, 10, 10, 64, 25)
+            (10, 10, 64, 25, 1000)
         );
+        let t = build_table(&c.core).unwrap();
+        assert_eq!(t.upstream_timeout, Duration::from_secs(30));
+        assert_eq!(t.keepalive_timeout(), Duration::from_secs(10));
+        assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(30));
+        assert_eq!(t.request_body_timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn old_and_new_spellings_together_are_errors() {
+        let both_tls = format!(
+            "{}\n[tls]\ncert_path = \"c\"\nkey_path = \"k\"\nclient_ca_path = \"ca\"\n",
+            cfg("", "", "", "", "")
+        );
+        let rps = cfg("tenant_rps = 1", "", "", "tenant_rps = 2", "");
+        let timeout = cfg(
+            "upstream_timeout_secs = 1",
+            "",
+            "",
+            "upstream_timeout_secs = 2",
+            "",
+        );
+        for (raw, want) in [
+            (both_tls, "[mtls]"),
+            (rps, "tenant_rps"),
+            (timeout, "upstream_timeout_secs"),
+        ] {
+            let e = format!("{:#}", EdgeConfig::parse(&raw).unwrap_err());
+            assert!(e.contains(want), "{want}: {e}");
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_in_every_table() {
+        for raw in [
+            cfg("bogus = 1", "", "", "", ""),
+            cfg("", "bogus = 1", "", "", ""),
+            cfg("", "", "bogus = 1", "", ""),
+            cfg("", "", "", "bogus = 1", ""),
+            cfg("", "", "", "", "bogus = 1"),
+        ] {
+            let e = format!("{:#}", EdgeConfig::parse(&raw).unwrap_err());
+            assert!(e.contains("bogus"), "{e}");
+        }
+    }
+
+    #[test]
+    fn missing_mtls_or_jwt_is_an_error() {
+        let no_mtls = cfg("", "", "", "", "").replace("[mtls]", "[unused]");
+        assert!(EdgeConfig::parse(&no_mtls).is_err());
+        let no_jwt =
+            "[mtls]\ncert_path = \"c\"\nkey_path = \"k\"\nclient_ca_path = \"ca\"\nroutes = []\n";
+        let e = format!("{:#}", EdgeConfig::parse(no_jwt).unwrap_err());
+        assert!(e.contains("[jwt]"), "{e}");
     }
 
     #[test]
@@ -320,71 +467,68 @@ mod tests {
         for (line, key) in [
             ("max_request_body_bytes = 0", "max_request_body_bytes"),
             (
-                "max_request_body_bytes = 1073741825",
-                "max_request_body_bytes",
-            ),
-            ("request_body_timeout_secs = 0", "request_body_timeout_secs"),
-            ("upstream_timeout_secs = 86401", "upstream_timeout_secs"),
-            (
                 "tls_handshake_timeout_secs = 0",
                 "tls_handshake_timeout_secs",
             ),
             (
-                "first_request_timeout_secs = 0",
+                "first_request_timeout_secs = 86401",
                 "first_request_timeout_secs",
             ),
             ("h2_max_concurrent_streams = 0", "h2_max_concurrent_streams"),
             ("shutdown_drain_secs = 0", "shutdown_drain_secs"),
         ] {
-            let raw = format!("{}\n[limits]\n{line}\n", base());
-            let e = parse_config(&raw).unwrap_err().to_string();
+            let e = format!(
+                "{:#}",
+                EdgeConfig::parse(&cfg("", "", "", line, "")).unwrap_err()
+            );
             assert!(e.contains(key), "{line}: {e}");
         }
-        let ok = format!(
-            "{}\n[limits]\nmax_request_body_bytes = 1073741824\nupstream_timeout_secs = 86400\n",
-            base()
-        );
-        parse_config(&ok).unwrap();
     }
 
     #[test]
-    fn health_path_validation_and_mapping() {
-        for bad in ["healthz", "/h?x=1", "/h#f", "/a b", "/a\\u0001b"] {
-            let raw = base().replacen(
-                "upstream = \"http://localhost:8001\"",
-                &format!("upstream = \"http://localhost:8001\"\nhealth_path = \"{bad}\""),
-                1,
-            );
-            let e = parse_config(&raw).unwrap_err().to_string();
-            assert!(e.contains("health_path"), "{bad}: {e}");
+    fn core_validation_names_the_key() {
+        for (line, key) in [
+            ("health_interval_secs = 0", "health_interval_secs"),
+            ("upstream_timeout_secs = 0", "upstream_timeout_secs"),
+            ("keepalive_timeout_secs = 86401", "keepalive_timeout_secs"),
+            (
+                "request_body_idle_timeout_secs = 0",
+                "request_body_idle_timeout_secs",
+            ),
+            ("request_body_timeout_secs = 0", "request_body_timeout_secs"),
+        ] {
+            let c = EdgeConfig::parse(&cfg(line, "", "", "", "")).unwrap();
+            let e = build_table(&c.core).err().unwrap().to_string();
+            assert!(e.contains(key), "{line}: {e}");
         }
-        let raw = base().replacen(
-            "upstream = \"http://localhost:8001\"",
-            "upstream = \"http://localhost:8001\"\nhealth_path = \"/ready\"\nhealth_disabled = true",
-            1,
-        );
-        let (cfg, ext) = parse_config(&raw).unwrap();
-        let t = build_table_ext(&cfg, &ext).unwrap();
+        for (route, key) in [
+            ("cooldown_secs = 0", "cooldown_secs"),
+            ("health_path = \"healthz\"", "health_path"),
+            ("health_path = \"/h?x=1\"", "health_path"),
+        ] {
+            let c = EdgeConfig::parse(&cfg("", "", "", "", route)).unwrap();
+            let e = build_table(&c.core).err().unwrap().to_string();
+            assert!(e.contains(key), "{route}: {e}");
+        }
+        let c = EdgeConfig::parse(
+            &cfg("", "", "", "", "").replace("http://localhost:8001", "/no-authority"),
+        )
+        .unwrap();
+        assert!(build_table(&c.core).is_err());
+    }
+
+    #[test]
+    fn health_keys_reach_the_upstream() {
+        let c = EdgeConfig::parse(&cfg(
+            "",
+            "",
+            "",
+            "",
+            "health_path = \"/ready\"\nhealth_disabled = true",
+        ))
+        .unwrap();
+        let t = build_table(&c.core).unwrap();
         let a = t.lookup("/svc-a").unwrap();
         assert_eq!((a.health_path(), a.health_disabled()), ("/ready", true));
-        let b = t.lookup("/svc-b").unwrap();
-        assert_eq!((b.health_path(), b.health_disabled()), ("/health", false));
-    }
-
-    #[test]
-    fn ext_prefix_matching_no_route_is_an_error() {
-        let (cfg, _) = parse_config(&base()).unwrap();
-        let ext: ConfigExt =
-            toml::from_str("[[routes]]\nprefix = \"/typo\"\nhealth_disabled = true").unwrap();
-        let e = build_table_ext(&cfg, &ext).err().unwrap().to_string();
-        assert!(e.contains("/typo"), "{e}");
-    }
-
-    #[test]
-    fn zero_health_interval_rejected_everywhere() {
-        let raw = base().replace("health_interval_secs = 5", "health_interval_secs = 0");
-        assert!(parse_config(&raw).is_err());
-        let cfg: ConfigToml = toml::from_str(&raw).unwrap();
-        assert!(build_table(&cfg).is_err());
     }
 }

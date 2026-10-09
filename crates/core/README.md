@@ -15,7 +15,7 @@ wires these behind a `tokio-rustls` acceptor.
 | `ratelimit` | Per-tenant GCRA limiter (`governor`), `0` rps = disabled, `spawn_gc` to bound per-tenant state |
 | `route` | `RouteTable` with segment-boundary longest-prefix matching and a lock-free Closed / Open / HalfOpen circuit breaker per upstream |
 | `health` | Active `/health` probe loop feeding the breaker |
-| `config` | TOML schema (`parse_config`, `ConfigExt` with `[limits]`, per-route `health_path` / `health_disabled`), `build_table` / `build_table_ext` |
+| `config` | `EdgeConfig::parse` (`[mtls]`, `[jwt]`, `[limits]`) over the core-shaped `ConfigToml`; `build_table` |
 
 ```rust
 use ferryman_edge_core::{build_limiter, check, JwtVerifier};

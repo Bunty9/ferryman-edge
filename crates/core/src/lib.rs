@@ -11,8 +11,8 @@
 //!   - `route`  : the P2 routing table (Upstream, RouteTable, SharedTable).
 //!     Copied verbatim — P4 layers atop, does not modify.
 //!   - `health` : active probe loop (copied from P2).
-//!   - `config` : TOML schema extended with `tls`, `jwks_path`, per-tenant
-//!     rate-limit caps.
+//!   - `config` : `EdgeConfig` two-pass parse (`[mtls]`, `[jwt]`, `[limits]`)
+//!     over the core-shaped `ConfigToml`.
 //!
 //! The server crate composes these behind a `tokio-rustls` acceptor and a
 //! hyper service.
@@ -24,10 +24,7 @@ pub mod ratelimit;
 pub mod route;
 pub mod tls;
 
-pub use config::{
-    build_table, build_table_ext, parse_config, ConfigExt, ConfigToml, JwtToml, Limits, RouteExt,
-    RouteToml, TlsToml,
-};
+pub use config::{build_table, ConfigToml, EdgeConfig, JwtToml, Limits, MtlsToml, RouteToml};
 pub use health::health_loop;
 pub use jwt::{Claims, JwtVerifier};
 pub use ratelimit::{build_limiter, check, spawn_gc, Limiter};

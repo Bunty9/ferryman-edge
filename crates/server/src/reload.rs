@@ -22,14 +22,14 @@
 //! point of view) without dropping connections.
 
 use arc_swap::ArcSwap;
-use ferryman_edge_core::{build_table_ext, parse_config, JwtVerifier, RouteTable, SharedTable};
+use ferryman_edge_core::{build_table, EdgeConfig, JwtVerifier, RouteTable, SharedTable};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Spawn the SIGUSR1 reload loop. Routes and their health keys
-/// (`health_path`, `health_disabled`) reload; `[limits]` are boot-only and
-/// a changed value needs a restart. Returns immediately; the loop runs until
-/// process exit.
+/// Spawn the SIGUSR1 reload loop. Routes, their health keys and the four
+/// top-level timeouts reload; `[limits]`, `[mtls]` paths, `[jwt]`
+/// issuer/audience, `health_interval_secs` and `keepalive_timeout_secs` are
+/// boot-only. Returns immediately; the loop runs until process exit.
 pub fn spawn_reload(path: PathBuf, table: SharedTable) {
     tokio::spawn(async move {
         let mut sig =
@@ -83,9 +83,8 @@ pub fn spawn_jwt_reload(pem_path: PathBuf, jwt: Arc<JwtVerifier>) {
 }
 
 fn reload_once(path: &Path) -> anyhow::Result<RouteTable> {
-    let raw = std::fs::read_to_string(path)?;
-    let (cfg, ext) = parse_config(&raw)?;
-    build_table_ext(&cfg, &ext)
+    let cfg = EdgeConfig::parse(&std::fs::read_to_string(path)?)?;
+    build_table(&cfg.core)
 }
 
 /// Helper for tests / integration code that build their own `SharedTable`

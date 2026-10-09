@@ -12,10 +12,13 @@ are resolved against the process working directory.
 | --- | --- | --- | --- |
 | `health_interval_secs` | `5` | no | Active health probe interval (`GET <upstream>/health`). |
 | `default_cooldown_secs` | `30` | yes (routes) | Breaker cooldown for routes that don't set one. |
-| `tenant_rps` | `1000` | no | Per-tenant GCRA limit keyed by JWT `sub`. `0` disables rate limiting. |
-| `[tls] cert_path` | — | yes | Server certificate chain, PEM (leaf first, then intermediates). |
-| `[tls] key_path` | — | yes | Server private key, PEM (PKCS#8, PKCS#1 or SEC1). |
-| `[tls] client_ca_path` | — | yes | Client CA bundle, PEM. Every client cert must chain to one of these. |
+| `upstream_timeout_secs` | `30` | yes | From the end of the client's upload to the upstream's response head; exceeded gets 504. (0.1.x: `[limits] upstream_timeout_secs`, still loads with a warning.) |
+| `keepalive_timeout_secs` | `10` | no | HTTP/1 keep-alive idle timeout; also bounds header reads of later requests. Behind an ALB use ALB idle + 15 s. |
+| `request_body_idle_timeout_secs` | `30` | yes | Longest gap between request-body frames. Accepted and validated; not enforced yet (the whole-upload limit below applies). |
+| `request_body_timeout_secs` | `300` | yes | Whole upload; exceeded gets 408. (0.1.x: `[limits] request_body_timeout_secs`, default 30.) |
+| `[mtls] cert_path` (0.1.x name `[tls]` still loads, with a warning) | — | yes | Server certificate chain, PEM (leaf first, then intermediates). |
+| `[mtls] key_path` | — | yes | Server private key, PEM (PKCS#8, PKCS#1 or SEC1). |
+| `[mtls] client_ca_path` | — | yes | Client CA bundle, PEM. Every client cert must chain to one of these. |
 | `[jwt] jwks_path` | — | yes (contents) | RSA public key, PEM, used for RS256 verification. The path itself is read at boot; SIGUSR1 re-reads the file at that path. |
 | `[jwt] issuer` | unset | no | Required `iss`. Unset = not checked. |
 | `[jwt] audience` | unset | no | Required `aud`. Unset = not checked; tokens carrying any `aud` are then rejected. |
@@ -51,15 +54,16 @@ restart (no log line).
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `max_request_body_bytes` | `8388608` (8 MiB) | 1 to 1073741824 | Largest client request body; larger gets 413. |
-| `request_body_timeout_secs` | `30` | 1 to 86400 | Deadline for reading the client body; exceeded gets 408. Collected (default) mode only; under `boxed_body` the upload runs inside `upstream_timeout_secs`. |
-| `upstream_timeout_secs` | `30` | 1 to 86400 | Upstream round trip, starting once the request body is ready; exceeded gets 504. |
 | `tls_handshake_timeout_secs` | `10` | 1 to 86400 | mTLS handshake deadline. |
-| `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request; also the HTTP/1 header-read timeout. |
+| `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request. |
+| `tenant_rps` | `1000` | 0 to 2^32-1 | Per-tenant GCRA limit keyed by JWT sub; 0 disables. (0.1.x: top level, still loads with a warning.) |
 | `h2_max_concurrent_streams` | `64` | at least 1 | Concurrent h2 streams per connection. In collected mode, per-connection body memory is up to this times `max_request_body_bytes`. |
 | `shutdown_drain_secs` | `25` | 1 to 86400 | How long in-flight connections get to finish after a shutdown signal. |
 
-Slowloris trade-off: `first_request_timeout_secs` (and the HTTP/1 header
-timeout it also sets) and `tls_handshake_timeout_secs` bound how long an
+Unknown keys in any table are rejected at load.
+
+Slowloris trade-off: `first_request_timeout_secs`, `keepalive_timeout_secs`
+(the HTTP/1 header-read timeout) and `tls_handshake_timeout_secs` bound how long an
 unauthenticated or silent client can hold a connection slot. Raising them
 widens that window; raise them only for slow, trusted networks. Keep
 `shutdown_drain_secs` below your orchestrator's kill timeout.
@@ -106,8 +110,9 @@ cache. There is a single key and no overlap window: tokens signed by the
 old key are rejected immediately after the reload, so rotate at the IdP
 accordingly (switch signing, then replace the file and signal).
 
-Not reloaded: the JWT `issuer` / `audience`, `tenant_rps`,
-`health_interval_secs`, every `[limits]` key, bind addresses. Restart for
+Not reloaded: the JWT `issuer` / `audience`, `keepalive_timeout_secs`,
+`health_interval_secs`, every `[limits]` key (including `tenant_rps`), bind
+addresses. Restart for
 those. An invalid `[limits]` value (or `health_interval_secs = 0`) in the
 file fails the whole route reload (old table kept); a valid but changed
 `[limits]` value is ignored without a log line.

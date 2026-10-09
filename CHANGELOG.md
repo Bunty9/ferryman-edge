@@ -13,6 +13,27 @@ Both crates share one version. Format follows
   `rustls::crypto::ring::default_provider()`. No FIPS build, and the
   post-quantum `X25519MLKEM768` key exchange is no longer offered.
   TLS 1.2 stays enabled.
+- Config: `[tls]` is now `[mtls]` (the old name loads with a warning; both
+  together is an error). Migration: rename the table.
+- Config: top-level `tenant_rps` moves to `[limits] tenant_rps` (old
+  spelling loads with a warning).
+- Config: `upstream_timeout_secs` and `request_body_timeout_secs` move from
+  `[limits]` to the top level (ferryman-core names; old spellings load with
+  a warning), joined by `keepalive_timeout_secs` (default 10 s) and
+  `request_body_idle_timeout_secs` (default 30 s; accepted and validated, not
+  enforced yet). `request_body_timeout_secs`
+  defaults to 300 s (was 30 s). The top-level timeouts reload on SIGUSR1,
+  except `keepalive_timeout_secs`.
+- Config: unknown keys are rejected in every table (0.1.x ignored them, so
+  a typo silently kept a default). Migration: fix or remove the key the
+  error names.
+- HTTP/1 keep-alive idle timeout is `keepalive_timeout_secs`;
+  `first_request_timeout_secs` now bounds only the first request.
+- Library: `parse_config`, `ConfigExt`, `RouteExt`, `build_table_ext` and
+  `TlsToml` are replaced by `EdgeConfig::parse`, `MtlsToml` and
+  `build_table(&ConfigToml)`; `Limits` loses `upstream_timeout_secs` /
+  `request_body_timeout_secs` and gains `tenant_rps`; `RouteTable` gains
+  `upstream_timeout` and timeout getters named like ferryman-core 0.3.
 
 ### Changed
 - `metrics-exporter-prometheus` without its push-gateway client;

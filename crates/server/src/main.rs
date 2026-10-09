@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
 use ferryman_edge_core::{
-    build_limiter, build_table_ext, health_loop, parse_config, spawn_gc, JwtVerifier, Limiter,
+    build_limiter, build_table, health_loop, spawn_gc, EdgeConfig, JwtVerifier, Limiter,
     ReloadingTls, SharedTable,
 };
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -66,18 +66,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let raw = std::fs::read_to_string(&args.config)?;
-    let (cfg, ext) = parse_config(&raw)?;
-    let interval = Duration::from_secs(cfg.health_interval_secs);
+    let cfg = EdgeConfig::parse(&raw)?;
+    for d in &cfg.deprecations {
+        tracing::warn!(config = %args.config.display(), "{d}");
+    }
+    let interval = Duration::from_secs(cfg.core.health_interval_secs);
 
     // Routing table (atomic hot-swap).
-    let table = build_table_ext(&cfg, &ext)?;
+    let table = build_table(&cfg.core)?;
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 
     // mTLS material + reloading wrapper. SIGUSR1 swaps cert/key/ca atomically.
     let tls = ReloadingTls::new(
-        &cfg.tls.cert_path,
-        &cfg.tls.key_path,
-        &cfg.tls.client_ca_path,
+        &cfg.mtls.cert_path,
+        &cfg.mtls.key_path,
+        &cfg.mtls.client_ca_path,
     )?;
 
     // JWT verifier: RSA pub key read at boot and re-read from the same path
@@ -96,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     // Per-tenant rate limiter, keyed by `Claims::sub`. `None` when
     // `tenant_rps == 0` — rate limiting is disabled outright rather than
     // silently clamped to 1 rps.
-    let limiter: Option<Arc<Limiter>> = build_limiter(cfg.tenant_rps);
+    let limiter: Option<Arc<Limiter>> = build_limiter(cfg.limits.tenant_rps);
     if let Some(l) = &limiter {
         spawn_gc(l.clone(), LIMITER_GC_INTERVAL);
     }
@@ -128,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, "ferryman-edge-server listening (mTLS)");
 
-    serve_with(listener, state, ext.limits.clone(), shutdown_signal()).await;
+    serve_with(listener, state, cfg.limits.clone(), shutdown_signal()).await;
     Ok(())
 }
 

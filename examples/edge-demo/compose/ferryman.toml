@@ -1,8 +1,10 @@
 health_interval_secs = 2
 default_cooldown_secs = 2
+
+[limits]
 tenant_rps = 5
 
-[tls]
+[mtls]
 cert_path = "/app/certs/server.crt"
 key_path = "/app/certs/server.key"
 client_ca_path = "/app/certs/ca.crt"

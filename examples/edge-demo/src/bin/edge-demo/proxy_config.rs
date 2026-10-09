@@ -28,8 +28,9 @@ pub fn write(pki: &Pki, topo: &Topology, path: &Path) -> anyhow::Result<()> {
     // Top-level keys must come before any [table].
     writeln!(s, "health_interval_secs = {}", topo.health_interval_secs)?;
     writeln!(s, "default_cooldown_secs = {}", topo.default_cooldown_secs)?;
+    writeln!(s, "\n[limits]")?;
     writeln!(s, "tenant_rps = {}", topo.tenant_rps)?;
-    writeln!(s, "\n[tls]")?;
+    writeln!(s, "\n[mtls]")?;
     writeln!(s, "cert_path = {:?}", abs("server.crt")?)?;
     writeln!(s, "key_path = {:?}", abs("server.key")?)?;
     // Every client cert must chain to this CA; nothing else is accepted.
@@ -73,12 +74,16 @@ mod tests {
         };
         let path = dir.path().join("ferryman.toml");
         write(&pki, &topo, &path).unwrap();
-        let cfg: ferryman_edge_core::ConfigToml =
-            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let c = ferryman_edge_core::EdgeConfig::parse(&std::fs::read_to_string(&path).unwrap())
+            .unwrap();
+        assert!(c.deprecations.is_empty(), "{:?}", c.deprecations);
         assert_eq!(
-            ferryman_edge_core::build_table(&cfg).unwrap().rules.len(),
+            ferryman_edge_core::build_table(&c.core)
+                .unwrap()
+                .rules
+                .len(),
             2
         );
-        assert_eq!(cfg.jwt.audience.as_deref(), Some("ferryman-edge"));
+        assert_eq!(c.jwt.audience.as_deref(), Some("ferryman-edge"));
     }
 }

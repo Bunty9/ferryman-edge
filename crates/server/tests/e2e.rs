@@ -28,6 +28,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsConnector;
@@ -259,10 +260,19 @@ struct Harness {
 
 impl Harness {
     async fn new(tenant_rps: u32) -> Self {
-        Self::with_limits(tenant_rps, Limits::default()).await
+        Self::build(tenant_rps, Limits::default(), |t| t).await
     }
 
     async fn with_limits(tenant_rps: u32, limits: Limits) -> Self {
+        Self::build(tenant_rps, limits, |t| t).await
+    }
+
+    /// `tune` adjusts the routing table (its timeouts) before serving.
+    async fn build(
+        tenant_rps: u32,
+        limits: Limits,
+        tune: impl FnOnce(RouteTable) -> RouteTable,
+    ) -> Self {
         install_crypto_provider();
         let certs = TestCerts::generate();
         let upstream_addr = spawn_upstream().await;
@@ -295,7 +305,7 @@ impl Harness {
                 Upstream::new(format!("http://{down_addr}").parse().unwrap(), 30),
             ),
         ]);
-        let table = reload::new_shared(table);
+        let table = reload::new_shared(tune(table));
 
         let client: UpstreamClient =
             Client::builder(TokioExecutor::new()).build(HttpConnector::new());
@@ -956,9 +966,11 @@ async fn configured_body_cap_is_enforced() {
 
 #[tokio::test]
 async fn configured_upstream_timeout_gives_504() {
-    let mut limits = Limits::default();
-    limits.upstream_timeout_secs = 1;
-    let h = Harness::with_limits(0, limits).await;
+    let h = Harness::build(0, Limits::default(), |mut t| {
+        t.upstream_timeout = Duration::from_secs(1);
+        t
+    })
+    .await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let resp = h
         .client()
@@ -989,12 +1001,13 @@ async fn configured_first_request_timeout_closes_silent_client() {
 }
 
 #[tokio::test]
-async fn huge_first_request_timeout_does_not_panic_h1_connections() {
-    // Library callers can pass unvalidated limits; hyper adds the header
-    // read timeout to `now()` without overflow checks.
-    let mut limits = Limits::default();
-    limits.first_request_timeout_secs = u64::MAX;
-    let h = Harness::with_limits(0, limits).await;
+async fn huge_keepalive_timeout_does_not_panic_h1_connections() {
+    // Library callers can pass unvalidated timeouts; hyper adds the header
+    // read timeout to `now()` without overflow checks, so serve_with caps it.
+    let h = Harness::build(0, Limits::default(), |t| {
+        t.with_keepalive_timeout(Duration::MAX)
+    })
+    .await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let resp = h
         .client_http1_only()
@@ -1082,4 +1095,86 @@ async fn tls12_clients_still_handshake() {
         tls.get_ref().1.protocol_version(),
         Some(rustls::ProtocolVersion::TLSv1_2)
     );
+}
+
+#[tokio::test]
+async fn huge_first_request_timeout_does_not_panic_h1_connections() {
+    let mut limits = Limits::default();
+    limits.first_request_timeout_secs = u64::MAX;
+    let h = Harness::with_limits(0, limits).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let resp = h
+        .client_http1_only()
+        .get(h.url("/svc-a/hello"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("h1 connection task survived");
+    assert_eq!(resp.status(), 200);
+}
+
+/// `keepalive_timeout_secs` (ferryman-core's name) closes an idle HTTP/1
+/// keep-alive connection; 0.1.x tied this to `first_request_timeout_secs`.
+#[tokio::test]
+async fn keepalive_timeout_closes_idle_h1_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(0, Limits::default(), |t| {
+        t.with_keepalive_timeout(Duration::from_secs(1))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "GET /svc-a/ka HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 0, "closed before the response");
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert!(
+        got.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&got)
+    );
+    let idle = std::time::Instant::now();
+    let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
+        .await
+        .expect("idle keep-alive connection closed within 5 s")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF");
+    assert!(idle.elapsed() < Duration::from_secs(4));
+}
+
+/// The whole-upload deadline comes from the routing table
+/// (`request_body_timeout_secs`). Collected mode only: under `boxed_body`
+/// the body streams, so this deadline never fires.
+#[cfg(not(feature = "boxed_body"))]
+#[tokio::test]
+async fn configured_request_body_timeout_gives_408() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(0, Limits::default(), |t| {
+        t.with_request_body_timeout(Duration::from_secs(1))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /svc-a/slow-upload HTTP/1.1\r\nhost: localhost\r\n\
+         authorization: Bearer {token}\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    // ... and never finish the body.
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
+        .await
+        .expect("408 within 5 s")
+        .unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    assert!(head.starts_with("HTTP/1.1 408"), "{head}");
 }
