@@ -35,14 +35,19 @@ jobs:
       - name: Format
         run: . "$HOME/.cargo/env" && cargo fmt --all -- --check
       - name: TLS provider is ring
-        # Dependency-graph gate: aws-lc must not be in the normal build graph
-        # of the published crates or the examples; ring must be.
+        # Dependency-graph gate: aws-lc must not be in the normal or dev graph
+        # of the published crates or the examples (deny.toml ban scope); ring must be.
         run: |
           . "$HOME/.cargo/env"
           for p in ferryman-edge ferryman-edge-core ferryman-edge-demo ferryman-edge-embed-example; do
-            if cargo tree --locked -e normal -p "$p" -i aws-lc-rs 2>/dev/null | grep -q .; then
-              echo "aws-lc-rs is in the normal dependency graph of $p"; exit 1
-            fi
+            # The graph must resolve at all, or the check below proves nothing.
+            cargo tree --locked -p "$p" -e normal,dev > /dev/null
+            out=$(cargo tree --locked -p "$p" -e normal,dev -i aws-lc-rs 2>&1) && {
+              echo "aws-lc-rs is in the dependency graph of $p:"; echo "$out"; exit 1; }
+            case "$out" in
+              *"did not match any packages"*) ;;
+              *) echo "unexpected cargo tree failure for $p:"; echo "$out"; exit 1 ;;
+            esac
           done
           cargo tree --locked -e normal -p ferryman-edge -i ring | grep -q '^ring '
       - name: Clippy

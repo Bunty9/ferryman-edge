@@ -67,7 +67,7 @@ Cloudflare Pingora team to reply.
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |
 | Observability         | `tracing` + `metrics-exporter-prometheus` 0.16            |
 | CLI                   | `clap` 4                                                  |
-| Container build       | `cargo-chef` multi-stage; **distroless** final (scratch is possible with ring + musl; not done yet) |
+| Container build       | `cargo-chef` multi-stage; **distroless** final (a `scratch` image on ring + musl is planned for this release, not done yet) |
 | Deploy                | Fly.io 2-region (`sin` + `iad`)                           |
 | CI                    | GHA (stable + beta) + `cargo-deny` + `cargo-nextest` + criterion (non-blocking) + mTLS smoke |
 
@@ -226,12 +226,13 @@ surfaces atomically from the operator's perspective.
 * **Pure-Rust audit story.** rustls with ring keeps the TLS stack in
   Rust plus ring's small, audited assembly.
 * **Static builds.** ring cross-compiles to musl with only `musl-gcc`,
-  so the release binaries are static and the image is `scratch`.
-  aws-lc-rs needed a C toolchain (and CMake on some targets) per target
-  and kept the image on glibc/distroless.
+  which makes static binaries and a `scratch` image possible (planned
+  for this release, not done yet). aws-lc-rs needs a C toolchain (and
+  CMake on some targets) per target and keeps the image on
+  glibc/distroless.
 * **Cost.** No FIPS build and no post-quantum `X25519MLKEM768` key
   exchange by default (rustls offers it only with aws-lc-rs). An opt-in
-  `tls-aws-lc` feature will be added if someone needs either.
+  `tls-aws-lc` feature may be added on request.
 
 ## Benchmarks
 
