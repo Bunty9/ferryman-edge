@@ -53,7 +53,10 @@ SIGUSR1 reloads.
 ## Invariants — keep these when changing the request path
 
 - Hop-by-hop headers are stripped in `lib.rs` *before* `x-ferryman-tenant`
-  is stamped; otherwise `Connection: x-ferryman-tenant` deletes it.
+  is stamped; otherwise `Connection: x-ferryman-tenant` deletes it. Right
+  after that strip, `proxy::strip_noncanonical_asserted` drops
+  non-canonical spellings of the headers in `PROXY_ASSERTED_HEADERS` (for
+  every peer); keep a header there whenever the proxy starts asserting it.
 - Order in `proxy::handle_checked` (called by `handle` and `handle_with`):
   `bad_path` → `ambiguous_route` (both 400 bad path, both from
   `ferryman_core::path`, both on the raw path; `ambiguous_route` relies on
@@ -94,7 +97,8 @@ SIGUSR1 reloads.
   `Upstream::release`. Never release for an upstream timeout or error, and
   never call `record_*` on an `Upstream` directly in the request path,
   except `WatchedBody`'s one `record_failure(Admission::Normal)` for a
-  body error after the head.
+  body error after the head (skipped when the head already counted as a
+  failure: one request, one failure).
 - Bodies stream; nothing is buffered.
 - Pass `RouteTable::lookup` the raw path (core normalises it for matching
   only) and forward the raw path. `lookup` ignores breaker state and never

@@ -301,8 +301,8 @@ async fn spawn_sse_upstream() -> SocketAddr {
     addr
 }
 
-/// Answers 200 with a chunked body, then closes without the terminating
-/// chunk: a body error after a healthy head.
+/// Answers 200 (502 for `/trunc/bad`) with a chunked body, then closes
+/// without the terminating chunk: a body error after the head.
 async fn spawn_truncating_upstream() -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -314,12 +314,14 @@ async fn spawn_truncating_upstream() -> SocketAddr {
             };
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
-                    )
-                    .await;
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let bad = buf[..n].windows(11).any(|w| w == b" /trunc/bad");
+                let head: &[u8] = if bad {
+                    b"HTTP/1.1 502 Bad Gateway\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                };
+                let _ = stream.write_all(head).await;
                 let _ = stream.shutdown().await;
             });
         }
@@ -2434,4 +2436,29 @@ async fn non_canonical_proxy_header_spellings_are_stripped_e2e() {
     assert!(rest.contains("x-echo-tenant: tenant-a\r\n"), "{rest}");
     assert!(!rest.contains("victim"), "only the real tenant: {rest}");
     assert!(rest.contains("x-echo-xff: 127.0.0.1\r\n"), "{rest}");
+}
+
+/// A 502 head counts as one failure; its broken body must not add a second.
+/// Two such requests stay under the threshold of 3; a third opens it.
+#[tokio::test]
+async fn failed_head_with_a_broken_body_counts_once() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for i in 1..=3 {
+        let resp = h
+            .client()
+            .get(h.url("/trunc/bad"))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502, "request {i}");
+        assert!(resp.bytes().await.is_err(), "request {i}: body must error");
+        let want = if i < 3 {
+            CircuitState::Closed
+        } else {
+            CircuitState::Open
+        };
+        assert_eq!(h.circuit("/trunc"), want, "after request {i}");
+    }
 }

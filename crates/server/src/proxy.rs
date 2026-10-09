@@ -547,6 +547,8 @@ struct WatchedBody {
     inner: Incoming,
     upstream: Upstream,
     request: Arc<BodyState>,
+    /// This request already counted one failure (its head, or an earlier
+    /// body error); never count another.
     failed: bool,
     /// When the head or the last frame was handed on and not yet followed
     /// by another poll.
@@ -841,11 +843,15 @@ pub(crate) async fn handle_checked(
     // 500 is one request's bug and must not blackhole the route. A gateway
     // answering 502–504 after the client stalled its upload is passing on
     // its backend's reaction to that stall: no verdict (and never success).
+    // A head that already counted as a failure must not count again if its
+    // body then breaks: one request, one failure.
+    let mut head_failed = false;
     if matches!(status.as_u16(), 502..=504) {
         if client_state.stalled_during_request() {
             ticket.release();
         } else {
             ticket.failure();
+            head_failed = true;
         }
     } else {
         ticket.success();
@@ -855,7 +861,7 @@ pub(crate) async fn handle_checked(
         inner: resp_body,
         upstream: upstream.clone(),
         request: client_state,
-        failed: false,
+        failed: head_failed,
         // The gap between the head and the first body poll counts too.
         ready_at: Some(tokio::time::Instant::now()),
         client_stalled_reading: false,

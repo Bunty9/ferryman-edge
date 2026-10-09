@@ -7,6 +7,11 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+### Security
+- Strip non-canonical spellings of proxy-asserted headers (forwarding
+  headers, `x-real-ip`, `x-ferryman-tenant`) from client requests, so only
+  the values the proxy sets reach the upstream.
+
 ### Changed (breaking)
 - Docker image: a static musl binary in `scratch` running as `65532:65532`
   (was distroless/cc as root). Migration: mounted certs, keys and config
@@ -131,6 +136,8 @@ Both crates share one version. Format follows
   `ferryman-edge-server --version`.
 
 ### Fixed
+- A 502–504 response whose body then breaks counts once against the
+  breaker, not twice.
 - One 502 no longer blackholes a route for a whole cooldown (breaker
   threshold 1 → 3).
 - Upstreams without a `/health` route (most third-party apps) no longer
