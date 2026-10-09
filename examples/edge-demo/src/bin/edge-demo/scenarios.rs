@@ -543,7 +543,7 @@ async fn routing(d: &mut Demo) -> anyhow::Result<()> {
 // 5 ---------------------------------------------------------------------
 
 async fn bodies(d: &mut Demo) -> anyhow::Result<()> {
-    d.scenario("Bodies: forwarded intact up to 8 MiB, refused beyond");
+    d.scenario("Bodies: streamed both ways, no size cap by default");
     let sub = "tenant-bodies";
     let edge = d.edge.clone();
     let token = edge.token(sub)?;
@@ -569,6 +569,7 @@ async fn bodies(d: &mut Demo) -> anyhow::Result<()> {
     for (name, len, json) in [
         ("64 KiB JSON", 64 << 10, true),
         ("6 MiB binary", 6 << 20, false),
+        ("9 MiB binary", 9 << 20, false),
     ] {
         let resp = post(len, json).await?;
         let status = resp.status().as_u16();
@@ -579,8 +580,6 @@ async fn bodies(d: &mut Demo) -> anyhow::Result<()> {
             format!("{status}, backend counted {}", e.body_bytes),
         );
     }
-    let status = post(9 << 20, false).await?.status().as_u16();
-    d.check_status("9 MiB upload is refused before routing", status, 413);
     Ok(())
 }
 

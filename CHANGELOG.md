@@ -20,8 +20,7 @@ Both crates share one version. Format follows
 - Config: `upstream_timeout_secs` and `request_body_timeout_secs` move from
   `[limits]` to the top level (ferryman-core names; old spellings load with
   a warning), joined by `keepalive_timeout_secs` (default 10 s) and
-  `request_body_idle_timeout_secs` (default 30 s; accepted and validated, not
-  enforced yet). The top-level timeouts reload on SIGUSR1,
+  `request_body_idle_timeout_secs` (default 30 s). The top-level timeouts reload on SIGUSR1,
   except `keepalive_timeout_secs`.
 - Config: unknown keys are rejected in every table (0.1.x ignored them, so
   a typo silently kept a default). Migration: fix or remove the key the
@@ -36,6 +35,20 @@ Both crates share one version. Format follows
   `build_table(&ConfigToml)`; `Limits` loses `upstream_timeout_secs` /
   `request_body_timeout_secs` and gains `tenant_rps`; `RouteTable` gains
   `upstream_timeout` and timeout getters named like ferryman-core 0.3.
+- Bodies always stream: the buffering (default) mode and the `boxed_body`
+  feature are removed. `proxy::Body` is `BoxBody<Bytes, BoxErr>` and
+  `UpstreamClient` is `Client<HttpConnector, proxy::RequestBody>`.
+- No request-body cap by default (was 8 MiB). `[limits]
+  max_request_body_bytes` is optional and has no upper bound; when set,
+  over-cap uploads get 413. Migration: set it to keep a cap.
+- `upstream_timeout_secs` runs from the end of the upload to the response
+  head only; the response body has no deadline. Uploads have their own
+  idle (30 s) and total deadlines and get 408. The total default
+  (`request_body_timeout_secs`) rises from 30 s to 300 s.
+
+### Fixed
+- A long or slow streamed response (SSE, LLM, download) is no longer cut
+  at 30 s and no longer opens the route's breaker for every tenant.
 
 ### Changed
 - `metrics-exporter-prometheus` without its push-gateway client;

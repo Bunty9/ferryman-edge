@@ -76,11 +76,8 @@ jobs:
           [ -s release-notes.md ] || {
             echo "::error::CHANGELOG section for $version is empty"; exit 1; }
 
-      - name: Tests (both body modes)
-        run: |
-          set -euo pipefail
-          cargo test --workspace --locked
-          cargo test --workspace --locked --features ferryman-edge/boxed_body
+      - name: Tests
+        run: cargo test --workspace --locked
 
       # Packages and builds each crate in isolation (server resolved against
       # core through a temporary registry), like `cargo publish --dry-run`.

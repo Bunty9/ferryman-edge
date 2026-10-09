@@ -22,15 +22,6 @@ path = "src/lib.rs"
 name = "ferryman-edge-server"
 path = "src/main.rs"
 
-[features]
-# Default: collect the inbound body once, forward as `Full<Bytes>`. Lower
-# code complexity and faster for typical JSON payloads under ~256 KB.
-default = []
-# Streaming body forwarding via `BoxBody`. Lower steady-state allocations
-# for large payloads at the cost of code complexity and per-frame overhead.
-# See README "Design tradeoffs" for measurements.
-boxed_body = []
-
 [dependencies]
 ferryman-edge-core = { path = "../core", version = "0.1.2" }
 tokio = { workspace = true }
@@ -56,3 +47,4 @@ jsonwebtoken = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-manual-roots", "http2"] }
 rcgen = { workspace = true }
 tempfile = "3"
+http-body-util = { workspace = true, features = ["channel"] }

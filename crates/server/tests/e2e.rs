@@ -1,6 +1,5 @@
 //! End-to-end test: real TLS handshake, real mTLS + JWT + rate-limit
-//! middleware, real upstream over HTTP/1 and HTTP/2. Runs once under the
-//! default (`collected`) body path and once under `--features boxed_body`.
+//! middleware, real upstream over HTTP/1 and HTTP/2.
 //!
 //! Certs are generated in-process with `rcgen` (CA -> server leaf, CA ->
 //! trusted client leaf, a second untrusted CA -> client leaf) and written to
@@ -13,6 +12,7 @@ use ferryman_edge_core::{
     build_limiter, Claims, JwtVerifier, Limits, ReloadingTls, RouteTable, Upstream,
 };
 use http::{Request, Response};
+use http_body_util::channel::Channel;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -180,6 +180,17 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
             .body(Full::new(Bytes::new()))
             .unwrap());
     }
+    if req.uri().path().starts_with("/svc-a/count") {
+        // Counts the body frame by frame, so a large upload never sits in memory.
+        let mut body = req.into_body();
+        let mut n = 0usize;
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame.unwrap().into_data() {
+                n += data.len();
+            }
+        }
+        return Ok(Response::new(Full::new(Bytes::from(n.to_string()))));
+    }
     let method = req.method().to_string();
     let path = req
         .uri()
@@ -220,6 +231,48 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .unwrap())
 }
 
+/// Streams `data: 0` .. `data: 5`, 500 ms apart (about 2.5 s), like a slow
+/// SSE/LLM response. Stops when the reader goes away.
+async fn sse_handler(_req: Request<Incoming>) -> Result<Response<Channel<Bytes>>, Infallible> {
+    let (mut tx, body) = Channel::<Bytes>::new(1);
+    tokio::spawn(async move {
+        for i in 0..6 {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            if tx
+                .send_data(Bytes::from(format!("data: {i}\n\n")))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    Ok(Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(body)
+        .unwrap())
+}
+
+async fn spawn_sse_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service_fn(sse_handler))
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
 async fn spawn_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -256,6 +309,8 @@ struct Harness {
     proxy_addr: SocketAddr,
     tls: Arc<ReloadingTls>,
     jwt: Arc<JwtVerifier>,
+    /// Shares breaker state with the `/flap` route.
+    flap: Upstream,
 }
 
 impl Harness {
@@ -276,6 +331,7 @@ impl Harness {
         install_crypto_provider();
         let certs = TestCerts::generate();
         let upstream_addr = spawn_upstream().await;
+        let sse_addr = spawn_sse_upstream().await;
         let down_addr = closed_port();
 
         let tls = ReloadingTls::new(
@@ -287,7 +343,9 @@ impl Harness {
         let jwt = Arc::new(JwtVerifier::new(JWT_PUB_PEM).unwrap());
         let limiter = build_limiter(tenant_rps);
 
+        let flap = Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 2);
         let table = RouteTable::new(vec![
+            ("/flap".to_string(), flap.clone()),
             (
                 "/svc-a".to_string(),
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
@@ -295,6 +353,10 @@ impl Harness {
             (
                 "/slow".to_string(),
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/sse".to_string(),
+                Upstream::new(format!("http://{sse_addr}").parse().unwrap(), 30),
             ),
             (
                 "/probe".to_string(),
@@ -328,6 +390,7 @@ impl Harness {
             proxy_addr,
             tls,
             jwt,
+            flap,
         }
     }
 
@@ -634,7 +697,7 @@ async fn rate_limit_is_enforced_per_tenant() {
 // ----- (f) routing + body-size limits ---------------------------------------
 
 #[tokio::test]
-async fn unknown_route_and_body_size_limit() {
+async fn unknown_route_is_404_and_bodies_pass_whole() {
     let h = Harness::new(0).await;
     let client = h.client();
     let token = mint_jwt("tenant-a", 3600, "read");
@@ -662,11 +725,12 @@ async fn unknown_route_and_body_size_limit() {
     let resp_big = client
         .post(h.url("/svc-a/echo"))
         .header("authorization", format!("Bearer {token}"))
-        .body(big)
+        .body(big.clone())
         .send()
         .await
         .unwrap();
-    assert_eq!(resp_big.status(), 413);
+    assert_eq!(resp_big.status(), 200, "no cap by default");
+    assert_eq!(resp_big.bytes().await.unwrap().len(), big.len());
 }
 
 // ----- (g) upstream down: breaker trips -------------------------------------
@@ -678,7 +742,9 @@ async fn unknown_route_and_body_size_limit() {
 async fn oversized_chunked_upload_is_413_and_does_not_trip_breaker() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::new(0).await;
+    let mut limits = Limits::default();
+    limits.max_request_body_bytes = Some(8 * 1024 * 1024);
+    let h = Harness::with_limits(0, limits).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let tls = tls_connect(h.proxy_addr, &h.certs).await;
     let (mut rd, mut wr) = tokio::io::split(tls);
@@ -949,7 +1015,7 @@ async fn jwt_key_reload_rotates_the_accepted_key() {
 #[tokio::test]
 async fn configured_body_cap_is_enforced() {
     let mut limits = Limits::default();
-    limits.max_request_body_bytes = 1024;
+    limits.max_request_body_bytes = Some(1024);
     let h = Harness::with_limits(0, limits).await;
     let client = h.client();
     let token = mint_jwt("tenant-a", 3600, "read");
@@ -1024,7 +1090,7 @@ async fn configured_cap_applies_to_chunked_uploads() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut limits = Limits::default();
-    limits.max_request_body_bytes = 1024;
+    limits.max_request_body_bytes = Some(1024);
     let h = Harness::with_limits(0, limits).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let tls = tls_connect(h.proxy_addr, &h.certs).await;
@@ -1151,9 +1217,7 @@ async fn keepalive_timeout_closes_idle_h1_connection() {
 }
 
 /// The whole-upload deadline comes from the routing table
-/// (`request_body_timeout_secs`). Collected mode only: under `boxed_body`
-/// the body streams, so this deadline never fires.
-#[cfg(not(feature = "boxed_body"))]
+/// (`request_body_timeout_secs`).
 #[tokio::test]
 async fn configured_request_body_timeout_gives_408() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1177,4 +1241,206 @@ async fn configured_request_body_timeout_gives_408() {
         .unwrap();
     let head = String::from_utf8_lossy(&buf[..n]);
     assert!(head.starts_with("HTTP/1.1 408"), "{head}");
+}
+
+/// A streamed response longer than `upstream_timeout` is neither cut nor
+/// blamed on the upstream: the deadline ends at the response head.
+#[tokio::test]
+async fn sse_outlives_the_upstream_timeout_and_keeps_the_breaker_closed() {
+    let h = Harness::build(0, Limits::default(), |mut t| {
+        t.upstream_timeout = Duration::from_secs(1);
+        t
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let get = |p: &str| {
+        h.client()
+            .get(h.url(p))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    let started = std::time::Instant::now();
+    let resp = get("/sse/events").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("data: 5"), "stream was cut: {body:?}");
+    assert!(started.elapsed() >= Duration::from_millis(2400));
+    assert_eq!(
+        get("/sse/again").await.unwrap().status(),
+        200,
+        "breaker must stay closed"
+    );
+}
+
+/// No body cap by default: a 50 MiB upload streams through whole (exit
+/// criterion 8).
+#[tokio::test]
+async fn fifty_mib_upload_streams_with_no_default_cap() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let resp = h
+        .client()
+        .post(h.url("/svc-a/count"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(vec![b'u'; 50 << 20])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), (50usize << 20).to_string());
+}
+
+/// A client that stalls its upload gets 408 from the body's own idle
+/// deadline, and the breaker never hears about it.
+#[tokio::test]
+async fn stalled_upload_is_408_and_does_not_trip_the_breaker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(0, Limits::default(), |t| {
+        t.with_request_body_idle_timeout(Duration::from_secs(1))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /svc-a/upload HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
+        .await
+        .expect("proxy answered the stalled upload")
+        .unwrap();
+    let line = String::from_utf8_lossy(&buf[..n]);
+    assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/after"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
+}
+
+#[tokio::test]
+async fn client_hanging_up_mid_upload_does_not_trip_the_breaker() {
+    use tokio::io::AsyncWriteExt;
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /svc-a/upload HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(tls);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let resp = h
+        .client()
+        .get(h.url("/svc-a/after"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
+}
+
+#[tokio::test]
+async fn client_hanging_up_mid_stream_does_not_trip_the_breaker() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let get = |p: &str| {
+        h.client()
+            .get(h.url(p))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    let mut resp = get("/sse/x").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let first = resp.chunk().await.unwrap().expect("first event");
+    assert!(first.starts_with(b"data: 0"), "{first:?}");
+    drop(resp);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        get("/sse/again").await.unwrap().status(),
+        200,
+        "breaker must stay closed"
+    );
+}
+
+/// An upload slower than `upstream_timeout` is fine as long as the client
+/// keeps sending (ROADMAP F4): the deadline starts at end-of-body.
+#[tokio::test]
+async fn upstream_timeout_starts_after_upload_regression() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(0, Limits::default(), |mut t| {
+        t.upstream_timeout = Duration::from_secs(1);
+        t
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let head = format!(
+        "POST /svc-a/count HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+    );
+    tls.write_all(head.as_bytes()).await.unwrap();
+    for _ in 0..4 {
+        tls.write_all(b"4\r\nabcd\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    tls.write_all(b"0\r\n\r\n").await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut out))
+        .await
+        .expect("answered")
+        .unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.ends_with("16"), "{text}");
+}
+
+/// A client that takes the half-open probe and aborts its upload must neither
+/// close the breaker (an abort is not a success) nor wedge it: the unreported
+/// probe is re-armed after one cooldown and a good request then closes it.
+#[tokio::test]
+async fn aborted_half_open_probe_neither_closes_nor_wedges_the_breaker() {
+    use tokio::io::AsyncWriteExt;
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let get = || {
+        h.client()
+            .get(h.url("/flap/x"))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    h.flap.mark_failed();
+    assert_eq!(get().await.unwrap().status(), 503, "open within cooldown");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+
+    // Cooldown over: this upload is admitted as the probe, then abandoned.
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /flap/upload HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(tls);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        get().await.unwrap().status(),
+        503,
+        "abort must not close the breaker"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(get().await.unwrap().status(), 200, "stale probe re-armed");
+    assert_eq!(get().await.unwrap().status(), 200, "breaker closed");
 }

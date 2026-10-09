@@ -13,16 +13,13 @@ cargo lives in `~/.cargo/bin` (not on the default PATH in some shells).
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features ferryman-edge/boxed_body -- -D warnings
 cargo test --workspace
-cargo test --workspace --features ferryman-edge/boxed_body
 cargo deny check
 cargo bench -p ferryman-edge-core --bench jwt_verify
 ```
 
 CI runs all of these (nextest instead of `cargo test`) plus an mTLS smoke
-job. Always check both feature sets: `boxed_body` changes the body type and
-the error paths in `crates/server/src/proxy.rs`.
+job.
 
 Manual end-to-end: `scripts/gen-test-certs.sh`, run the server with
 `config.toml`, serve an upstream on :8001 that answers `/health`, then
@@ -40,8 +37,7 @@ SIGUSR1 reloads.
   SIGUSR1 route + JWT key reload; `main.rs` — boot only.
 - `examples/edge-demo` (`ferryman-edge-demo`, publish = false): `backend`
   sample upstream + `edge-demo` driver (`setup` | `token` | `run`). `run`
-  spawns the real proxy binary and checks every feature; CI runs it for
-  both body modes. `examples/embed-core`: ferryman-edge-core in an axum
+  spawns the real proxy binary and checks every feature; CI runs it. `examples/embed-core`: ferryman-edge-core in an axum
   service. Behaviour changes to the request path must keep
   `cargo build -p ferryman-edge -p ferryman-edge-demo && target/debug/edge-demo run`
   green; update its scenarios and README when behaviour changes.
@@ -59,13 +55,21 @@ SIGUSR1 reloads.
   back would leak the half-open probe slot). `Upgrade` is stripped as
   hop-by-hop, so `lib.rs` computes `proxy::wants_upgrade` before stripping
   and passes it to `handle_checked`; `h2c` is exempt.
-- Only upstream-caused failures may call `Upstream::mark_failed`: transport
-  errors, 502–504, response-body errors, and timeouts after the upload
-  finished. Client-side failures (body cap, disconnect, slow upload, 408)
-  must not, or any tenant can open a route's breaker for everyone.
-- The client body is read (under its own deadline) before
-  `RouteTable::lookup`, because lookup may admit the request as the
-  breaker's single half-open probe, and that probe must report back.
+- Only upstream-caused failures may count against the breaker: transport
+  errors, 502–504 response heads, and the upstream timer (which fires only
+  after the upload finished, or when hyper stopped reading the body while
+  the client was not stalling). Client-side failures (body cap 413,
+  idle/total upload deadline 408, disconnect 400) and anything that happens
+  after the response head (a long or broken response body) must not, or any
+  tenant can open a route's breaker for everyone. They must not call
+  `mark_success` either, or a client could close an open breaker by
+  aborting an upload.
+- Bodies stream; nothing is buffered. Every rejection that needs no
+  upstream (400 bad path, 501 upgrade, 413 declared Content-Length, 404)
+  happens before `RouteTable::lookup`, because lookup may admit the request
+  as the breaker's single half-open probe. A probe that then fails on the
+  client's side reports nothing; the breaker re-arms a stale probe after
+  one cooldown.
 - `lookup` never falls through to a shorter prefix when the matching
   upstream isn't routable; it returns `None` (503).
 - Outbound requests are downgraded to HTTP/1.1; hyper-util rejects

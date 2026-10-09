@@ -25,7 +25,7 @@ any fails (about 5 seconds):
    JWT `sub` (client-supplied values are discarded), the peer IP in
    `x-forwarded-for`, and `x-forwarded-proto: https`.
 4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected; a WebSocket upgrade is 501.
-5. **Bodies**: 6 MiB passes intact, 9 MiB is 413.
+5. **Bodies**: 6 MiB and 9 MiB pass intact (no size cap by default).
 6. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.
 7. **Circuit breaker + health checks**: kill a backend, watch 503 and the
    `ferryman_circuit_state` gauge, restart it, watch recovery.
@@ -105,7 +105,7 @@ edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/ordersX
 edge --path-as-is -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/orders/../inventory
 edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" -H 'Upgrade: websocket' -H 'Connection: Upgrade' $P/orders/ws
 
-# 5. bodies: 9 MiB is refused with 413
+# 5. bodies: 9 MiB passes (no size cap by default)
 head -c 9437184 /dev/zero | edge -o /dev/null -w '%{http_code}\n' -X POST --data-binary @- \
   -H "$AUTH" $P/orders/upload
 
@@ -205,15 +205,3 @@ material, routes and the JWT key.
 - **Tuning**: `[limits] tenant_rps`, `health_interval_secs`, `default_cooldown_secs` and
   per-route `cooldown_secs` are in the config; the full reference is in
   [docs/operations.md](https://github.com/Bunty9/ferryman-edge/blob/main/docs/operations.md).
-
-## Streaming mode
-
-By default the proxy buffers request bodies (fast for typical JSON). Build it
-with `--features ferryman-edge/boxed_body` for streaming forwarding; the demo
-passes unchanged:
-
-```bash
-examples/edge-demo/run.sh --features ferryman-edge/boxed_body
-```
-
-The trade-offs are in the [main README](https://github.com/Bunty9/ferryman-edge/blob/main/README.md).

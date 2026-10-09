@@ -17,7 +17,6 @@ use std::time::Duration;
 
 /// Upper bound for every duration key, so `Duration` arithmetic can't overflow.
 const MAX_SECS: u64 = 86_400;
-const MAX_BODY: u64 = 1 << 30;
 
 /// The whole config file.
 #[derive(Debug, Clone)]
@@ -78,9 +77,8 @@ fn default_keepalive() -> u64 {
 fn default_body_idle() -> u64 {
     30
 }
-// Stays 30 until the idle-gap deadline is enforced (Task 3 raises it to 300).
 fn default_body_total() -> u64 {
-    30
+    300
 }
 
 /// One `[[routes]]` entry.
@@ -134,8 +132,8 @@ pub struct JwtToml {
 #[non_exhaustive]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
-    /// Max client request body, bytes (<= 1 GiB).
-    pub max_request_body_bytes: u64,
+    /// Max client request body, bytes. `None` (default) = no cap; over-cap uploads get 413.
+    pub max_request_body_bytes: Option<u64>,
     /// TLS handshake deadline.
     pub tls_handshake_timeout_secs: u64,
     /// Deadline for the first request on a connection.
@@ -151,7 +149,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_request_body_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: None,
             tls_handshake_timeout_secs: 10,
             first_request_timeout_secs: 10,
             h2_max_concurrent_streams: 64,
@@ -180,8 +178,8 @@ impl Limits {
             );
         }
         ensure!(
-            (1..=MAX_BODY).contains(&self.max_request_body_bytes),
-            "limits.max_request_body_bytes must be between 1 and {MAX_BODY}"
+            self.max_request_body_bytes != Some(0),
+            "limits.max_request_body_bytes must be at least 1 (omit it for no cap)"
         );
         ensure!(
             self.h2_max_concurrent_streams > 0,
@@ -375,7 +373,7 @@ health_path = "/ready"
         let c = EdgeConfig::parse(V012).unwrap();
         assert_eq!(c.mtls.cert_path, "c");
         assert_eq!(c.limits.tenant_rps, 7);
-        assert_eq!(c.limits.max_request_body_bytes, 1024);
+        assert_eq!(c.limits.max_request_body_bytes, Some(1024));
         assert_eq!(c.core.upstream_timeout_secs, 12);
         assert_eq!(c.core.request_body_timeout_secs, 40);
         assert_eq!(c.deprecations.len(), 4, "{:?}", c.deprecations);
@@ -427,7 +425,7 @@ health_path = "/ready"
                 k.request_body_idle_timeout_secs,
                 k.request_body_timeout_secs
             ),
-            (5, 30, 30, 10, 30, 30)
+            (5, 30, 30, 10, 30, 300)
         );
         let l = &c.limits;
         assert_eq!(
@@ -444,7 +442,7 @@ health_path = "/ready"
         assert_eq!(t.upstream_timeout, Duration::from_secs(30));
         assert_eq!(t.keepalive_timeout(), Duration::from_secs(10));
         assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(30));
-        assert_eq!(t.request_body_timeout(), Duration::from_secs(30));
+        assert_eq!(t.request_body_timeout(), Duration::from_secs(300));
     }
 
     #[test]

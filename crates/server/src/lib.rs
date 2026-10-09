@@ -38,7 +38,7 @@ use tokio_rustls::TlsAcceptor;
 /// Shared upstream client. One instance for the whole process; its pool
 /// keeps idle HTTP/1.1 connections to each upstream (outbound is always
 /// HTTP/1.1).
-pub type UpstreamClient = Client<HttpConnector, proxy::Body>;
+pub type UpstreamClient = Client<HttpConnector, proxy::RequestBody>;
 
 /// Everything a connection/request needs, built once at boot.
 pub struct AppState {
@@ -67,12 +67,6 @@ pub async fn serve(
 /// Accept loop. Runs until `shutdown` resolves, then stops accepting new
 /// connections, lets in-flight ones finish (bounded by
 /// `limits.shutdown_drain_secs`), and returns.
-///
-/// Each h2 stream may buffer up to `limits.max_request_body_bytes` in
-/// collected mode, so `h2_max_concurrent_streams` bounds per-connection body
-/// memory.
-// ponytail: per-connection bound only; add a global in-flight-bytes
-// semaphore if many clients trickling large bodies becomes a real threat.
 pub async fn serve_with(
     listener: TcpListener,
     state: Arc<AppState>,

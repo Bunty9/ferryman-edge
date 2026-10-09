@@ -14,8 +14,8 @@ are resolved against the process working directory.
 | `default_cooldown_secs` | `30` | yes (routes) | Breaker cooldown for routes that don't set one. |
 | `upstream_timeout_secs` | `30` | yes | From the end of the client's upload to the upstream's response head; exceeded gets 504. (0.1.x: `[limits] upstream_timeout_secs`, still loads with a warning.) |
 | `keepalive_timeout_secs` | `10` | no | HTTP/1 keep-alive idle timeout; also bounds header reads of later requests, and the first request on HTTP/1 is cut off at the smaller of this and `first_request_timeout_secs`. Behind an ALB use ALB idle + 15 s. If you raised `first_request_timeout_secs` in 0.1.x, set this to the same value. |
-| `request_body_idle_timeout_secs` | `30` | yes | Longest gap between request-body frames. Accepted and validated; not enforced yet (the whole-upload limit below applies). |
-| `request_body_timeout_secs` | `30` | yes | Whole upload; exceeded gets 408. Collected (default) mode only; under `boxed_body` the upload runs inside `upstream_timeout_secs`. (0.1.x: `[limits] request_body_timeout_secs`, still loads with a warning.) |
+| `request_body_idle_timeout_secs` | `30` | yes | Longest gap between request-body frames; exceeded gets 408. |
+| `request_body_timeout_secs` | `300` | yes | Whole upload; exceeded gets 408. (0.1.x: `[limits] request_body_timeout_secs`, still loads with a warning.) |
 | `[mtls] cert_path` (0.1.x name `[tls]` still loads, with a warning) | — | yes (contents) | Server certificate chain, PEM (leaf first, then intermediates). |
 | `[mtls] key_path` | — | yes (contents) | Server private key, PEM (PKCS#8, PKCS#1 or SEC1). |
 | `[mtls] client_ca_path` | — | yes (contents) | Client CA bundle, PEM. Every client cert must chain to one of these. |
@@ -54,11 +54,11 @@ restart (no log line).
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
-| `max_request_body_bytes` | `8388608` (8 MiB) | 1 to 1073741824 | Largest client request body; larger gets 413. |
+| `max_request_body_bytes` | unset (no cap) | at least 1 | Optional cap on the client request body; over-cap gets 413 (declared length before routing, chunked mid-stream). |
 | `tls_handshake_timeout_secs` | `10` | 1 to 86400 | mTLS handshake deadline. |
 | `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request; on HTTP/1 also capped by `keepalive_timeout_secs` (the smaller applies). |
 | `tenant_rps` | `1000` | 0 to 2^32-1 | Per-tenant GCRA limit keyed by JWT sub; 0 disables. (0.1.x: top level, still loads with a warning.) |
-| `h2_max_concurrent_streams` | `64` | at least 1 | Concurrent h2 streams per connection. In collected mode, per-connection body memory is up to this times `max_request_body_bytes`. |
+| `h2_max_concurrent_streams` | `64` | at least 1 | Concurrent h2 streams per connection. |
 | `shutdown_drain_secs` | `25` | 1 to 86400 | How long in-flight connections get to finish after a shutdown signal. |
 
 Unknown keys in any table are rejected at load.

@@ -48,7 +48,7 @@ Cloudflare Pingora team to reply.
                        v
               +--------+---------+
               | hyper client     |  pool: 1 conn per upstream * N
-              | HTTP/2 multiplex |  feature flag: boxed_body vs collected
+              | HTTP/2 multiplex |
               +--------+---------+
                        |
                        v
@@ -132,9 +132,9 @@ Every request passes the same gates, in order:
 | No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
 | Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
-| Body ≤ 8 MiB (default; `max_request_body_bytes`) | `413` | |
-| Client body read within 30 s by default (collected mode; read before route lookup) | `408` slow client, `400` body error | |
-| Upstream round trip within 30 s by default, counted from when the body is ready (plus the response body in collected mode) | `502` transport/response-body error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
+| Body ≤ `max_request_body_bytes` if set (no cap by default; declared Content-Length checked before routing, chunked bodies mid-stream) | `413` | |
+| Upload: ≤ 30 s between body frames, ≤ 300 s total (`request_body_idle_timeout_secs` / `request_body_timeout_secs`) | `408` slow client, `400` body error | |
+| Upstream response head within 30 s of the end of the upload (`upstream_timeout_secs`); the response body then streams with no deadline | `502` transport error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
 
 On the way through, the proxy strips hop-by-hop headers (both directions,
 including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
@@ -149,9 +149,8 @@ then get keep-alive pings and a 64-stream cap.
 
 Each upstream has a Closed / Open / HalfOpen circuit breaker
 (`ferryman_circuit_state{upstream}`: 0/1/2; `cooldown_secs` must be ≥ 1).
-A transport error, a 502–504, or a timeout opens it — under `boxed_body` a
-timeout only counts if the client had finished uploading; after `cooldown_secs` exactly one request is let through
-as the probe. A plain `500` does not trip it, and neither does a failure
+A transport error, a 502–504, or a timeout opens it; after `cooldown_secs` exactly one request is let through
+as the probe. A response that has started streaming never counts against the breaker, however long it lasts or however it ends. A plain `500` does not trip it, and neither does a failure
 caused by the client's own body (size cap, disconnect). The active health
 checker (`GET <upstream>/health` every `health_interval_secs`; per-route
 `health_path` / `health_disabled` change or skip the probe) opens and
@@ -179,26 +178,16 @@ was minted for.
 
 P4 makes three decisions worth defending in a hiring loop.
 
-### (a) `boxed_body` is off by default
+### (a) Bodies always stream
 
-Cargo feature `boxed_body` swaps the upstream client to
-`http_body_util::BoxBody` and streams request and response bodies. With it
-off, the proxy collects each body once into a `Full<Bytes>` before
-forwarding. Both builds enforce the request body cap (8 MiB by default, configurable via `[limits]`); under streaming, a
-chunked upload with no `Content-Length` that exceeds it is cut mid-stream
-and answered `413`, without counting against the upstream's breaker.
-Streaming mode has no separate body-read deadline: a slow upload runs
-inside the upstream budget (`upstream_timeout_secs`, default 30 s) and ends as `504`.
-
-Estimates from the design spec (not yet measured here): `boxed` adds ~200 µs per request at 10 MB; `collected`
-adds ~80 µs at 1 KB but allocates ~`req_size`. For an internal proxy
-fronting JSON APIs under ~256 KB the collected path wins on code
-complexity, allocator pressure (because the JSON allocator already paid
-the cost), and steady-state latency. Pingora picks streaming for
-general-purpose CDN traffic where payloads skew big and bimodal; that
-calculus inverts for an internal API edge. Flip the feature on (`cargo
-build --features boxed_body`) when your p99 latency tells you the
-collect-first cost dominates.
+Requests and responses stream frame by frame; nothing is buffered. An
+SSE or LLM response, a large download and a 50 MiB upload all pass with
+constant memory. The breaker judges an upstream on its response head:
+the deadline runs from the end of the upload to the head, so a long
+stream is never cut and never opens the circuit. 0.1.x buffered by
+default (the `boxed_body` feature streamed); buffering cut every stream
+at 30 s and opened the breaker for all tenants on a slow body, so it is
+gone.
 
 ### (b) SIGUSR1 reload over filesystem-watch
 
@@ -297,7 +286,7 @@ ferryman-edge/
 ## Roadmap
 
 Phase 1 (scaffold) and Phase 2 (mTLS + JWT + rate limit on the real
-request path, circuit breaker, streaming `boxed_body`, e2e tests) are
+request path, circuit breaker, streaming bodies, e2e tests) are
 done. Open: mTLS-capable throughput numbers against the 50k rps / p99
 targets, and the Fly.io 2-region deploy. See [`PROGRESS.md`](./PROGRESS.md).
 
