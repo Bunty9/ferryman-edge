@@ -27,9 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Spawn the SIGUSR1 reload loop. Routes, their health keys and the four
-/// top-level timeouts reload; `[limits]`, `[mtls]` paths, `[jwt]`
-/// issuer/audience, `health_interval_secs` and `keepalive_timeout_secs` are
-/// boot-only. Returns immediately; the loop runs until process exit.
+/// top-level timeouts reload; `[limits]`, `[jwt]` issuer/audience,
+/// `health_interval_secs` and `keepalive_timeout_secs` are boot-only. The
+/// `[mtls]` / `[jwt]` paths are fixed at boot; file contents are re-read on
+/// SIGUSR1. Returns immediately; the loop runs until process exit.
 pub fn spawn_reload(path: PathBuf, table: SharedTable) {
     tokio::spawn(async move {
         let mut sig =
@@ -84,6 +85,9 @@ pub fn spawn_jwt_reload(pem_path: PathBuf, jwt: Arc<JwtVerifier>) {
 
 fn reload_once(path: &Path) -> anyhow::Result<RouteTable> {
     let cfg = EdgeConfig::parse(&std::fs::read_to_string(path)?)?;
+    for d in &cfg.deprecations {
+        tracing::warn!(config = %path.display(), "{d}");
+    }
     build_table(&cfg.core)
 }
 
@@ -92,4 +96,30 @@ fn reload_once(path: &Path) -> anyhow::Result<RouteTable> {
 #[allow(dead_code)]
 pub fn new_shared(table: RouteTable) -> SharedTable {
     Arc::new(ArcSwap::from_pointee(table))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OK: &str = "[mtls]\ncert_path='c'\nkey_path='k'\nclient_ca_path='a'\n\
+                      [jwt]\njwks_path='j'\n[[routes]]\nprefix='/a'\nupstream='http://h:1'\n";
+
+    #[test]
+    fn malformed_edge_config_fails_reload_and_keeps_old_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, OK).unwrap();
+        let shared = new_shared(reload_once(&path).unwrap());
+        let bad = [
+            format!("{OK}[limits]\nbogus = 1\n"),
+            OK.replace("[mtls]", "[nope]"),
+            format!("{OK}[tls]\ncert_path='c'\nkey_path='k'\nclient_ca_path='a'\n"),
+        ];
+        for raw in bad {
+            std::fs::write(&path, raw).unwrap();
+            assert!(reload_once(&path).is_err());
+            assert_eq!(shared.load().rules.len(), 1);
+        }
+    }
 }

@@ -78,8 +78,9 @@ fn default_keepalive() -> u64 {
 fn default_body_idle() -> u64 {
     30
 }
+// Stays 30 until the idle-gap deadline is enforced (Task 3 raises it to 300).
 fn default_body_total() -> u64 {
-    300
+    30
 }
 
 /// One `[[routes]]` entry.
@@ -243,6 +244,18 @@ impl EdgeConfig {
             .try_into()
             .context("in [limits]")?;
         limits.validate()?;
+        // hyper arms the HTTP/1 header-read timeout from keepalive_timeout_secs
+        // (not first_request_timeout_secs), so a raised first_request value
+        // alone no longer lengthens keep-alive or the first-request window.
+        if !top.contains_key("keepalive_timeout_secs")
+            && limits.first_request_timeout_secs > default_keepalive()
+        {
+            deprecations.push(format!(
+                "[limits] first_request_timeout_secs = {} no longer sets HTTP/1 keep-alive; \
+                 also set top-level keepalive_timeout_secs to the same value",
+                limits.first_request_timeout_secs
+            ));
+        }
         Ok(Self {
             core: toml::Value::Table(top).try_into()?,
             mtls: mtls.try_into().context("in [mtls]")?,
@@ -382,6 +395,26 @@ health_path = "/ready"
     }
 
     #[test]
+    fn raised_first_request_timeout_warns_unless_keepalive_is_set() {
+        let warn = |top: &str, lim: &str| {
+            EdgeConfig::parse(&cfg(top, "", "", lim, ""))
+                .unwrap()
+                .deprecations
+        };
+        let w = warn("", "first_request_timeout_secs = 60");
+        assert!(
+            w.len() == 1 && w[0].contains("keepalive_timeout_secs"),
+            "{w:?}"
+        );
+        assert!(warn(
+            "keepalive_timeout_secs = 60",
+            "first_request_timeout_secs = 60"
+        )
+        .is_empty());
+        assert!(warn("", "first_request_timeout_secs = 10").is_empty());
+    }
+
+    #[test]
     fn defaults_match_ferryman_core() {
         let c = EdgeConfig::parse(&cfg("", "", "", "", "")).unwrap();
         let k = &c.core;
@@ -394,7 +427,7 @@ health_path = "/ready"
                 k.request_body_idle_timeout_secs,
                 k.request_body_timeout_secs
             ),
-            (5, 30, 30, 10, 30, 300)
+            (5, 30, 30, 10, 30, 30)
         );
         let l = &c.limits;
         assert_eq!(
@@ -411,7 +444,7 @@ health_path = "/ready"
         assert_eq!(t.upstream_timeout, Duration::from_secs(30));
         assert_eq!(t.keepalive_timeout(), Duration::from_secs(10));
         assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(30));
-        assert_eq!(t.request_body_timeout(), Duration::from_secs(300));
+        assert_eq!(t.request_body_timeout(), Duration::from_secs(30));
     }
 
     #[test]

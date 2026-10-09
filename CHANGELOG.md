@@ -21,14 +21,16 @@ Both crates share one version. Format follows
   `[limits]` to the top level (ferryman-core names; old spellings load with
   a warning), joined by `keepalive_timeout_secs` (default 10 s) and
   `request_body_idle_timeout_secs` (default 30 s; accepted and validated, not
-  enforced yet). `request_body_timeout_secs`
-  defaults to 300 s (was 30 s). The top-level timeouts reload on SIGUSR1,
+  enforced yet). The top-level timeouts reload on SIGUSR1,
   except `keepalive_timeout_secs`.
 - Config: unknown keys are rejected in every table (0.1.x ignored them, so
   a typo silently kept a default). Migration: fix or remove the key the
   error names.
 - HTTP/1 keep-alive idle timeout is `keepalive_timeout_secs`;
-  `first_request_timeout_secs` now bounds only the first request.
+  `first_request_timeout_secs` now bounds only the first request, and on
+  HTTP/1 the first-request window is the smaller of the two. Migration: if
+  you raised `first_request_timeout_secs`, also set top-level
+  `keepalive_timeout_secs` to the same value (a warning says so at load).
 - Library: `parse_config`, `ConfigExt`, `RouteExt`, `build_table_ext` and
   `TlsToml` are replaced by `EdgeConfig::parse`, `MtlsToml` and
   `build_table(&ConfigToml)`; `Limits` loses `upstream_timeout_secs` /

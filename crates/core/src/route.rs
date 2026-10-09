@@ -170,8 +170,7 @@ fn matches_prefix(path: &str, prefix: &str) -> bool {
 
 /// Routing decisions table. `rules` is sorted DESC by prefix length at
 /// construction time so iteration order is the lookup order. Timeout
-/// names and defaults follow ferryman-core 0.3, and they reload with the
-/// table.
+/// names follow ferryman-core 0.3 (defaults too, except body total).
 pub struct RouteTable {
     pub rules: Vec<(String, Upstream)>,
     /// From the end of the client's upload to the upstream's response head.
@@ -183,7 +182,8 @@ pub struct RouteTable {
 
 impl RouteTable {
     /// Timeouts default to upstream 30 s, keep-alive 10 s, body idle 30 s,
-    /// body total 300 s.
+    /// body total 30 s. The timeouts reload with the table, except keep-alive,
+    /// which `serve_with` reads once at start.
     pub fn new(mut rules: Vec<(String, Upstream)>) -> Self {
         rules.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
         Self {
@@ -191,7 +191,7 @@ impl RouteTable {
             upstream_timeout: Duration::from_secs(30),
             keepalive_timeout: Duration::from_secs(10),
             request_body_idle_timeout: Duration::from_secs(30),
-            request_body_timeout: Duration::from_secs(300),
+            request_body_timeout: Duration::from_secs(30),
         }
     }
 

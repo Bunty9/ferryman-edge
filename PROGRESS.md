@@ -15,8 +15,8 @@
 - [x] `crates/core/src/route.rs` — `Upstream`, `RouteTable`, `SharedTable`
       (verbatim from P2).
 - [x] `crates/core/src/health.rs` — `health_loop` (verbatim from P2).
-- [x] `crates/core/src/config.rs` — extended `ConfigToml` with `TlsToml`,
-      `JwtToml`, `tenant_rps`.
+- [x] `crates/core/src/config.rs` — `EdgeConfig` (0.2.0): `[mtls]` (alias `[tls]`),
+      `[jwt]`, `[limits] tenant_rps` over the core-shaped `ConfigToml`.
 - [x] `crates/core/src/tls.rs` — `build_mtls_config` + `ReloadingTls`
       (SIGUSR1 reload).
 - [x] `crates/core/src/jwt.rs` — `Claims`, `JwtVerifier` with moka LRU.
