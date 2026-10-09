@@ -248,6 +248,8 @@ pub struct RequestBody {
 struct BodyState {
     polled: AtomicBool,
     waiting_on_client: AtomicBool,
+    /// The request body yielded an error (cap, deadline, client broke off).
+    client_failed: AtomicBool,
 }
 
 /// End-of-upload signal for [`upstream_timer`].
@@ -292,6 +294,25 @@ impl hyper::body::Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxErr>>> {
         let this = self.get_mut();
+        let polled = this.poll_inner(cx);
+        if matches!(polled, Poll::Ready(Some(Err(_)))) {
+            this.state.client_failed.store(true, Ordering::Release);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl RequestBody {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxErr>>> {
+        let this = self;
         this.state.polled.store(true, Ordering::Release);
         if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(UploadError::TotalTimeout.into())));
@@ -343,14 +364,6 @@ impl hyper::body::Body for RequestBody {
             }
         }
     }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
 }
 
 /// Completes when the request must fail as an upstream timeout (504).
@@ -389,6 +402,7 @@ async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
 struct WatchedBody {
     inner: Incoming,
     upstream: Upstream,
+    request: Arc<BodyState>,
     failed: bool,
 }
 
@@ -402,9 +416,19 @@ impl hyper::body::Body for WatchedBody {
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         let this = self.get_mut();
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
-        if matches!(polled, Poll::Ready(Some(Err(_)))) && !this.failed {
-            this.failed = true;
-            this.upstream.mark_failed();
+        // The upstream may answer before it has read the whole upload. If the
+        // client then aborts or stalls, hyper tears the connection down and
+        // surfaces a plain "connection error" here, with no trace of the
+        // client's error in its source chain. So besides the head's
+        // classifier, check whether the request body itself failed.
+        if let Poll::Ready(Some(Err(e))) = &polled {
+            if !this.failed
+                && client_fault(e).is_none()
+                && !this.request.client_failed.load(Ordering::Acquire)
+            {
+                this.failed = true;
+                this.upstream.mark_failed();
+            }
         }
         polled
     }
@@ -518,6 +542,7 @@ pub(crate) async fn handle_checked(
         .uri
         .authority()
         .map_or_else(String::new, |a| a.to_string());
+    let client_state = eos.state.clone();
     let fwd = Request::from_parts(parts, body);
     let result = tokio::select! {
         r = client.request(fwd) => Some(r),
@@ -559,6 +584,7 @@ pub(crate) async fn handle_checked(
     let resp_body = WatchedBody {
         inner: resp_body,
         upstream: upstream.clone(),
+        request: client_state,
         failed: false,
     };
     strip_hop_by_hop(&mut resp_parts.headers);

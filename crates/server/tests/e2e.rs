@@ -300,6 +300,42 @@ async fn spawn_truncating_upstream() -> SocketAddr {
     addr
 }
 
+/// Sends the 200 head at once, then echoes the request body back as it
+/// arrives (full duplex). An error on the request body is passed on.
+async fn early_handler(req: Request<Incoming>) -> Result<Response<Channel<Bytes>>, Infallible> {
+    let (mut tx, body) = Channel::<Bytes>::new(1);
+    tokio::spawn(async move {
+        let mut inb = req.into_body();
+        while let Some(frame) = inb.frame().await {
+            let Ok(frame) = frame else { return };
+            if let Ok(data) = frame.into_data() {
+                if tx.send_data(data).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Ok(Response::new(body))
+}
+
+async fn spawn_early_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service_fn(early_handler))
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
 async fn spawn_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -360,6 +396,7 @@ impl Harness {
         let upstream_addr = spawn_upstream().await;
         let sse_addr = spawn_sse_upstream().await;
         let trunc_addr = spawn_truncating_upstream().await;
+        let early_addr = spawn_early_upstream().await;
         let down_addr = closed_port();
 
         let tls = ReloadingTls::new(
@@ -381,6 +418,10 @@ impl Harness {
             (
                 "/slow".to_string(),
                 Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
+            ),
+            (
+                "/early".to_string(),
+                Upstream::new(format!("http://{early_addr}").parse().unwrap(), 30),
             ),
             (
                 "/trunc".to_string(),
@@ -1548,6 +1589,44 @@ async fn trickling_upload_past_the_total_deadline_is_408_and_breaker_stays_close
     let resp = h
         .client()
         .get(h.url("/svc-a/after"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
+}
+
+/// The upstream answers 200 before the upload ends; the client then stalls
+/// its upload. The error that reaches the response body is the client's, so
+/// the breaker must stay closed.
+#[tokio::test]
+async fn client_stalling_after_an_early_upstream_answer_does_not_trip_the_breaker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(0, Limits::default(), |t| {
+        t.with_request_body_idle_timeout(Duration::from_secs(1))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /early/x HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
+        .await
+        .expect("200 head")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    // Stall past the idle gap, then let the proxy finish tearing down.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    drop(tls);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let resp = h
+        .client()
+        .get(h.url("/early/after"))
         .header("authorization", format!("Bearer {token}"))
         .send()
         .await
