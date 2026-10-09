@@ -826,6 +826,7 @@ async fn h2_authority_becomes_the_upstream_host() {
         .client()
         .get(h.url("/svc-a/h2"))
         .header("authorization", format!("Bearer {token}"))
+        .header("X-Forwarded-Host", "evil.example")
         .send()
         .await
         .unwrap();
@@ -834,6 +835,75 @@ async fn h2_authority_becomes_the_upstream_host() {
     let get = |n: &str| resp.headers().get(n).unwrap().to_str().unwrap().to_string();
     assert_eq!(get("x-echo-host"), want);
     assert_eq!(get("x-echo-xfh"), want);
+}
+
+/// Duplicate and mixed-case `x-forwarded-host` headers are all replaced by
+/// one value; an absolute-form target's authority beats the `Host` header;
+/// `Connection: host` cannot delete the Host.
+#[tokio::test]
+async fn forwarded_host_variants_and_absolute_form() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let (s, rest) = raw_get_with(
+        &h,
+        "/svc-a/x",
+        Some(&token),
+        "X-Forwarded-Host: e1.example\r\nx-forwarded-host: e2.example\r\nconnection: host\r\n",
+    )
+    .await;
+    assert!(s.contains(" 200"), "{s}");
+    let rest = rest.to_ascii_lowercase();
+    assert!(rest.contains("x-echo-xfh: localhost\r\n"), "{rest}");
+    assert!(rest.contains("x-echo-host: localhost\r\n"), "{rest}");
+    assert!(
+        !rest.contains("evil") && !rest.contains("e1.example"),
+        "{rest}"
+    );
+
+    let (s, rest) = raw_get(&h, "http://other.example/svc-a/x", Some(&token)).await;
+    assert!(s.contains(" 200"), "{s}");
+    let rest = rest.to_ascii_lowercase();
+    assert!(rest.contains("x-echo-host: other.example\r\n"), "{rest}");
+    assert!(rest.contains("x-echo-xfh: other.example\r\n"), "{rest}");
+}
+
+/// A malformed or repeated `Host` is a 400 before routing.
+#[tokio::test]
+async fn bad_host_headers_are_rejected_and_good_ones_pass() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for bad in ["a.example, b.example", "u@x", "x/y"] {
+        let (s, rest) = raw_host(&h, &token, &[bad]).await;
+        assert!(s.contains(" 400"), "{bad}: {s}");
+        assert!(rest.contains("bad host"), "{bad}: {rest}");
+    }
+    let (s, _) = raw_host(&h, &token, &["a.example", "b.example"]).await;
+    assert!(s.contains(" 400"), "{s}");
+    for ok in ["a.example", "a.example:8443", "[::1]:8443", "UPPER.Example"] {
+        let (s, rest) = raw_host(&h, &token, &[ok]).await;
+        assert!(s.contains(" 200"), "{ok}: {s}");
+        let want = format!("x-echo-host: {}\r\n", ok.to_ascii_lowercase());
+        assert!(rest.to_ascii_lowercase().contains(&want), "{ok}: {rest}");
+    }
+}
+
+async fn raw_host(h: &Harness, token: &str, hosts: &[&str]) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let hs: String = hosts.iter().map(|v| format!("host: {v}\r\n")).collect();
+    let req = format!(
+        "GET /svc-a/x HTTP/1.1\r\n{hs}authorization: Bearer {token}\r\nconnection: close\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tls.read_to_end(&mut buf),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (s, rest) = text.split_once("\r\n").unwrap_or((&text, ""));
+    (s.to_string(), rest.to_string())
 }
 
 /// `rewrite_host = true` restores the 0.1.x behaviour for that route only.

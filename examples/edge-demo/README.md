@@ -23,7 +23,9 @@ any fails (about 5 seconds):
    and wrongly-signed tokens are all 401; a valid one is 200.
 3. **Identity propagation**: the backend sees `x-ferryman-tenant` equal to the
    JWT `sub` (client-supplied values are discarded), the peer IP in
-   `x-forwarded-for`, and `x-forwarded-proto: https`.
+   `x-forwarded-for`, and `x-forwarded-proto: https`. `Host` is the one the
+   client used (h2 `:authority`), and `x-forwarded-host` carries it (a forged
+   one is replaced).
 4. **Routing**: longest prefix on a path-segment boundary; `..` is rejected; a WebSocket upgrade is 501.
 5. **Bodies**: 6 MiB and 9 MiB pass intact (no size cap by default).
 6. **Rate limiting**: per tenant, 6th immediate request is 429 with `retry-after`.

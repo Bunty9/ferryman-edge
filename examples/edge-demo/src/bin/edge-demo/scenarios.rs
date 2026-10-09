@@ -450,6 +450,7 @@ async fn identity(d: &mut Demo) -> anyhow::Result<()> {
         .bearer_auth(d.edge.token(sub)?)
         .header("x-ferryman-tenant", "admin")
         .header("x-forwarded-for", "6.6.6.6")
+        .header("x-forwarded-host", "evil.example")
         .send()
         .await?;
     let e: Echo = resp.json().await?;
@@ -466,7 +467,7 @@ async fn identity(d: &mut Demo) -> anyhow::Result<()> {
     );
     d.check(
         "x-forwarded-host carries the same host",
-        e.forwarded_host.as_deref() == Some(&client_host),
+        e.forwarded_host.as_deref() == Some(&client_host), // not the forged one
         format!("{:?}", e.forwarded_host),
     );
     d.check(

@@ -77,6 +77,11 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
         headers.remove(*name);
     }
     for name in extra {
+        // The proxy relies on `Host`; a client must not delete it by naming
+        // it in `Connection`.
+        if name == "host" {
+            continue;
+        }
         headers.remove(name.as_str());
     }
 }
@@ -580,7 +585,7 @@ fn set_host(
     let client_host = client_uri
         .authority()
         .and_then(host_value)
-        .or_else(|| headers.get(http::header::HOST).cloned());
+        .or_else(|| headers.get(http::header::HOST).and_then(parse_host));
     headers.remove("x-forwarded-host");
     if let Some(h) = &client_host {
         headers.insert("x-forwarded-host", h.clone());
@@ -597,6 +602,32 @@ fn set_host(
         None => {
             headers.remove(http::header::HOST);
         }
+    }
+}
+
+/// A `Host` header value as `host[:port]`; `None` unless it is a bare
+/// authority (no userinfo, list or path).
+fn parse_host(v: &HeaderValue) -> Option<HeaderValue> {
+    if v.as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'@' | b',' | b'/') || *b >= 0x80)
+    {
+        return None;
+    }
+    http::uri::Authority::try_from(v.as_bytes())
+        .ok()
+        .and_then(|a| host_value(&a))
+}
+
+/// More than one `Host`, or (when the request target has no authority, so
+/// the header is what gets used) one that is not a plain authority. Checked
+/// before `lookup`, so the 400 cannot leak a half-open probe slot.
+fn bad_host(headers: &HeaderMap, uri: &http::Uri) -> bool {
+    let mut it = headers.get_all(http::header::HOST).iter();
+    match (it.next(), it.next()) {
+        (None, _) => false,
+        (Some(v), None) => uri.authority().is_none() && parse_host(v).is_none(),
+        _ => true,
     }
 }
 
@@ -629,6 +660,9 @@ pub(crate) async fn handle_checked(
     // probe, and a probe must report back.
     if bad_path(&path) {
         return plain(400, b"bad path");
+    }
+    if bad_host(req.headers(), req.uri()) {
+        return plain(400, b"bad host");
     }
     if upgrade {
         return plain(501, b"protocol upgrades are not supported");
@@ -748,7 +782,7 @@ pub(crate) async fn handle_checked(
 
 #[cfg(test)]
 mod tests {
-    use super::{bad_path, set_host, stall_threshold, wants_upgrade};
+    use super::{bad_host, bad_path, set_host, stall_threshold, strip_hop_by_hop, wants_upgrade};
     use http::{HeaderMap, HeaderValue};
     use std::time::Duration;
 
@@ -800,6 +834,56 @@ mod tests {
         let mut h = HeaderMap::new();
         set_host(&mut h, &"/x".parse().unwrap(), &up, false);
         assert!(h.get("host").is_none() && h.get("x-forwarded-host").is_none());
+    }
+
+    #[test]
+    fn host_validation() {
+        let h = |vals: &[&str]| {
+            let mut m = HeaderMap::new();
+            for v in vals {
+                m.append("host", HeaderValue::from_str(v).unwrap());
+            }
+            m
+        };
+        for bad in ["a.example, b.example", "u@x", "x/y", ""] {
+            assert!(bad_host(&h(&[bad]), &"/".parse().unwrap()), "{bad:?}");
+        }
+        assert!(bad_host(
+            &h(&["a.example", "b.example"]),
+            &"/".parse().unwrap()
+        ));
+        for ok in ["a.example", "a.example:8443", "[::1]:8443", "LOCALHOST"] {
+            assert!(!bad_host(&h(&[ok]), &"/".parse().unwrap()), "{ok:?}");
+        }
+        assert!(!bad_host(&HeaderMap::new(), &"/".parse().unwrap()));
+        // With a URI authority the header is not used, so it is not judged.
+        assert!(!bad_host(
+            &h(&["u@x"]),
+            &"http://a.example/".parse().unwrap()
+        ));
+        assert!(bad_host(
+            &h(&["a", "b"]),
+            &"http://a.example/".parse().unwrap()
+        ));
+        // The validated value is what gets forwarded.
+        let mut m = h(&["[::1]:8443"]);
+        set_host(
+            &mut m,
+            &"/x".parse().unwrap(),
+            &"http://u:1".parse().unwrap(),
+            false,
+        );
+        assert_eq!(m.get("x-forwarded-host").unwrap(), "[::1]:8443");
+    }
+
+    #[test]
+    fn connection_cannot_delete_host() {
+        let mut m = HeaderMap::new();
+        m.insert("host", HeaderValue::from_static("a.example"));
+        m.insert("connection", HeaderValue::from_static("Host, x-other"));
+        m.insert("x-other", HeaderValue::from_static("1"));
+        strip_hop_by_hop(&mut m);
+        assert!(m.get("host").is_some() && m.get("x-other").is_none());
     }
 
     #[test]
