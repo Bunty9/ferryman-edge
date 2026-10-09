@@ -104,7 +104,8 @@ jobs:
   # Release binaries. Runs cargo (third-party build scripts), so read-only,
   # no OIDC. Each Linux binary is smoke-tested (mTLS + JWT + proxy) before
   # it is packaged; macOS runners lack the smoke's openssl flavour.
-  # ci.yml's `binaries` job builds the same matrix on every PR.
+  # It gates publish: if any target fails nothing is published. ci.yml's
+  # `binaries` job builds the same matrix on every PR.
   binaries:
     name: binary (${{ matrix.target }})
     needs: verify
@@ -121,6 +122,10 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin }
     env:
       TARGET: ${{ matrix.target }}
+      # cc-rs would look for aarch64-linux-musl-gcc when the host is gnu;
+      # musl-tools only ships musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:

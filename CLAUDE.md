@@ -128,7 +128,8 @@ tag publishes irreversibly: never push one without an explicit request. `cargo p
 safe. When bumping, change `[workspace.package] version` and the
 `version` on server's `ferryman-edge-core` dependency together, and add a
 `## [X.Y.Z]` section to `CHANGELOG.md` (the verify job requires it and
-uses it as the GitHub release notes). Checklist: `docs/publishing.md`.
+uses it as the GitHub release notes). Release binaries are Unix-only
+(no Windows: SIGUSR1). Checklist: `docs/publishing.md`.
 
 ## Commits
 

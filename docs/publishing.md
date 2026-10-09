@@ -180,6 +180,11 @@ After publishing:
   re-bump the version. The `.crate`, binary archive and release-notes artifacts are kept
   for 7 days, so re-run `publish` / `release` within that window; after
   that, push a new patch version instead.
+- **A `binaries` job fails:** nothing was published (`attest`, `publish`
+  and `release` need every target). "Re-run failed jobs" handles flakes
+  (runner or network). If it needs a code fix, delete and re-push the tag
+  (see "The verify job fails") before `publish` has run; once a crate is
+  on crates.io, release X.Y.Z+1 instead.
 - **The release job fails:** same, "Re-run failed jobs"; it creates the
   release, or uploads to the one that already exists.
 - **Bad release:** `cargo yank --version X.Y.Z ferryman-edge` (and core

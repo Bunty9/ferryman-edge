@@ -77,8 +77,8 @@ Pinned versions live in [`Cargo.toml`](https://github.com/Bunty9/ferryman-edge/b
 
 ## Install
 
-Prebuilt static binaries (Linux musl x86_64/aarch64, macOS x86_64/aarch64)
-are attached to every GitHub release with `SHA256SUMS` and build
+Prebuilt binaries (static Linux musl x86_64/aarch64; macOS x86_64/aarch64,
+which link the system libSystem) are attached to every GitHub release with `SHA256SUMS` and build
 provenance (`gh attestation verify <file> --repo Bunty9/ferryman-edge`):
 
 ```bash
@@ -86,7 +86,9 @@ cargo binstall ferryman-edge     # or: cargo install ferryman-edge
 docker build -t ferryman-edge .  # static binary in scratch, runs as 65532
 ```
 
-Both install the `ferryman-edge-server` binary.
+All three give you the `ferryman-edge-server` binary. Verify a download
+with `sha256sum -c SHA256SUMS --ignore-missing` (or `shasum -a 256 -c` on
+macOS) and `gh attestation verify`.
 
 The reusable pieces (TLS reload, JWT verifier, rate limiter, routing +
 circuit breaker) are published separately as

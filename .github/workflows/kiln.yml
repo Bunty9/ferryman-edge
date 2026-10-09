@@ -80,14 +80,16 @@ jobs:
           mkdir -p "$up/svc-a"
           echo ok > "$up/health"
           echo hello > "$up/svc-a/hello"
-          (cd "$up" && python3 -m http.server 8001 --bind 127.0.0.1 > "$RUNNER_TEMP/upstream.log" 2>&1 &)
+          (cd "$up" && exec python3 -m http.server 8001 --bind 127.0.0.1) > "$RUNNER_TEMP/upstream.log" 2>&1 &
+          upid=$!
+          # Free :8001 for the container smoke step below.
+          trap 'kill $upid ${pid:-} 2>/dev/null || true' EXIT
           # Upstream first, so the first health tick cannot open the breaker.
           for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8001/health && break; sleep 0.25; done
           curl -sf -o /dev/null http://127.0.0.1:8001/health || { echo "upstream did not start"; cat "$RUNNER_TEMP/upstream.log"; exit 1; }
           ./target/release/ferryman-edge-server --config config.toml \
               --bind 127.0.0.1:8443 --metrics-bind 127.0.0.1:9090 > "$RUNNER_TEMP/server.log" 2>&1 &
           pid=$!
-          trap 'kill $pid 2>/dev/null || true' EXIT
           for _ in $(seq 1 20); do (echo > /dev/tcp/127.0.0.1/8443) 2>/dev/null && break; sleep 0.5; done
           C="--cacert certs/ca.crt --cert certs/client.crt --key certs/client.key"
           TOKEN=$(bash scripts/mint-jwt.sh smoke-tenant 300)

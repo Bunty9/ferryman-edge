@@ -14,6 +14,8 @@
 # With SMOKE_IMAGE set (and no binary argument) the proxy runs from that
 # docker image instead, as `--read-only --user 65532:65532` on the host
 # network, so the same checks prove the container's rootfs and uid work.
+# Container mode needs a native Docker engine (`DOCKER_CONTEXT=default`):
+# Docker Desktop's `--network host` is its VM's network, not the host's.
 set -euo pipefail
 
 IMAGE=${SMOKE_IMAGE:-}

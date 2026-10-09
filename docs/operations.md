@@ -167,12 +167,13 @@ network (`fly.toml` uses Fly's internal `[metrics]` scrape).
 
 ```bash
 docker build -t ferryman-edge .
-docker run -p 8443:8443 -v "$PWD/certs:/app/certs:ro" ferryman-edge
+docker run --user "$(id -u):$(id -g)" -p 8443:8443 -v "$PWD/certs:/app/certs:ro" ferryman-edge
 ```
 
 The image is `scratch` with a static musl binary and runs as `65532:65532`.
 Mounted certs, keys and config must be readable by that uid (`chmod 0640` +
-`chgrp 65532`, or `docker run --user $(id -u)`). It also runs with
+`chgrp 65532`, or `docker run --user $(id -u)`; the example above does
+the latter because `gen-test-certs.sh` writes keys 0600). It also runs with
 `--read-only`: the proxy writes nothing to disk.
 
 The image ships no key material and no certs; mount them at `/app/certs`

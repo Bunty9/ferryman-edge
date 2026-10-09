@@ -126,31 +126,8 @@ jobs:
           name: edge-demo-logs
           path: examples/edge-demo/.demo/run/*.log
 
-  mtls-smoke:
-    name: mTLS smoke (static musl binary)
-    runs-on: ubuntu-latest
-    needs: test
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Install musl-tools, openssl, curl
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools openssl curl python3
-      - name: Build the static binary
-        run: cargo build --release --locked -p ferryman-edge --target x86_64-unknown-linux-musl
-      - name: mTLS + JWT smoke
-        run: bash scripts/smoke.sh target/x86_64-unknown-linux-musl/release/ferryman-edge-server
-
-  # The release matrix (release.yml `binaries`), exercised on every PR and
+  # The release matrix (release.yml `binaries`, incl. the x86_64 musl smoke
+  # that replaced the old mtls-smoke job), exercised on every PR and
   # push to main so a broken target is found before a tag. Builds and smoke
   # tests only: no attestation, no publishing, no secrets.
   binaries:
@@ -169,6 +146,10 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin }
     env:
       TARGET: ${{ matrix.target }}
+      # cc-rs would look for aarch64-linux-musl-gcc when the host is gnu;
+      # musl-tools only ships musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -185,8 +166,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools openssl curl python3
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-auditable
       - name: Build
-        run: cargo build --release --locked -p ferryman-edge --target "$TARGET"
+        run: cargo auditable build --locked --release -p ferryman-edge --target "$TARGET"
       - name: Smoke-test the binary
         if: contains(matrix.target, 'linux-musl')
         run: bash scripts/smoke.sh "target/$TARGET/release/ferryman-edge-server"
@@ -209,3 +194,9 @@ jobs:
           user=$(docker inspect -f '{{.Config.User}}' ferryman-edge:ci)
           [ "$user" = "65532:65532" ] || { echo "image user is '$user', want 65532:65532"; exit 1; }
           docker run --rm ferryman-edge:ci --version
+      - name: Install openssl, curl, python3 for the smoke
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl curl python3
+      - name: mTLS + JWT smoke through the container (read-only, uid 65532)
+        run: SMOKE_IMAGE=ferryman-edge:ci bash scripts/smoke.sh
