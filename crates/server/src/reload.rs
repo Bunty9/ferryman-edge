@@ -22,9 +22,23 @@
 //! point of view) without dropping connections.
 
 use arc_swap::ArcSwap;
-use ferryman_edge_core::{build_table, EdgeConfig, JwtVerifier, RouteTable, SharedTable};
-use std::path::{Path, PathBuf};
+use ferryman_edge_core::ferryman_core::{build_table, RouteTable, SharedTable};
+use ferryman_edge_core::{EdgeConfig, JwtVerifier};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Parse `raw` and swap in the new routing table. Upstreams that survive
+/// the reload (same `host:port`) keep their breaker, so an open circuit
+/// stays open and in-flight tickets report to the live breaker. On any
+/// error the live table is untouched. Returns the config's deprecation
+/// warnings.
+pub fn apply(raw: &str, table: &SharedTable) -> anyhow::Result<Vec<String>> {
+    let cfg = EdgeConfig::parse(raw)?;
+    let next = build_table(cfg.core, Some(&table.load()))?;
+    table.store(Arc::new(next));
+    table.load().publish_gauges();
+    Ok(cfg.deprecations)
+}
 
 /// Spawn the SIGUSR1 reload loop. Routes, their health keys and the four
 /// top-level timeouts reload; `[limits]`, `[jwt]` issuer/audience,
@@ -42,10 +56,14 @@ pub fn spawn_reload(path: PathBuf, table: SharedTable) {
                 }
             };
         while sig.recv().await.is_some() {
-            match reload_once(&path) {
-                Ok(mut new_table) => {
-                    new_table.inherit_breakers(&table.load());
-                    table.store(Arc::new(new_table));
+            match std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|raw| apply(&raw, &table))
+            {
+                Ok(deprecations) => {
+                    for d in deprecations {
+                        tracing::warn!(config = %path.display(), "{d}");
+                    }
                     tracing::info!(path = %path.display(), "routing table reloaded");
                 }
                 Err(e) => {
@@ -86,17 +104,7 @@ pub fn spawn_jwt_reload(pem_path: PathBuf, jwt: Arc<JwtVerifier>) {
     });
 }
 
-fn reload_once(path: &Path) -> anyhow::Result<RouteTable> {
-    let cfg = EdgeConfig::parse(&std::fs::read_to_string(path)?)?;
-    for d in &cfg.deprecations {
-        tracing::warn!(config = %path.display(), "{d}");
-    }
-    build_table(&cfg.core)
-}
-
-/// Helper for tests / integration code that build their own `SharedTable`
-/// outside of `main()`.
-#[allow(dead_code)]
+/// Wrap a table for hot swapping (boot, tests and embedders).
 pub fn new_shared(table: RouteTable) -> SharedTable {
     Arc::new(ArcSwap::from_pointee(table))
 }
@@ -104,25 +112,42 @@ pub fn new_shared(table: RouteTable) -> SharedTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferryman_edge_core::ferryman_core::CircuitState;
 
-    const OK: &str = "[mtls]\ncert_path='c'\nkey_path='k'\nclient_ca_path='a'\n\
-                      [jwt]\njwks_path='j'\n[[routes]]\nprefix='/a'\nupstream='http://h:1'\n";
+    const CFG: &str = "failure_threshold = 1\n[mtls]\ncert_path = \"c\"\nkey_path = \"k\"\n\
+        client_ca_path = \"ca\"\n[jwt]\njwks_path = \"j\"\n\
+        [[routes]]\nprefix = \"/a\"\nupstream = \"http://127.0.0.1:9\"\n";
+
+    fn state(table: &SharedTable) -> CircuitState {
+        table.load().lookup("/a").unwrap().upstream.state()
+    }
 
     #[test]
-    fn malformed_edge_config_fails_reload_and_keeps_old_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("c.toml");
-        std::fs::write(&path, OK).unwrap();
-        let shared = new_shared(reload_once(&path).unwrap());
-        let bad = [
-            format!("{OK}[limits]\nbogus = 1\n"),
-            OK.replace("[mtls]", "[nope]"),
-            format!("{OK}[tls]\ncert_path='c'\nkey_path='k'\nclient_ca_path='a'\n"),
-        ];
-        for raw in bad {
-            std::fs::write(&path, raw).unwrap();
-            assert!(reload_once(&path).is_err());
-            assert_eq!(shared.load().rules.len(), 1);
+    fn reload_keeps_an_open_breaker_and_rejects_bad_config() {
+        let table = new_shared(build_table(EdgeConfig::parse(CFG).unwrap().core, None).unwrap());
+        let up = table.load().lookup("/a").unwrap().upstream.clone();
+        let ticket = up.try_acquire().unwrap();
+        up.record_failure(ticket);
+        assert_eq!(up.state(), CircuitState::Open);
+
+        // The route changes (new prefix added), the upstream stays: breaker kept.
+        let moved =
+            format!("{CFG}[[routes]]\nprefix = \"/b\"\nupstream = \"http://127.0.0.1:9\"\n");
+        assert!(apply(&moved, &table).unwrap().is_empty());
+        assert_eq!(state(&table), CircuitState::Open);
+        assert!(table.load().lookup("/b").is_some());
+
+        for bad in [
+            "not = [toml".to_string(),
+            format!("{CFG}[limits]\nbogus = 1\n"),
+            CFG.replace("[mtls]", "[nope]"),
+            format!("{CFG}[tls]\ncert_path='c'\nkey_path='k'\nclient_ca_path='a'\n"),
+            CFG.replace("prefix = \"/a\"", "prefix = \"/%61\""),
+            format!("trusted_proxies = [\"10.0.0.0/8\"]\n{CFG}"),
+        ] {
+            assert!(apply(&bad, &table).is_err(), "{bad}");
+            assert_eq!(state(&table), CircuitState::Open);
+            assert!(table.load().lookup("/b").is_some(), "live table kept");
         }
     }
 }

@@ -38,3 +38,6 @@ allow = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Temporary: ferryman-core comes from a git rev until 0.3.0 is on
+# crates.io; remove this when the dependency switches to the registry.
+allow-git = ["https://github.com/Bunty9/ferryman"]

@@ -13,20 +13,21 @@ readme = "README.md"
 # Tests and benches need repo-level fixtures (incl. test-only private keys);
 # they run in CI from the repository, not from the published crate.
 exclude = ["tests/", "benches/"]
-description = "Core types for ferryman-edge — RouteTable, mTLS reload, JWT verifier, per-tenant rate limiter."
+description = "Core types for ferryman-edge — mTLS reload, JWT verifier, per-tenant rate limiter and the edge config, over ferryman-core."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
+# Routing, breaker, health checks and the core config; re-exported as
+# `ferryman_edge_core::ferryman_core`.
+ferryman-core = { workspace = true }
 tokio = { workspace = true }
-http = { workspace = true }
 arc-swap = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-metrics = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 # P4 stack additions

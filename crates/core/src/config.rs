@@ -3,20 +3,38 @@
 //! [`EdgeConfig::parse`] reads the file into a `toml::Table`, removes the
 //! edge-only keys and deserialises them into edge structs: `[mtls]` (or its
 //! deprecated alias `[tls]`), `[jwt]` and `[limits]` (which also holds
-//! `tenant_rps`). What remains is [`ConfigToml`], the proxy-core schema. It
-//! mirrors ferryman-core 0.3 key for key, so the rebase onto it swaps the
-//! type without a schema change. Every table rejects unknown keys. serde
+//! `tenant_rps`). What remains is `ferryman_core::ConfigToml` (its
+//! `deny_unknown_fields` still applies), validated further by
+//! `ferryman_core::build_table`. Every table rejects unknown keys. serde
 //! cannot combine `flatten` with `deny_unknown_fields`, hence two passes.
 //! Deprecated spellings still load. Each one adds a line to
 //! [`EdgeConfig::deprecations`], which the binary logs as a warning.
 
-use crate::route::{RouteTable, Upstream};
 use anyhow::{bail, ensure, Context};
+use ferryman_core::ConfigToml;
 use serde::Deserialize;
-use std::time::Duration;
 
 /// Upper bound for every duration key, so `Duration` arithmetic can't overflow.
 const MAX_SECS: u64 = 86_400;
+
+/// Default of ferryman-core's `keepalive_timeout_secs`.
+const DEFAULT_KEEPALIVE_SECS: u64 = 10;
+
+/// Why [`EdgeConfig::parse`] rejected a config file.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// The core part (top-level keys and `[[routes]]`) does not fit
+    /// ferryman-core's schema. The cause is in `source()`; print the chain
+    /// (`anyhow`'s `{:#}`) to see it.
+    #[error(transparent)]
+    Core(#[from] ferryman_core::Error),
+    /// The file is not valid TOML, or an edge table (`[mtls]`, `[jwt]`,
+    /// `[limits]`) or an edge-only rule is violated. The message holds the
+    /// whole cause chain.
+    #[error("{0}")]
+    Edge(String),
+}
 
 /// The whole config file.
 #[derive(Debug, Clone)]
@@ -32,76 +50,6 @@ pub struct EdgeConfig {
     pub limits: Limits,
     /// Deprecated spellings found in the file, one readable line each.
     pub deprecations: Vec<String>,
-}
-
-/// Top-level keys and `[[routes]]`. Names, defaults and meaning follow
-/// ferryman-core 0.3's `ConfigToml`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfigToml {
-    /// Active health-check interval in seconds. Boot-only.
-    #[serde(default = "default_health_interval")]
-    pub health_interval_secs: u64,
-    /// Breaker cooldown for routes that don't set `cooldown_secs`.
-    #[serde(default = "default_cooldown")]
-    pub default_cooldown_secs: u64,
-    /// Upstream deadline, from the end of the client's upload to the
-    /// upstream's response head.
-    #[serde(default = "default_upstream_timeout")]
-    pub upstream_timeout_secs: u64,
-    /// HTTP/1 keep-alive idle timeout (also the header-read timeout of
-    /// later requests on a connection). Boot-only.
-    #[serde(default = "default_keepalive")]
-    pub keepalive_timeout_secs: u64,
-    /// Longest gap between request-body frames.
-    #[serde(default = "default_body_idle")]
-    pub request_body_idle_timeout_secs: u64,
-    /// Total time allowed to receive a request body.
-    #[serde(default = "default_body_total")]
-    pub request_body_timeout_secs: u64,
-    pub routes: Vec<RouteToml>,
-}
-
-fn default_health_interval() -> u64 {
-    5
-}
-fn default_cooldown() -> u64 {
-    30
-}
-fn default_upstream_timeout() -> u64 {
-    30
-}
-fn default_keepalive() -> u64 {
-    10
-}
-fn default_body_idle() -> u64 {
-    30
-}
-fn default_body_total() -> u64 {
-    300
-}
-
-/// One `[[routes]]` entry.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RouteToml {
-    /// Path prefix to match (e.g. `/svc-a`).
-    pub prefix: String,
-    /// Upstream URI, e.g. `http://localhost:8001`.
-    pub upstream: String,
-    /// Per-route circuit-breaker cooldown override.
-    #[serde(default)]
-    pub cooldown_secs: Option<u64>,
-    /// Health probe path. `None` = `/health`.
-    #[serde(default)]
-    pub health_path: Option<String>,
-    /// Skip active health probing for this route.
-    #[serde(default)]
-    pub health_disabled: bool,
-    /// `true`: send the upstream's authority as `Host` (0.1.x behaviour).
-    /// `false` (default): keep the client's `Host`.
-    #[serde(default)]
-    pub rewrite_host: bool,
 }
 
 /// `[mtls]` (deprecated alias `[tls]`): material for `tls::build_mtls_config`.
@@ -193,10 +141,43 @@ impl Limits {
     }
 }
 
+/// Core keys edge does not implement yet. A non-default value is rejected
+/// (at load and on reload), never accepted and silently ignored. Adding a
+/// key is one line: its name and "is it set?".
+fn reject_unsupported(core: &ConfigToml) -> Result<(), ConfigError> {
+    // Edge always replaces forwarding headers with the TLS peer it sees.
+    let unsupported = [("trusted_proxies", !core.trusted_proxies.is_empty())];
+    match unsupported.into_iter().find(|(_, set)| *set) {
+        Some((key, _)) => Err(ConfigError::Edge(format!(
+            "{key} is not supported by ferryman-edge yet; remove it"
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl EdgeConfig {
-    /// Parse and validate the edge tables; the core part is validated by
-    /// [`build_table`].
-    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+    /// Parse and validate the edge tables and the core schema. Route-level
+    /// rules (prefixes, upstreams, shared-upstream conflicts) are checked by
+    /// `ferryman_core::build_table`.
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let edge = |e: anyhow::Error| ConfigError::Edge(format!("{e:#}"));
+        let (top, mtls, jwt, limits, deprecations) = Self::parse_edge(raw).map_err(edge)?;
+        let core = ConfigToml::from_table(top)?;
+        reject_unsupported(&core)?;
+        Ok(Self {
+            core,
+            mtls,
+            jwt,
+            limits,
+            deprecations,
+        })
+    }
+
+    /// The edge tables and deprecations, plus what is left for the core.
+    #[allow(clippy::type_complexity)]
+    fn parse_edge(
+        raw: &str,
+    ) -> anyhow::Result<(toml::Table, MtlsToml, JwtToml, Limits, Vec<String>)> {
         let mut top: toml::Table = raw.parse().context("config is not valid TOML")?;
         let mut deprecations = Vec::new();
 
@@ -250,7 +231,7 @@ impl EdgeConfig {
         // (not first_request_timeout_secs), so a raised first_request value
         // alone no longer lengthens keep-alive or the first-request window.
         if !top.contains_key("keepalive_timeout_secs")
-            && limits.first_request_timeout_secs > default_keepalive()
+            && limits.first_request_timeout_secs > DEFAULT_KEEPALIVE_SECS
         {
             deprecations.push(format!(
                 "[limits] first_request_timeout_secs = {} no longer sets HTTP/1 keep-alive; \
@@ -258,80 +239,29 @@ impl EdgeConfig {
                 limits.first_request_timeout_secs
             ));
         }
-        Ok(Self {
-            core: toml::Value::Table(top).try_into()?,
-            mtls: mtls.try_into().context("in [mtls]")?,
-            jwt: jwt.try_into().context("in [jwt]")?,
+        Ok((
+            top,
+            mtls.try_into().context("in [mtls]")?,
+            jwt.try_into().context("in [jwt]")?,
             limits,
             deprecations,
-        })
+        ))
     }
-}
-
-/// Validate the core keys and build a [`RouteTable`]. On error the caller
-/// keeps its old table.
-pub fn build_table(cfg: &ConfigToml) -> anyhow::Result<RouteTable> {
-    for (key, v) in [
-        ("health_interval_secs", cfg.health_interval_secs),
-        ("default_cooldown_secs", cfg.default_cooldown_secs),
-        ("upstream_timeout_secs", cfg.upstream_timeout_secs),
-        ("keepalive_timeout_secs", cfg.keepalive_timeout_secs),
-        (
-            "request_body_idle_timeout_secs",
-            cfg.request_body_idle_timeout_secs,
-        ),
-        ("request_body_timeout_secs", cfg.request_body_timeout_secs),
-    ] {
-        ensure!(
-            (1..=MAX_SECS).contains(&v),
-            "{key} must be between 1 and {MAX_SECS}"
-        );
-    }
-    let mut rules = Vec::with_capacity(cfg.routes.len());
-    for r in &cfg.routes {
-        let uri: http::Uri = r
-            .upstream
-            .parse()
-            .with_context(|| format!("route {:?}: invalid upstream {:?}", r.prefix, r.upstream))?;
-        ensure!(
-            uri.authority().is_some(),
-            "route {:?}: upstream {:?} has no authority (scheme://host)",
-            r.prefix,
-            r.upstream
-        );
-        let cooldown = r.cooldown_secs.unwrap_or(cfg.default_cooldown_secs);
-        // 0 would let every caller through as a "probe".
-        ensure!(
-            cooldown > 0,
-            "route {}: cooldown_secs must be at least 1",
-            r.prefix
-        );
-        if let Some(p) = &r.health_path {
-            ensure!(
-                p.starts_with('/')
-                    && !p.contains(['?', '#'])
-                    && p.parse::<http::uri::PathAndQuery>().is_ok(),
-                "route {}: health_path {p:?} must start with '/' and contain no '?' or '#'",
-                r.prefix
-            );
-        }
-        let up = Upstream::new(uri, cooldown)
-            .with_health(r.health_path.clone(), r.health_disabled)
-            .with_rewrite_host(r.rewrite_host);
-        rules.push((r.prefix.clone(), up));
-    }
-    let secs = Duration::from_secs;
-    let mut table = RouteTable::new(rules)
-        .with_keepalive_timeout(secs(cfg.keepalive_timeout_secs))
-        .with_request_body_idle_timeout(secs(cfg.request_body_idle_timeout_secs))
-        .with_request_body_timeout(secs(cfg.request_body_timeout_secs));
-    table.upstream_timeout = secs(cfg.upstream_timeout_secs);
-    Ok(table)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferryman_core::build_table;
+    use std::time::Duration;
+
+    /// The whole cause chain, as the binary prints it.
+    fn err(raw: &str) -> String {
+        format!(
+            "{:#}",
+            anyhow::Error::from(EdgeConfig::parse(raw).unwrap_err())
+        )
+    }
 
     /// A config file exactly as 0.1.2 documented it.
     const V012: &str = r#"
@@ -371,7 +301,7 @@ health_path = "/ready"
     fn repo_config_toml_parses_without_warnings_and_builds() {
         let c = EdgeConfig::parse(include_str!("../../../config.toml")).unwrap();
         assert!(c.deprecations.is_empty(), "{:?}", c.deprecations);
-        build_table(&c.core).unwrap();
+        build_table(c.core, None).unwrap();
     }
 
     #[test]
@@ -395,7 +325,7 @@ health_path = "/ready"
                 c.deprecations
             );
         }
-        build_table(&c.core).unwrap();
+        build_table(c.core, None).unwrap();
     }
 
     #[test]
@@ -426,12 +356,13 @@ health_path = "/ready"
             (
                 k.health_interval_secs,
                 k.default_cooldown_secs,
+                k.failure_threshold,
                 k.upstream_timeout_secs,
                 k.keepalive_timeout_secs,
                 k.request_body_idle_timeout_secs,
                 k.request_body_timeout_secs
             ),
-            (5, 30, 30, 10, 30, 300)
+            (5, 30, 3, 30, 10, 30, 300)
         );
         let l = &c.limits;
         assert_eq!(
@@ -444,7 +375,7 @@ health_path = "/ready"
             ),
             (10, 10, 64, 25, 1000)
         );
-        let t = build_table(&c.core).unwrap();
+        let t = build_table(c.core, None).unwrap();
         assert_eq!(t.upstream_timeout, Duration::from_secs(30));
         assert_eq!(t.keepalive_timeout(), Duration::from_secs(10));
         assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(30));
@@ -470,7 +401,7 @@ health_path = "/ready"
             (rps, "tenant_rps"),
             (timeout, "upstream_timeout_secs"),
         ] {
-            let e = format!("{:#}", EdgeConfig::parse(&raw).unwrap_err());
+            let e = err(&raw);
             assert!(e.contains(want), "{want}: {e}");
         }
     }
@@ -484,7 +415,7 @@ health_path = "/ready"
             cfg("", "", "", "bogus = 1", ""),
             cfg("", "", "", "", "bogus = 1"),
         ] {
-            let e = format!("{:#}", EdgeConfig::parse(&raw).unwrap_err());
+            let e = err(&raw);
             assert!(e.contains("bogus"), "{e}");
         }
     }
@@ -495,7 +426,7 @@ health_path = "/ready"
         assert!(EdgeConfig::parse(&no_mtls).is_err());
         let no_jwt =
             "[mtls]\ncert_path = \"c\"\nkey_path = \"k\"\nclient_ca_path = \"ca\"\nroutes = []\n";
-        let e = format!("{:#}", EdgeConfig::parse(no_jwt).unwrap_err());
+        let e = err(no_jwt);
         assert!(e.contains("[jwt]"), "{e}");
     }
 
@@ -514,74 +445,37 @@ health_path = "/ready"
             ("h2_max_concurrent_streams = 0", "h2_max_concurrent_streams"),
             ("shutdown_drain_secs = 0", "shutdown_drain_secs"),
         ] {
-            let e = format!(
-                "{:#}",
-                EdgeConfig::parse(&cfg("", "", "", line, "")).unwrap_err()
-            );
+            let e = err(&cfg("", "", "", line, ""));
             assert!(e.contains(key), "{line}: {e}");
         }
     }
 
     #[test]
-    fn core_validation_names_the_key() {
-        for (line, key) in [
-            ("health_interval_secs = 0", "health_interval_secs"),
-            ("upstream_timeout_secs = 0", "upstream_timeout_secs"),
-            ("keepalive_timeout_secs = 86401", "keepalive_timeout_secs"),
-            (
-                "request_body_idle_timeout_secs = 0",
-                "request_body_idle_timeout_secs",
-            ),
-            ("request_body_timeout_secs = 0", "request_body_timeout_secs"),
-        ] {
-            let c = EdgeConfig::parse(&cfg(line, "", "", "", "")).unwrap();
-            let e = build_table(&c.core).err().unwrap().to_string();
-            assert!(e.contains(key), "{line}: {e}");
-        }
-        for (route, key) in [
-            ("cooldown_secs = 0", "cooldown_secs"),
-            ("health_path = \"healthz\"", "health_path"),
-            ("health_path = \"/h?x=1\"", "health_path"),
-        ] {
-            let c = EdgeConfig::parse(&cfg("", "", "", "", route)).unwrap();
-            let e = build_table(&c.core).err().unwrap().to_string();
-            assert!(e.contains(key), "{route}: {e}");
-        }
-        let c = EdgeConfig::parse(
-            &cfg("", "", "", "", "").replace("http://localhost:8001", "/no-authority"),
-        )
-        .unwrap();
-        assert!(build_table(&c.core).is_err());
+    fn trusted_proxies_is_rejected() {
+        let e = err(&cfg("trusted_proxies = [\"10.0.0.0/8\"]", "", "", "", ""));
+        assert!(
+            e.contains("trusted_proxies is not supported by ferryman-edge yet"),
+            "{e}"
+        );
+        assert!(EdgeConfig::parse(&cfg("trusted_proxies = []", "", "", "", "")).is_ok());
+    }
+
+    /// Core's schema errors arrive wrapped, not re-expressed as edge errors.
+    #[test]
+    fn core_errors_are_wrapped() {
+        let core = EdgeConfig::parse(&cfg("bogus = 1", "", "", "", "")).unwrap_err();
+        assert!(matches!(core, ConfigError::Core(_)), "{core:?}");
+        let edge = EdgeConfig::parse(&cfg("", "", "", "bogus = 1", "")).unwrap_err();
+        assert!(matches!(edge, ConfigError::Edge(_)), "{edge:?}");
     }
 
     #[test]
-    fn health_keys_reach_the_upstream() {
-        let c = EdgeConfig::parse(&cfg(
-            "",
-            "",
-            "",
-            "",
-            "health_path = \"/ready\"\nhealth_disabled = true",
-        ))
-        .unwrap();
-        let t = build_table(&c.core).unwrap();
-        let a = t.lookup("/svc-a").unwrap();
-        assert_eq!((a.health_path(), a.health_disabled()), ("/ready", true));
-    }
-
-    #[test]
-    fn rewrite_host_key_reaches_the_upstream() {
-        let on = EdgeConfig::parse(&cfg("", "", "", "", "rewrite_host = true")).unwrap();
-        let off = EdgeConfig::parse(&cfg("", "", "", "", "")).unwrap();
-        assert!(build_table(&on.core)
-            .unwrap()
-            .lookup("/svc-a")
-            .unwrap()
-            .rewrite_host());
-        assert!(!build_table(&off.core)
-            .unwrap()
-            .lookup("/svc-a")
-            .unwrap()
-            .rewrite_host());
+    fn rewrite_host_is_a_core_route_key() {
+        let c = EdgeConfig::parse(&cfg("", "", "", "", "rewrite_host = true")).unwrap();
+        let t = build_table(c.core, None).unwrap();
+        assert!(t.lookup("/svc-a/x").unwrap().rewrite_host);
+        let c = EdgeConfig::parse(&cfg("", "", "", "", "")).unwrap();
+        let t = build_table(c.core, None).unwrap();
+        assert!(!t.lookup("/svc-a/x").unwrap().rewrite_host);
     }
 }

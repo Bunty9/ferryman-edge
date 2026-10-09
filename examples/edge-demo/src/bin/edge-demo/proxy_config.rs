@@ -1,6 +1,7 @@
 //! Write `ferryman.toml` for a given topology.
 //!
-//! The schema is `ConfigToml` in `ferryman-edge-core`. Paths are written
+//! The schema is `EdgeConfig` in `ferryman-edge-core` (edge tables plus
+//! `ferryman_core::ConfigToml`). Paths are written
 //! absolute so the proxy can be started from any working directory.
 
 use crate::pki::Pki;
@@ -77,13 +78,9 @@ mod tests {
         let c = ferryman_edge_core::EdgeConfig::parse(&std::fs::read_to_string(&path).unwrap())
             .unwrap();
         assert!(c.deprecations.is_empty(), "{:?}", c.deprecations);
-        assert_eq!(
-            ferryman_edge_core::build_table(&c.core)
-                .unwrap()
-                .rules
-                .len(),
-            2
-        );
+        // One item per distinct upstream; the two routes use different ports.
+        let t = ferryman_edge_core::ferryman_core::build_table(c.core, None).unwrap();
+        assert_eq!(t.upstreams().count(), 2);
         assert_eq!(c.jwt.audience.as_deref(), Some("ferryman-edge"));
     }
 }

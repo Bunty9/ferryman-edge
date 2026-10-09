@@ -5,13 +5,10 @@
 //! rate-limiter GC), then hand off to `ferryman_edge::serve_with` for the
 //! accept loop and per-request pipeline.
 
-use arc_swap::ArcSwap;
 use clap::Parser;
 use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
-use ferryman_edge_core::{
-    build_limiter, build_table, health_loop, spawn_gc, EdgeConfig, JwtVerifier, Limiter,
-    ReloadingTls, SharedTable,
-};
+use ferryman_edge_core::ferryman_core::{build_table, health_loop};
+use ferryman_edge_core::{build_limiter, spawn_gc, EdgeConfig, JwtVerifier, Limiter, ReloadingTls};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -68,6 +65,14 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Prometheus exporter binds its own listener so the proxy is unaffected
+    // by /metrics scrape traffic. Installed first: ferryman-core writes the
+    // breaker gauges as soon as a table exists.
+    PrometheusBuilder::new()
+        .with_http_listener(args.metrics_bind)
+        .install()?;
+    tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
+
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let raw = std::fs::read_to_string(&args.config)?;
     let cfg = EdgeConfig::parse(&raw)?;
@@ -77,8 +82,8 @@ async fn main() -> anyhow::Result<()> {
     let interval = Duration::from_secs(cfg.core.health_interval_secs);
 
     // Routing table (atomic hot-swap).
-    let table = build_table(&cfg.core)?;
-    let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
+    let shared = reload::new_shared(build_table(cfg.core.clone(), None)?);
+    shared.load().publish_gauges();
 
     // mTLS material + reloading wrapper. SIGUSR1 swaps cert/key/ca atomically.
     let tls = ReloadingTls::new(
@@ -107,13 +112,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(l) = &limiter {
         spawn_gc(l.clone(), LIMITER_GC_INTERVAL);
     }
-
-    // Prometheus exporter binds its own listener so the proxy is unaffected
-    // by /metrics scrape traffic.
-    PrometheusBuilder::new()
-        .with_http_listener(args.metrics_bind)
-        .install()?;
-    tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
 
     // Background tasks: active health checker + SIGUSR1-driven route reload.
     tokio::spawn(health_loop(shared.clone(), interval));

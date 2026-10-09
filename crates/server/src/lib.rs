@@ -17,7 +17,8 @@
 pub mod proxy;
 pub mod reload;
 
-use ferryman_edge_core::{check, Claims, JwtVerifier, Limiter, Limits, ReloadingTls, SharedTable};
+use ferryman_edge_core::ferryman_core::SharedTable;
+use ferryman_edge_core::{check, Claims, JwtVerifier, Limiter, Limits, ReloadingTls};
 use http::{HeaderValue, Request, Response};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;

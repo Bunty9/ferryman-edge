@@ -8,9 +8,10 @@
 //! `ferryman-edge-core`'s own tests use.
 
 use ferryman_edge::{reload, serve_with, AppState, UpstreamClient};
-use ferryman_edge_core::{
-    build_limiter, Claims, JwtVerifier, Limits, ReloadingTls, RouteTable, Upstream,
+use ferryman_edge_core::ferryman_core::{
+    build_table, health_loop, CircuitState, ConfigToml, RouteTable, SharedTable,
 };
+use ferryman_edge_core::{build_limiter, Claims, JwtVerifier, Limits, ReloadingTls};
 use http::{Request, Response};
 use http_body_util::channel::Channel;
 use http_body_util::{BodyExt, Full};
@@ -180,6 +181,18 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
             .body(Full::new(Bytes::new()))
             .unwrap());
     }
+    if req.uri().path() == "/missing" {
+        return Ok(Response::builder()
+            .status(404)
+            .body(Full::new(Bytes::new()))
+            .unwrap());
+    }
+    if req.uri().path().ends_with("/fail") {
+        return Ok(Response::builder()
+            .status(502)
+            .body(Full::new(Bytes::new()))
+            .unwrap());
+    }
     if req.uri().path().starts_with("/svc-a/count") {
         // Counts the body frame by frame, so a large upload never sits in memory.
         let mut body = req.into_body();
@@ -222,7 +235,7 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if path.starts_with("/slow") {
+    if path.starts_with("/slow") || path.starts_with("/flaky/slow") {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
     let body = req.into_body().collect().await.unwrap().to_bytes();
@@ -433,8 +446,10 @@ async fn spawn_write_timeout_upstream() -> SocketAddr {
 }
 
 /// An upstream with a strict read timeout: it closes the connection if no
-/// body bytes arrive for 1.5 s (above the proxy's 1 s stall threshold). `/strict-b` sends its 200 head first, `/strict-a`
-/// does not. A GET (no body) is answered normally.
+/// body bytes arrive for 1.5 s (above the proxy's 1 s stall threshold).
+/// `/strict-b` sends its 200 head first, `/strict-a` does not, and
+/// `/strict-g` is a gateway: it answers 502 when its (simulated) backend
+/// gives up. A GET (no body) is answered normally.
 async fn spawn_strict_read_upstream() -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -474,6 +489,13 @@ async fn spawn_strict_read_upstream() -> SocketAddr {
                         break;
                     }
                 }
+                if text.contains(" /strict-g") {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                }
                 // Dropping the stream closes it without a (further) answer.
             });
         }
@@ -501,12 +523,13 @@ async fn spawn_upstream() -> SocketAddr {
     addr
 }
 
-/// A port nobody is listening on, for the upstream-down test.
-fn closed_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// Two distinct ports nobody listens on. Both listeners are bound at once so
+/// the ports differ: core gives each `host:port` one breaker, and routes on
+/// one `host:port` must agree on the cooldown.
+fn closed_ports() -> (SocketAddr, SocketAddr) {
+    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (a.local_addr().unwrap(), b.local_addr().unwrap())
 }
 
 // ----- proxy harness -------------------------------------------------------
@@ -517,35 +540,80 @@ struct Harness {
     proxy_addr: SocketAddr,
     tls: Arc<ReloadingTls>,
     jwt: Arc<JwtVerifier>,
-    /// Shares breaker state with the `/flap` route.
-    flap: Upstream,
+    table: SharedTable,
+}
+
+/// Harness settings. `failure_threshold` defaults to core's 3; the blame
+/// tests use 1, so a single wrongly blamed failure opens the circuit and
+/// shows up as a 503.
+struct Opts {
+    tenant_rps: u32,
+    limits: Limits,
+    failure_threshold: u32,
+    /// Extra `[[routes]]` TOML appended to the standard set.
+    extra_routes: String,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            tenant_rps: 0,
+            limits: Limits::default(),
+            failure_threshold: 3,
+            extra_routes: String::new(),
+        }
+    }
+}
+
+/// One breaker failure opens the circuit (see [`Opts`]).
+fn strict() -> Opts {
+    Opts {
+        failure_threshold: 1,
+        ..Opts::default()
+    }
 }
 
 impl Harness {
     async fn new(tenant_rps: u32) -> Self {
-        Self::build(tenant_rps, Limits::default(), |t| t).await
+        Self::build(
+            Opts {
+                tenant_rps,
+                ..Opts::default()
+            },
+            |t| t,
+        )
+        .await
     }
 
+    /// Threshold 1: these callers check that a client-side failure leaves
+    /// the breaker closed.
     async fn with_limits(tenant_rps: u32, limits: Limits) -> Self {
-        Self::build(tenant_rps, limits, |t| t).await
+        Self::build(
+            Opts {
+                tenant_rps,
+                limits,
+                failure_threshold: 1,
+                ..Opts::default()
+            },
+            |t| t,
+        )
+        .await
     }
 
     /// `tune` adjusts the routing table (its timeouts) before serving.
-    async fn build(
-        tenant_rps: u32,
-        limits: Limits,
-        tune: impl FnOnce(RouteTable) -> RouteTable,
-    ) -> Self {
+    async fn build(opts: Opts, tune: impl FnOnce(RouteTable) -> RouteTable) -> Self {
         install_crypto_provider();
         let certs = TestCerts::generate();
         let upstream_addr = spawn_upstream().await;
+        let flaky_addr = spawn_upstream().await;
+        let burst_addr = spawn_upstream().await;
         let sse_addr = spawn_sse_upstream().await;
         let trunc_addr = spawn_truncating_upstream().await;
         let early_addr = spawn_early_upstream().await;
         let strict_addr = spawn_strict_read_upstream().await;
         let dying_addr = spawn_dying_upstream().await;
         let wt_addr = spawn_write_timeout_upstream().await;
-        let down_addr = closed_port();
+        let (probe_addr, down_addr) = closed_ports();
 
         let tls = ReloadingTls::new(
             certs.server_cert_path.to_str().unwrap(),
@@ -554,69 +622,46 @@ impl Harness {
         )
         .unwrap();
         let jwt = Arc::new(JwtVerifier::new(JWT_PUB_PEM).unwrap());
-        let limiter = build_limiter(tenant_rps);
+        let limiter = build_limiter(opts.tenant_rps);
 
-        let flap = Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 2);
-        let table = RouteTable::new(vec![
-            ("/flap".to_string(), flap.clone()),
+        let mut core = format!("failure_threshold = {}\n", opts.failure_threshold);
+        for (prefix, addr, extra) in [
+            ("/svc-a", upstream_addr, ""),
+            ("/slow", upstream_addr, ""),
+            ("/rewrite", upstream_addr, "rewrite_host = true"),
+            ("/sse", sse_addr, ""),
+            ("/trunc", trunc_addr, ""),
+            ("/early", early_addr, ""),
+            ("/strict-a", strict_addr, ""),
+            ("/strict-b", strict_addr, ""),
+            ("/strict-g", strict_addr, ""),
+            ("/dies", dying_addr, ""),
+            ("/wt", wt_addr, ""),
             (
-                "/svc-a".to_string(),
-                Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
+                "/flaky",
+                flaky_addr,
+                "cooldown_secs = 1\nhealth_path = \"/missing\"",
             ),
-            (
-                "/rewrite".to_string(),
-                Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30)
-                    .with_rewrite_host(true),
-            ),
-            (
-                "/slow".to_string(),
-                Upstream::new(format!("http://{upstream_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/strict-a".to_string(),
-                Upstream::new(format!("http://{strict_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/strict-b".to_string(),
-                Upstream::new(format!("http://{strict_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/dies".to_string(),
-                Upstream::new(format!("http://{dying_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/wt".to_string(),
-                Upstream::new(format!("http://{wt_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/early".to_string(),
-                Upstream::new(format!("http://{early_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/trunc".to_string(),
-                Upstream::new(format!("http://{trunc_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/sse".to_string(),
-                Upstream::new(format!("http://{sse_addr}").parse().unwrap(), 30),
-            ),
-            (
-                "/probe".to_string(),
-                Upstream::new(format!("http://{down_addr}").parse().unwrap(), 1),
-            ),
-            (
-                "/down".to_string(),
-                Upstream::new(format!("http://{down_addr}").parse().unwrap(), 30),
-            ),
-        ]);
-        let table = reload::new_shared(tune(table));
+            ("/burst", burst_addr, "cooldown_secs = 3"),
+            ("/probe", probe_addr, "cooldown_secs = 1"),
+            ("/down", down_addr, ""),
+        ] {
+            core += &format!(
+                "[[routes]]\nprefix = \"{prefix}\"\nupstream = \"http://{addr}\"\n{extra}\n"
+            );
+        }
+        core += &opts
+            .extra_routes
+            .replace("UPSTREAM", &format!("http://{upstream_addr}"));
+        let cfg = ConfigToml::from_table(core.parse::<toml::Table>().unwrap()).unwrap();
+        let table = reload::new_shared(tune(build_table(cfg, None).unwrap()));
 
         let client: UpstreamClient =
             Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
         let state = Arc::new(AppState {
             tls: tls.clone(),
-            table,
+            table: table.clone(),
             jwt: jwt.clone(),
             limiter,
             client,
@@ -624,7 +669,12 @@ impl Harness {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_with(listener, state, limits, std::future::pending()));
+        tokio::spawn(serve_with(
+            listener,
+            state,
+            opts.limits,
+            std::future::pending(),
+        ));
 
         Self {
             certs,
@@ -632,8 +682,13 @@ impl Harness {
             proxy_addr,
             tls,
             jwt,
-            flap,
+            table,
         }
+    }
+
+    /// Breaker state of the upstream behind `prefix`.
+    fn circuit(&self, prefix: &str) -> CircuitState {
+        self.table.load().lookup(prefix).unwrap().upstream.state()
     }
 
     fn url(&self, path: &str) -> String {
@@ -1231,14 +1286,16 @@ async fn dot_segment_variants_are_rejected_and_legit_paths_pass() {
 }
 
 /// A 400 bad path must not consume the half-open probe slot: the bad-path
-/// check runs before `RouteTable::lookup`. If it ran after, the 400 request
+/// check runs before `Upstream::try_acquire`. If it ran after, the 400 request
 /// would take the probe and the next normal request would see 503, not 502.
 #[tokio::test]
 async fn bad_path_does_not_consume_half_open_probe() {
     let h = Harness::new(0).await;
     let token = mint_jwt("tenant-a", 3600, "read");
-    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
-    assert!(s.contains(" 502"), "{s}"); // breaker opens
+    for _ in 0..3 {
+        let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+        assert!(s.contains(" 502"), "{s}");
+    } // the third failure opens the breaker
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await; // cooldown (1s) elapsed
     let (s, rest) = raw_get(&h, "/probe/..%2fx", Some(&token)).await;
     assert!(
@@ -1289,8 +1346,10 @@ async fn upgrade_requests_get_501_but_h2c_is_proxied() {
 async fn upgrade_does_not_consume_half_open_probe() {
     let h = Harness::new(0).await;
     let token = mint_jwt("tenant-a", 3600, "read");
-    let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
-    assert!(s.contains(" 502"), "{s}"); // breaker opens
+    for _ in 0..3 {
+        let (s, _) = raw_get(&h, "/probe/x", Some(&token)).await;
+        assert!(s.contains(" 502"), "{s}");
+    } // the third failure opens the breaker
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await; // cooldown (1s) elapsed
     let (s, _) = raw_get_with(&h, "/probe/x", Some(&token), WS).await;
     assert!(s.contains(" 501"), "{s}");
@@ -1314,29 +1373,6 @@ async fn silent_client_is_disconnected() {
         .unwrap_or(0);
     assert_eq!(n, 0, "expected EOF");
     assert!(started.elapsed() >= std::time::Duration::from_secs(9));
-}
-
-#[tokio::test]
-async fn upstream_down_trips_the_breaker() {
-    let h = Harness::new(0).await;
-    let client = h.client();
-    let token = mint_jwt("tenant-a", 3600, "read");
-
-    let resp1 = client
-        .get(h.url("/down/anything"))
-        .header("authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp1.status(), 502);
-
-    let resp2 = client
-        .get(h.url("/down/anything"))
-        .header("authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), 503);
 }
 
 // ----- (h) TLS hot reload ----------------------------------------------------
@@ -1402,7 +1438,7 @@ async fn configured_body_cap_is_enforced() {
 
 #[tokio::test]
 async fn configured_upstream_timeout_gives_504() {
-    let h = Harness::build(0, Limits::default(), |mut t| {
+    let h = Harness::build(strict(), |mut t| {
         t.upstream_timeout = Duration::from_secs(1);
         t
     })
@@ -1440,10 +1476,7 @@ async fn configured_first_request_timeout_closes_silent_client() {
 async fn huge_keepalive_timeout_does_not_panic_h1_connections() {
     // Library callers can pass unvalidated timeouts; hyper adds the header
     // read timeout to `now()` without overflow checks, so serve_with caps it.
-    let h = Harness::build(0, Limits::default(), |t| {
-        t.with_keepalive_timeout(Duration::MAX)
-    })
-    .await;
+    let h = Harness::build(strict(), |t| t.with_keepalive_timeout(Duration::MAX)).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let resp = h
         .client_http1_only()
@@ -1555,7 +1588,7 @@ async fn huge_first_request_timeout_does_not_panic_h1_connections() {
 async fn keepalive_timeout_closes_idle_h1_connection() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::build(0, Limits::default(), |t| {
+    let h = Harness::build(strict(), |t| {
         t.with_keepalive_timeout(Duration::from_secs(1))
     })
     .await;
@@ -1592,7 +1625,7 @@ async fn keepalive_timeout_closes_idle_h1_connection() {
 async fn configured_request_body_timeout_gives_408() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::build(0, Limits::default(), |t| {
+    let h = Harness::build(strict(), |t| {
         t.with_request_body_timeout(Duration::from_secs(1))
     })
     .await;
@@ -1625,7 +1658,7 @@ async fn configured_request_body_timeout_gives_408() {
 /// blamed on the upstream: the deadline ends at the response head.
 #[tokio::test]
 async fn sse_outlives_the_upstream_timeout_and_keeps_the_breaker_closed() {
-    let h = Harness::build(0, Limits::default(), |mut t| {
+    let h = Harness::build(strict(), |mut t| {
         t.upstream_timeout = Duration::from_secs(1);
         t
     })
@@ -1674,7 +1707,7 @@ async fn fifty_mib_upload_streams_with_no_default_cap() {
 async fn stalled_upload_is_408_and_does_not_trip_the_breaker() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::build(0, Limits::default(), |t| {
+    let h = Harness::build(strict(), |t| {
         t.with_request_body_idle_timeout(Duration::from_secs(1))
     })
     .await;
@@ -1706,7 +1739,7 @@ async fn stalled_upload_is_408_and_does_not_trip_the_breaker() {
 async fn client_hanging_up_mid_upload_does_not_trip_the_breaker() {
     use tokio::io::AsyncWriteExt;
 
-    let h = Harness::new(0).await;
+    let h = Harness::build(strict(), |t| t).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
     let req = format!(
@@ -1729,7 +1762,7 @@ async fn client_hanging_up_mid_upload_does_not_trip_the_breaker() {
 
 #[tokio::test]
 async fn client_hanging_up_mid_stream_does_not_trip_the_breaker() {
-    let h = Harness::new(0).await;
+    let h = Harness::build(strict(), |t| t).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let get = |p: &str| {
         h.client()
@@ -1756,7 +1789,7 @@ async fn client_hanging_up_mid_stream_does_not_trip_the_breaker() {
 async fn upstream_timeout_starts_after_upload_regression() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::build(0, Limits::default(), |mut t| {
+    let h = Harness::build(strict(), |mut t| {
         t.upstream_timeout = Duration::from_secs(1);
         t
     })
@@ -1783,51 +1816,11 @@ async fn upstream_timeout_starts_after_upload_regression() {
     assert!(text.ends_with("16"), "{text}");
 }
 
-/// A client that takes the half-open probe and aborts its upload must neither
-/// close the breaker (an abort is not a success) nor wedge it: the unreported
-/// probe is re-armed after one cooldown and a good request then closes it.
-#[tokio::test]
-async fn aborted_half_open_probe_neither_closes_nor_wedges_the_breaker() {
-    use tokio::io::AsyncWriteExt;
-
-    let h = Harness::new(0).await;
-    let token = mint_jwt("tenant-a", 3600, "read");
-    let get = || {
-        h.client()
-            .get(h.url("/flap/x"))
-            .header("authorization", format!("Bearer {token}"))
-            .send()
-    };
-    h.flap.mark_failed();
-    assert_eq!(get().await.unwrap().status(), 503, "open within cooldown");
-    tokio::time::sleep(Duration::from_millis(2200)).await;
-
-    // Cooldown over: this upload is admitted as the probe, then abandoned.
-    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
-    let req = format!(
-        "POST /flap/upload HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
-         transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
-    );
-    tls.write_all(req.as_bytes()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    drop(tls);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        get().await.unwrap().status(),
-        503,
-        "abort must not close the breaker"
-    );
-
-    tokio::time::sleep(Duration::from_millis(2200)).await;
-    assert_eq!(get().await.unwrap().status(), 200, "stale probe re-armed");
-    assert_eq!(get().await.unwrap().status(), 200, "breaker closed");
-}
-
 /// A body error after a healthy 200 head is the upstream's fault: the breaker
 /// opens. (A slow or long body, or a client hang-up, never does.)
 #[tokio::test]
 async fn upstream_body_reset_after_200_head_trips_the_breaker() {
-    let h = Harness::new(0).await;
+    let h = Harness::build(strict(), |t| t).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let get = |p: &str| {
         h.client()
@@ -1851,7 +1844,7 @@ async fn upstream_body_reset_after_200_head_trips_the_breaker() {
 async fn trickling_upload_past_the_total_deadline_is_408_and_breaker_stays_closed() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::build(0, Limits::default(), |t| {
+    let h = Harness::build(strict(), |t| {
         t.with_request_body_idle_timeout(Duration::from_secs(1))
             .with_request_body_timeout(Duration::from_secs(2))
     })
@@ -1900,7 +1893,7 @@ async fn trickling_upload_past_the_total_deadline_is_408_and_breaker_stays_close
 async fn client_stalling_after_an_early_upstream_answer_does_not_trip_the_breaker() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::build(0, Limits::default(), |t| {
+    let h = Harness::build(strict(), |t| {
         t.with_request_body_idle_timeout(Duration::from_secs(1))
     })
     .await;
@@ -1939,7 +1932,7 @@ async fn client_stalling_after_an_early_upstream_answer_does_not_trip_the_breake
 async fn upstream_read_timeout_during_a_client_stall_does_not_trip_the_breaker() {
     use tokio::io::AsyncWriteExt;
 
-    let h = Harness::build(0, Limits::default(), |t| {
+    let h = Harness::build(strict(), |t| {
         t.with_request_body_idle_timeout(Duration::from_secs(5))
             .with_request_body_timeout(Duration::from_secs(30))
     })
@@ -1974,7 +1967,7 @@ async fn upstream_read_timeout_during_a_client_stall_does_not_trip_the_breaker()
 async fn upstream_dying_mid_upload_while_the_client_sends_trips_the_breaker() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::new(0).await;
+    let h = Harness::build(strict(), |t| t).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let tls = tls_connect(h.proxy_addr, &h.certs).await;
     let (mut rd, mut wr) = tokio::io::split(tls);
@@ -2016,7 +2009,7 @@ async fn upstream_dying_mid_upload_while_the_client_sends_trips_the_breaker() {
 async fn upstream_write_timeout_during_a_paused_reader_does_not_trip_the_breaker() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = Harness::new(0).await;
+    let h = Harness::build(strict(), |t| t).await;
     let token = mint_jwt("tenant-a", 3600, "read");
     let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
     let req = format!(
@@ -2048,4 +2041,260 @@ async fn upstream_write_timeout_during_a_paused_reader_does_not_trip_the_breaker
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "breaker must stay closed");
+}
+
+// ----- ferryman-core: threshold, normalised lookup, health, admission ------
+
+/// Edge 0.1.x opened on the first failure; core's breaker needs three in a
+/// row (one 502 used to blackhole a route for a whole cooldown).
+#[tokio::test]
+async fn breaker_opens_on_the_third_consecutive_failure() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for i in 1..=3 {
+        let (s, _) = raw_get(&h, "/down/x", Some(&token)).await;
+        assert!(s.contains(" 502"), "attempt {i}: {s}");
+    }
+    let (s, _) = raw_get(&h, "/down/x", Some(&token)).await;
+    assert!(s.contains(" 503"), "{s}");
+}
+
+/// Matching uses core's normalised path; the upstream still receives the
+/// bytes the client sent. An encoded separator that would pick a different
+/// route under an upstream's reading is 400 (`ambiguous_route`).
+#[tokio::test]
+async fn routes_match_the_normalised_path_but_forward_it_raw() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for (p, want) in [
+        ("/%73vc-a/x", 200),
+        ("//svc-a/x", 200),
+        ("/svc-a//x", 200),
+        ("/SVC-A/x", 404),
+        ("/svc-a%2fx", 400),
+    ] {
+        let (s, rest) = raw_get(&h, p, Some(&token)).await;
+        assert!(s.contains(&format!(" {want}")), "{p}: {s}");
+        if want == 200 {
+            assert!(
+                rest.contains(&format!("x-echo-path: {p}\r\n")),
+                "{p} forwarded raw: {rest}"
+            );
+        }
+    }
+}
+
+/// With a `/` catch-all next to `/api`, a path an upstream could read as
+/// `/api/...` (encoded or back slash, `;params`) while the proxy routes it
+/// to `/` is 400. It is checked right after `bad_path`, before Host and the
+/// upgrade check. An encoded slash that does not change the route passes.
+#[tokio::test]
+async fn ambiguous_routes_are_rejected_before_host_and_upgrade_checks() {
+    let h = Harness::build(
+        Opts {
+            extra_routes: "[[routes]]\nprefix = \"/\"\nupstream = \"UPSTREAM\"\n\
+                           [[routes]]\nprefix = \"/api\"\nupstream = \"UPSTREAM\"\n"
+                .into(),
+            ..Opts::default()
+        },
+        |t| t,
+    )
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for p in [
+        "/api%2Fsecret",
+        "/api%5Csecret",
+        "/api\\secret",
+        "/api;x/secret",
+    ] {
+        let (s, rest) = raw_get(&h, p, Some(&token)).await;
+        assert!(
+            s.contains(" 400") && rest.ends_with("bad path"),
+            "{p}: {s} {rest}"
+        );
+        let (s, rest) = raw_get_with(&h, p, Some(&token), WS).await;
+        assert!(rest.ends_with("bad path"), "{p} before 501: {s} {rest}");
+        let (s, rest) = raw_host(&h, &token, &["a", "b"]).await;
+        assert!(rest.ends_with("bad host"), "control: {s}");
+    }
+    // Ordering against Host: the ambiguous path wins over a duplicate Host.
+    let (s, rest) = raw_get_with(&h, "/api%2Fsecret", Some(&token), "host: other\r\n").await;
+    assert!(rest.ends_with("bad path"), "before Host: {s} {rest}");
+
+    let p = "/api/v4/projects/group%2Fproject";
+    let (s, rest) = raw_get(&h, p, Some(&token)).await;
+    assert!(s.contains(" 200"), "{p}: {s}");
+    assert!(rest.contains(&format!("x-echo-path: {p}\r\n")), "{rest}");
+}
+
+/// Core health semantics: any answer below 500 means the upstream is up.
+#[tokio::test]
+async fn health_probe_answering_404_keeps_the_route_up() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    tokio::spawn(health_loop(h.table.clone(), Duration::from_millis(100)));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(h.circuit("/flaky"), CircuitState::Closed);
+    let (s, _) = raw_get(&h, "/flaky/ok", Some(&token)).await;
+    assert!(s.contains(" 200"), "{s}");
+}
+
+/// Opens `/flaky` (three 502s) and waits out its 1 s cooldown.
+async fn open_flaky_and_wait(h: &Harness, token: &str) {
+    for _ in 0..3 {
+        let (s, _) = raw_get(h, "/flaky/fail", Some(token)).await;
+        assert!(s.contains(" 502"), "{s}");
+    }
+    let (s, _) = raw_get(h, "/flaky/ok", Some(token)).await;
+    assert!(s.contains(" 503"), "open: {s}");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+}
+
+/// The half-open probe is admitted, then its client hangs up mid-upload.
+/// That says nothing about the upstream: the circuit must not close, and the
+/// ticket is released, so the very next request can probe (no extra
+/// cooldown). The route has no health loop to rescue it.
+#[tokio::test]
+async fn client_aborted_probe_does_not_close_the_breaker() {
+    use tokio::io::AsyncWriteExt;
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    open_flaky_and_wait(&h, &token).await;
+
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /flaky/ok HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.circuit("/flaky"),
+        CircuitState::HalfOpen,
+        "probe admitted"
+    );
+    drop(tls);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_ne!(
+        h.circuit("/flaky"),
+        CircuitState::Closed,
+        "an aborted probe must not close the circuit"
+    );
+
+    let (s, _) = raw_get(&h, "/flaky/ok", Some(&token)).await;
+    assert!(
+        s.contains(" 200"),
+        "released probe slot is usable at once: {s}"
+    );
+    assert_eq!(h.circuit("/flaky"), CircuitState::Closed);
+}
+
+/// h2 variant: the probe waits on a slow upstream and the client resets the
+/// stream. hyper drops the handler future; the ticket's drop releases it.
+#[tokio::test]
+async fn h2_reset_probe_is_released() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    open_flaky_and_wait(&h, &token).await;
+
+    let client = h.client();
+    let err = client
+        .get(h.url("/flaky/slow"))
+        .header("authorization", format!("Bearer {token}"))
+        .timeout(Duration::from_millis(300))
+        .send()
+        .await
+        .expect_err("timed out: the stream is reset");
+    assert!(err.is_timeout(), "{err}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        h.circuit("/flaky"),
+        CircuitState::HalfOpen,
+        "probe admitted"
+    );
+
+    let resp = client
+        .get(h.url("/flaky/ok"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(resp.status(), 200, "released probe slot is usable at once");
+}
+
+/// A burst of clients that take the half-open probe and abort re-arms the
+/// slot at most once per cooldown: the following requests are refused, not
+/// all turned into probes against the still-sick upstream.
+#[tokio::test]
+async fn aborted_probe_burst_rearms_at_most_once_per_cooldown() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for _ in 0..3 {
+        let (s, _) = raw_get(&h, "/burst/fail", Some(&token)).await;
+        assert!(s.contains(" 502"), "{s}");
+    }
+    tokio::time::sleep(Duration::from_millis(3100)).await; // cooldown 3 s
+
+    let mut admitted = 0;
+    for _ in 0..20 {
+        let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+        let req = format!(
+            "POST /burst/up HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+             transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_millis(150), tls.read(&mut buf)).await {
+            // Refused at once: 503.
+            Ok(Ok(n)) => {
+                let line = String::from_utf8_lossy(&buf[..n]);
+                assert!(line.starts_with("HTTP/1.1 503"), "{line}");
+            }
+            // Forwarded and waiting on the upload: a probe. Abort it.
+            _ => admitted += 1,
+        }
+        drop(tls);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        (1..=2).contains(&admitted),
+        "the probe plus at most one re-arm, got {admitted}"
+    );
+    assert_ne!(h.circuit("/burst"), CircuitState::Closed);
+    let (s, _) = raw_get(&h, "/burst/fail", Some(&token)).await;
+    assert!(s.contains(" 503"), "no further probe this cooldown: {s}");
+}
+
+/// A gateway upstream whose backend gives up on a stalled upload answers
+/// 502. The client stalled for at least θ, so the 502 is forwarded but not
+/// blamed (ferryman does the same).
+#[tokio::test]
+async fn gateway_502_after_a_client_stall_does_not_trip_the_breaker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(strict(), |t| {
+        t.with_request_body_idle_timeout(Duration::from_secs(5))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let req = format!(
+        "POST /strict-g/up HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
+        .await
+        .expect("gateway answered")
+        .unwrap();
+    let line = String::from_utf8_lossy(&buf[..n]);
+    assert!(line.starts_with("HTTP/1.1 502"), "{line}");
+    drop(tls);
+    let (s, _) = raw_get(&h, "/strict-g/after", Some(&token)).await;
+    assert!(s.contains(" 200"), "breaker must stay closed: {s}");
 }
