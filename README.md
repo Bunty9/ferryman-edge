@@ -41,8 +41,8 @@ Cloudflare Pingora team to reply.
                        |
                        v
               +--------+---------+
-              | RouteService     |
-              | (P2's table)     |
+              | ferryman-core    |  routing table, breaker,
+              | 0.3 RouteTable   |  health checks
               +--------+---------+
                        |
                        v
@@ -64,6 +64,7 @@ Cloudflare Pingora team to reply.
 | TLS / mTLS            | `rustls` 0.23 (`ring` provider) + `tokio-rustls` 0.26 |
 | AuthN                 | `jsonwebtoken` 9 + `moka` 0.12 (`future` cache, 10k × 5min) |
 | Rate limit            | `governor` 0.7 (keyed GCRA)                               |
+| Routing / breaker     | `ferryman-core` 0.3 (prefix table, Admission-ticket breaker, health checks, core config) |
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |
 | Observability         | `tracing` + `metrics-exporter-prometheus` 0.16            |
 | CLI                   | `clap` 4                                                  |
@@ -138,9 +139,11 @@ Every request passes the same gates, in order:
 | TLS handshake, client cert must chain to `client_ca_path` (10 s by default; `tls_handshake_timeout_secs`) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
 | `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
 | Per-tenant GCRA limit keyed by `sub` (`[limits] tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
-| No `.` / `..` path segments (incl. `%2e`) | `400` | `ferryman_requests_total{status}` |
+| No `.` / `..` path segments (incl. `%2e`), and no ambiguous route: a path that an upstream reading `%2F` / `%5C` / `\` as `/` or dropping `;params` would send to a different route (`/api%2Fsecret` next to a `/` catch-all) | `400` bad path | `ferryman_requests_total{status}` |
+| One valid `Host` (or a request-target authority); HTTP/1.1 needs one | `400` bad host | `ferryman_requests_total{status}` |
 | Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
-| Longest-prefix route on a path-segment boundary; no fall-through to a shorter prefix | `404` no route, `503` breaker open | |
+| Longest-prefix route on a path-segment boundary, matched on a normalised path (`%XX` of unreserved characters decoded, `//` merged; the upstream still gets the raw path); no fall-through to a shorter prefix | `404` no route | |
+| Breaker admission (`Upstream::try_acquire`) | `503` circuit open | |
 | Body ≤ `max_request_body_bytes` if set (no cap by default; declared Content-Length checked before routing, chunked bodies mid-stream) | `413` | |
 | Upload: ≤ 30 s between body frames, ≤ 300 s total (`request_body_idle_timeout_secs` / `request_body_timeout_secs`) | `408` slow client, `400` body error | |
 | Upstream response head within 30 s of the end of the upload (`upstream_timeout_secs`); the response body then streams with no deadline | `502` transport error, `504` timeout | `ferryman_request_duration_seconds{upstream}` (success path) |
@@ -157,31 +160,36 @@ the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
 handshake is closed (this also covers a stalled h2 preface); h2 connections
 then get keep-alive pings and a 64-stream cap.
 
-Each upstream has a Closed / Open / HalfOpen circuit breaker
+Each upstream `host:port` has one Closed / Open / HalfOpen circuit breaker
+from ferryman-core 0.3, shared by every route that uses it
 (`ferryman_circuit_state{upstream}`: 0/1/2; `cooldown_secs` must be ≥ 1).
-A transport error, a 502–504, or a timeout opens it; after `cooldown_secs`
-exactly one request is let through as the probe. A response that has started
-streaming never counts against the breaker however long it lasts; only an
-error from the upstream body does. While half-open, a client that abandons
-the probe request delays recovery by one cooldown (routes with active health
-checks recover on the next healthy probe). A plain `500` does not trip it,
-and neither does a failure caused by the client's own body (size cap,
-disconnect, stall), even if the upstream had already answered. An upstream
-that hangs up after the client stalled its upload, or paused reading the
-response, for at least θ = min(1 s, `request_body_idle_timeout_secs` / 2,
-at least 100 ms) is not blamed either; an upstream that fails while the
-client sends or reads without such a pause generally is. Known limits, where
-the upstream is blamed for what the client did: its own read or write
-timeout is under θ; it is a gateway answering 502/504 because its own
-backend timed out on a stalled upload; or it has a total request or response
-deadline (e.g. Go `http.Server` `ReadTimeout` / `WriteTimeout`) that a slow
-but steady client exceeds, since every gap is under θ and the stall
-exemption does not apply. The active health
-checker (`GET <upstream>/health` every `health_interval_secs`; per-route
-`health_path` / `health_disabled` change or skip the probe) opens and
-closes it too. A route reload keeps breaker state for rules whose prefix,
-upstream, cooldown, and health settings (`health_path` / `health_disabled`,
-compared by effective value) are unchanged.
+It opens after `failure_threshold` (default 3) consecutive upstream
+failures: transport errors, 502–504, timeouts. After `cooldown_secs`
+exactly one request is let through as the probe; its result decides, and a
+late result of an ordinary request can no longer close an open circuit. A
+response that has started streaming never counts against the breaker however
+long it lasts; only an error from the upstream body does (ferryman itself
+never blames after the response head; edge does on purpose). A plain `500`
+does not count, and neither does a failure caused by the client's own body
+(size cap, disconnect, stall), even if the upstream had already answered.
+A request that ends without a verdict on the upstream (client body error,
+hang-up, h2 stream reset) hands its admission back: an abandoned half-open
+probe is re-armed at once, at most once per cooldown. An upstream that hangs
+up after the client stalled its upload, or paused reading the response, for
+at least θ = min(1 s, `request_body_idle_timeout_secs` / 2, at least
+100 ms) is not blamed either, nor is a forwarded 502–504 when the client
+stalled its upload that long at any point of the request (a gateway whose
+backend gave up on it); an upstream that fails while the client sends or
+reads without such a pause generally is. Known limits, where the upstream is
+blamed for what the client did: its own read or write timeout is under θ;
+or it has a total request or response deadline (e.g. Go `http.Server`
+`ReadTimeout` / `WriteTimeout`) that a slow but steady client exceeds, since
+every gap is under θ and the stall exemption does not apply. The active
+health checker (`GET <upstream>/health` every `health_interval_secs`, all
+upstreams concurrently; per-route `health_path` / `health_disabled` change
+or skip the probe) opens and closes it too: any status below 500 counts as
+up. A route reload keeps breaker state per upstream `host:port`, so an open
+circuit stays open even when its routes change.
 
 SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
 25 s by default (`shutdown_drain_secs`). SIGUSR1 reloads TLS material, the
@@ -190,10 +198,9 @@ the JWT public key (read from the boot-time path; the token cache is
 cleared). `[limits]`, `issuer` / `audience`,
 `health_interval_secs` and `keepalive_timeout_secs` are read once at boot.
 
-Route prefixes match the raw, undecoded request path and are not access
-control: every route shares the same mTLS + JWT + rate-limit policy, so do
-not rely on prefixes to separate privileges. Normalised matching is planned
-before any per-route policy.
+Every route shares one mTLS + JWT + rate-limit policy; prefixes are
+routing, not access control. Matching is case-sensitive, so an upstream that
+folds case (`/API/x`) can still see a path the proxy routed elsewhere.
 
 Set `[jwt] issuer` and `audience` for anything beyond local dev — without
 them, any token signed by the issuer key is accepted, whichever service it

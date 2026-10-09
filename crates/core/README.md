@@ -4,7 +4,11 @@
 [![docs.rs](https://img.shields.io/docsrs/ferryman-edge-core)](https://docs.rs/ferryman-edge-core)
 
 Building blocks behind the [`ferryman-edge`](https://github.com/Bunty9/ferryman-edge)
-mTLS reverse proxy. No HTTP serving here — the
+mTLS reverse proxy: mTLS, JWT, per-tenant rate limiting and the edge config.
+Routing, the circuit breaker and health checks come from
+[`ferryman-core`](https://crates.io/crates/ferryman-core) 0.3, re-exported
+as `ferryman_edge_core::ferryman_core` so you get the exact version this
+crate was built against. No HTTP serving here — the
 [`ferryman-edge`](https://crates.io/crates/ferryman-edge) crate
 wires these behind a `tokio-rustls` acceptor.
 
@@ -13,9 +17,8 @@ wires these behind a `tokio-rustls` acceptor.
 | `tls` | `build_mtls_config` (rustls 0.23 + ring, required client certs, ALPN h2/http1.1) and `ReloadingTls`, which swaps cert/key/client-CA atomically on `SIGUSR1` or `reload()` |
 | `jwt` | `JwtVerifier`: RS256 with a 10k-entry / 5-minute moka cache; `exp` re-checked on cache hits, `nbf` enforced, optional `iss` / `aud`; `reload_key` swaps the public key and clears the cache (no-op if the PEM is unchanged) |
 | `ratelimit` | Per-tenant GCRA limiter (`governor`), `0` rps = disabled, `spawn_gc` to bound per-tenant state |
-| `route` | `RouteTable` with segment-boundary longest-prefix matching and a lock-free Closed / Open / HalfOpen circuit breaker per upstream |
-| `health` | Active `/health` probe loop feeding the breaker |
-| `config` | `EdgeConfig::parse` (`[mtls]`, `[jwt]`, `[limits]`) over the core-shaped `ConfigToml`; `build_table` |
+| `config` | `EdgeConfig::parse` (`[mtls]`, `[jwt]`, `[limits]`) over `ferryman_core::ConfigToml`; errors are `ConfigError` (core errors wrapped as `ConfigError::Core`) |
+| `ferryman_core` | Re-export: `RouteTable`, `Upstream` with its Admission-ticket breaker, `build_table`, `health_loop`, `path::{bad_path, ambiguous_route}` |
 
 ```rust
 use ferryman_edge_core::{build_limiter, check, JwtVerifier};
@@ -27,6 +30,26 @@ async fn authorize(pem: &[u8], token: &str) -> anyhow::Result<bool> {
         Some(claims) => check(&limiter, &claims.sub),
         None => false,
     })
+}
+```
+
+Routing from the same config file:
+
+```rust
+use ferryman_edge_core::ferryman_core::build_table;
+use ferryman_edge_core::EdgeConfig;
+
+fn table(raw: &str) -> anyhow::Result<()> {
+    let cfg = EdgeConfig::parse(raw)?;
+    let table = build_table(cfg.core, None)?;
+    if let Some(route) = table.lookup("/svc-a/users") {
+        if let Some(ticket) = route.upstream.try_acquire() {
+            // forward, then report: record_success / record_failure, or
+            // release when the request ended without a verdict
+            route.upstream.record_success(ticket);
+        }
+    }
+    Ok(())
 }
 ```
 

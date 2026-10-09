@@ -29,9 +29,13 @@ SIGUSR1 reloads.
 
 ## Layout
 
-- `crates/core` — primitives, no HTTP serving: `route.rs` (RouteTable +
-  lock-free breaker), `jwt.rs`, `ratelimit.rs`, `tls.rs` (ReloadingTls),
-  `health.rs`, `config.rs`. JWT test keys in `crates/core/tests/fixtures`.
+- `crates/core` — primitives, no HTTP serving: `config.rs` (`EdgeConfig`
+  two-pass parse over `ferryman_core::ConfigToml`; `reject_unsupported`
+  lists core keys edge does not implement yet), `jwt.rs`, `ratelimit.rs`,
+  `tls.rs` (ReloadingTls). Routing, breaker and health come from
+  `ferryman-core` (re-exported as `ferryman_edge_core::ferryman_core`; the
+  server crate uses the re-export, never a direct dependency). JWT test
+  keys in `crates/core/tests/fixtures`.
 - `crates/server/src/lib.rs` — accept loop (`serve` / `serve_with`) and
   auth middleware; `proxy.rs` — per-request forwarding; `reload.rs` —
   SIGUSR1 route + JWT key reload; `main.rs` — boot only.
@@ -50,10 +54,13 @@ SIGUSR1 reloads.
 
 - Hop-by-hop headers are stripped in `lib.rs` *before* `x-ferryman-tenant`
   is stamped; otherwise `Connection: x-ferryman-tenant` deletes it.
-- The 400 bad-path and 501 upgrade/CONNECT checks run in `proxy::handle_checked`
-  (called by `handle` and `handle_with`)
-  *before* `RouteTable::lookup` (a request that returns without reporting
-  back would leak the half-open probe slot). `Upgrade` is stripped as
+- Order in `proxy::handle_checked` (called by `handle` and `handle_with`):
+  `bad_path` → `ambiguous_route` (both 400 bad path, both from
+  `ferryman_core::path`, both on the raw path; `ambiguous_route` relies on
+  `bad_path` having run) → Host validation (400 bad host) → 501
+  upgrade/CONNECT → 413 declared length → `lookup` (404) →
+  `Upstream::try_acquire` (503). Everything before `try_acquire` needs no
+  admission. `Upgrade` is stripped as
   hop-by-hop, so `lib.rs` computes `proxy::wants_upgrade` before stripping
   and passes it to `handle_checked`; `h2c` is exempt.
 - Only upstream-caused failures may count against the breaker: transport
@@ -73,16 +80,25 @@ SIGUSR1 reloads.
   body while the client was not stalling. Client-side failures (body cap
   413, idle/total upload deadline 408, disconnect 400) and elapsed time in
   a response body (a long stream) must not count, or any tenant can open a
-  route's breaker for everyone. They must not call `mark_success` either,
-  or a client could close an open breaker by aborting an upload.
-- Bodies stream; nothing is buffered. Every rejection that needs no
-  upstream (400 bad path, 501 upgrade, 413 declared Content-Length, 404)
-  happens before `RouteTable::lookup`, because lookup may admit the request
-  as the breaker's single half-open probe. A probe that then fails on the
-  client's side reports nothing; the breaker re-arms a stale probe after
-  one cooldown.
-- `lookup` never falls through to a shorter prefix when the matching
-  upstream isn't routable; it returns `None` (503).
+  route's breaker for everyone. They must not record success either, or a
+  client could close an open breaker by aborting an upload. A forwarded
+  502–504 after the client stalled its upload for at least θ at any point
+  of the request is not blamed (ferryman does the same); edge's own 504
+  timer still is. Edge also blames response-body errors after the head;
+  ferryman does not (deliberate difference).
+- Every admission goes into a `proxy::Ticket` right after `try_acquire`;
+  only upstream-caused outcomes call `success` / `failure`, exactly once.
+  A ticket dropped without a verdict (client fault, stall-exempt upstream
+  failure, handler future dropped by a hang-up or h2 reset) calls
+  `Upstream::release`. Never release for an upstream timeout or error, and
+  never call `record_*` on an `Upstream` directly in the request path,
+  except `WatchedBody`'s one `record_failure(Admission::Normal)` for a
+  body error after the head.
+- Bodies stream; nothing is buffered.
+- Pass `RouteTable::lookup` the raw path (core normalises it for matching
+  only) and forward the raw path. `lookup` ignores breaker state and never
+  falls through to a shorter prefix (core's guarantee); an open circuit is
+  a 503 from `try_acquire`.
 - Outbound requests are downgraded to HTTP/1.1; hyper-util rejects
   h2-versioned requests on HTTP/1 upstream connections.
 - Metric labels stay bounded: `status`, upstream `host:port`, fixed
@@ -102,6 +118,13 @@ SIGUSR1 reloads.
   into it must be readable by that uid. The Dockerfile sets
   `RUSTUP_TOOLCHAIN=stable` because `rust-toolchain.toml` would otherwise
   switch cargo to a toolchain without the musl target.
+- `ferryman-core` comes from a git rev until 0.3.0 is on crates.io
+  (`deny.toml` `allow-git`); the release task switches it to the registry.
+  Its breaker opens after 3 consecutive failures by default: e2e blame
+  tests use `strict()` (threshold 1) so one wrong blame shows as a 503.
+  Routes on one `host:port` share a breaker and must agree on cooldown and
+  health keys, so tests that need isolated breakers spawn separate
+  upstreams.
 - Running the server in the background from a tool call: redirect its
   stdout/stderr to a file, or a trailing `| tail` waits forever.
 

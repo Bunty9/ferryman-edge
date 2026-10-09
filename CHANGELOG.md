@@ -36,10 +36,56 @@ Both crates share one version. Format follows
   you raised `first_request_timeout_secs`, also set top-level
   `keepalive_timeout_secs` to the same value (a warning says so at load).
 - Library: `parse_config`, `ConfigExt`, `RouteExt`, `build_table_ext` and
-  `TlsToml` are replaced by `EdgeConfig::parse`, `MtlsToml` and
-  `build_table(&ConfigToml)`; `Limits` loses `upstream_timeout_secs` /
-  `request_body_timeout_secs` and gains `tenant_rps`; `RouteTable` gains
-  `upstream_timeout` and timeout getters named like ferryman-core 0.3.
+  `TlsToml` are replaced by `EdgeConfig::parse` (returning
+  `Result<EdgeConfig, ConfigError>`, which wraps `ferryman_core::Error` as
+  `ConfigError::Core`) and `MtlsToml`; `Limits` loses
+  `upstream_timeout_secs` / `request_body_timeout_secs` and gains
+  `tenant_rps`.
+- Routing, circuit breaker, health checks and the core config now come
+  from `ferryman-core` 0.3 (edge's copies are deleted).
+  `ferryman-edge-core` no longer exports `route`, `health`, `RouteTable`,
+  `Upstream`, `SharedTable`, `health_loop`, `build_table`, `ConfigToml` or
+  `RouteToml`; it re-exports the crate as `ferryman_edge_core::ferryman_core`.
+  Migration: `ferryman_edge_core::X` becomes
+  `ferryman_edge_core::ferryman_core::X`; `build_table(&cfg.core)` becomes
+  `build_table(cfg.core, prev)`; `Upstream::new(uri, cooldown)` becomes the
+  fallible `Upstream::new(uri, BreakerConfig)` (cooldown at least 1 ms);
+  `mark_success` / `mark_failed` / `is_routable` become `try_acquire` plus
+  `record_success` / `record_failure` / `release` on the Admission ticket;
+  `RouteTable::lookup` returns a `Route` (`.upstream`, `.rewrite_host`) and
+  ignores breaker state. `proxy::handle` admits through
+  `Upstream::try_acquire` and reports through the ticket.
+- Breaker: one per upstream `host:port`, shared by the routes that use it
+  (was one per rule). It opens after `failure_threshold` (new key, default
+  3) consecutive upstream failures. A late result of an ordinary request
+  can no longer close an open circuit.
+- Health checks: any status below 500 counts as up (was 2xx only); probes
+  run concurrently. Migration: an upstream whose health path answers 4xx
+  while broken needs a real health endpoint, or `health_disabled = true`.
+  Health probes no longer speak TLS: an `https://` upstream is rejected at
+  load (forwarding never supported https).
+- Route prefixes match a normalised path (`%XX` of unreserved characters
+  decoded, other escapes' hex uppercased, `//` merged; still
+  case-sensitive), so `/%73vc-a/x` and `//svc-a/x` now reach `/svc-a`. The
+  upstream receives the raw path.
+- Paths that an upstream reading `%2F` / `%5C` / `\` as `/`, or dropping
+  `;params`, would send to a different route than the proxy chose get
+  `400 bad path` (`/api%2Fsecret` with a `/` catch-all next to `/api`),
+  checked right after the dot-segment check. Migration: send plain `/`
+  separators; an encoded slash that does not change the route
+  (`group%2Fproject`) still passes.
+- Config validation (from core): duplicate prefixes; prefixes not in
+  normalised form or containing `;`, `\`, `%2F` or `%5C`; upstreams with a
+  path, query or `https://` scheme; and routes sharing an upstream with
+  different `cooldown_secs` / `health_path` / `health_disabled` are
+  rejected. Core keys edge does not implement yet are rejected when set
+  (today only `trusted_proxies`: edge always replaces forwarding headers).
+- Reload carries breaker state by upstream `host:port`, so an open
+  circuit stays open across SIGUSR1 even when its routes change.
+- The `upstream` metric label is core's normalised `host:port` (lowercase,
+  default port filled in: `http://localhost` is `localhost:80`).
+  `ferryman_upstream_alive` now follows the circuit state (1 = closed) and
+  is written for `health_disabled` upstreams too.
 - Bodies always stream: the buffering (default) mode and the `boxed_body`
   feature are removed. `proxy::Body` is `BoxBody<Bytes, BoxErr>` and
   `UpstreamClient` is `Client<HttpConnector, proxy::RequestBody>`.
@@ -49,12 +95,14 @@ Both crates share one version. Format follows
 - `upstream_timeout_secs` runs from the end of the upload to the response
   head only; the response body has no deadline (a broken body still counts
   against the breaker, unless the client had stalled its upload or its
-  reads for at least θ = min(1 s, idle gap / 2), floored at 100 ms). Known
-  limits, where the upstream is still blamed: its own read/write timeout
-  is under θ; it is a gateway answering 502/504 because its backend timed
-  out on a stalled upload; or it has a total request or response deadline
-  (Go `http.Server` `ReadTimeout`/`WriteTimeout`) that a slow but steady
-  client exceeds, since every gap is under θ. Uploads have their own idle (30 s) and total
+  reads for at least θ = min(1 s, idle gap / 2), floored at 100 ms; a
+  forwarded 502–504 after such an upload stall is not blamed either).
+  Blaming a broken response body is a deliberate difference from
+  ferryman, which never blames after the response head. Known limits,
+  where the upstream is still blamed: its own read/write timeout is under
+  θ; or it has a total request or response deadline (Go `http.Server`
+  `ReadTimeout`/`WriteTimeout`) that a slow but steady client exceeds,
+  since every gap is under θ. Uploads have their own idle (30 s) and total
   deadlines and get 408. The total default (`request_body_timeout_secs`)
   rises from 30 s to 300 s.
 - The upstream sees the client's `Host` (h2 `:authority` included), not
@@ -75,6 +123,16 @@ Both crates share one version. Format follows
   `ferryman-edge-server --version`.
 
 ### Fixed
+- One 502 no longer blackholes a route for a whole cooldown (breaker
+  threshold 1 → 3).
+- Upstreams without a `/health` route (most third-party apps) no longer
+  flap between 503 and 200.
+- A client that takes the half-open probe and then hangs up, resets its h2
+  stream or fails its upload no longer holds the probe slot for a whole
+  cooldown: the admission is released and the next request probes (at most
+  once per cooldown, so a burst of aborts cannot turn into a probe flood).
+- A gateway upstream answering 502–504 because its backend gave up on a
+  client's stalled upload no longer counts against the breaker.
 - A long or slow streamed response (SSE, LLM, download) is no longer cut
   at 30 s and no longer opens the route's breaker for every tenant.
 
@@ -82,8 +140,8 @@ Both crates share one version. Format follows
 - SIGUSR1 leaves the JWT key and token cache alone when the PEM file is
   byte-for-byte unchanged (it used to flush the cache on every reload).
 - `metrics-exporter-prometheus` without its push-gateway client;
-  `reqwest` in `ferryman-edge-core` without TLS (health probes are plain
-  HTTP). `webpki-roots` and the CDLA-Permissive-2.0 licence allowance are
+  `reqwest` (now only via ferryman-core's health checker) without TLS
+  (health probes are plain HTTP). `webpki-roots` and the CDLA-Permissive-2.0 licence allowance are
   gone.
 - `edge-demo` uses committed test-only RSA keys for its JWT issuer
   instead of generating them.

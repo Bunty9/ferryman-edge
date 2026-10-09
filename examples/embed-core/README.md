@@ -20,7 +20,9 @@ What you give up by embedding:
 
 - **Routing**: no prefix table; your router does that.
 - **Circuit breaker and active health checks**: they protect a proxy's
-  upstreams, and you have none.
+  upstreams, and you have none. (If your service calls others,
+  `ferryman_edge_core::ferryman_core::Breaker` is the same breaker,
+  usable on its own.)
 - **A separate trust boundary**: a bug in your handlers now runs in the
   process that holds the TLS private key.
 - **Hot route reload**: there is no route table in embed mode, so there

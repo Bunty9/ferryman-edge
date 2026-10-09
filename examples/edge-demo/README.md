@@ -118,8 +118,8 @@ seq 8 | xargs -P8 -I{} curl -sS --cacert $D/ca.crt --cert $D/client.crt --key $D
 #   5 200
 #   3 429      (typically; a token refills every 200 ms, so a slow run can show 6 x 200)
 
-# 7. circuit breaker: kill inventory, wait two health intervals -> 503
-kill $INVENTORY; sleep 2
+# 7. circuit breaker: kill inventory, wait three failed health probes -> 503
+kill $INVENTORY; sleep 4
 edge -o /dev/null -w '%{http_code}\n' -H "$AUTH" $P/inventory/x
 curl -s 127.0.0.1:9090/metrics | grep '^ferryman_circuit_state'   # ...} 1 = open
 target/debug/backend --name inventory --bind 127.0.0.1:9102 & INVENTORY=$!
