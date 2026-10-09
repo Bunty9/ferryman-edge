@@ -62,6 +62,10 @@ Both crates share one version. Format follows
   client-sent `x-forwarded-host` is dropped. Migration: set
   `rewrite_host = true` on routes whose upstream needs its own authority
   as Host.
+- Requests with an unusable `Host` are answered `400 bad host` before
+  routing: duplicate or empty `Host`, `*`, userinfo, a path, a comma,
+  non-ASCII bytes, an invalid port, or HTTP/1.1 with neither `Host` nor
+  an absolute-form target. `Connection: host` no longer removes `Host`.
 
 ### Added
 - Per-route `rewrite_host` (same key and meaning as ferryman-core 0.3).
