@@ -1,6 +1,6 @@
 # ferryman-edge
 
-mTLS-terminating L7 reverse proxy in Rust: rustls 0.23 (aws-lc-rs) mTLS,
+mTLS-terminating L7 reverse proxy in Rust: rustls 0.23 (ring) mTLS,
 in-line RS256 JWT auth (moka cache), per-tenant governor rate limit,
 per-upstream circuit breaker, SIGUSR1 hot reload. Behaviour and config are
 documented in `README.md` and `docs/operations.md`; `PROGRESS.md` tracks

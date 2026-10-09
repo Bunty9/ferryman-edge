@@ -34,6 +34,17 @@ jobs:
         run: curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy,rustfmt
       - name: Format
         run: . "$HOME/.cargo/env" && cargo fmt --all -- --check
+      - name: TLS provider is ring
+        # Dependency-graph gate: aws-lc must not be in the normal build graph
+        # of the published crates or the examples; ring must be.
+        run: |
+          . "$HOME/.cargo/env"
+          for p in ferryman-edge ferryman-edge-core ferryman-edge-demo ferryman-edge-embed-example; do
+            if cargo tree --locked -e normal -p "$p" -i aws-lc-rs 2>/dev/null | grep -q .; then
+              echo "aws-lc-rs is in the normal dependency graph of $p"; exit 1
+            fi
+          done
+          cargo tree --locked -e normal -p ferryman-edge -i ring | grep -q '^ring '
       - name: Clippy
         run: |
           . "$HOME/.cargo/env"

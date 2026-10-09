@@ -1,7 +1,7 @@
 //! ferryman-edge-core — programmable mTLS L7 proxy primitives.
 //!
 //! Extends `ferryman-core` (P2) with:
-//!   - `tls`    : rustls 0.23 + aws-lc-rs mTLS server config + `ReloadingTls`
+//!   - `tls`    : rustls 0.23 + ring mTLS server config + `ReloadingTls`
 //!     that swaps cert/key/ca on `SIGUSR1` without dropping live
 //!     connections.
 //!   - `jwt`    : `JwtVerifier` with a moka LRU cache (default 10k entries,

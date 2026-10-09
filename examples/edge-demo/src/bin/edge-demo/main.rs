@@ -80,9 +80,8 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // rustls has no default crypto provider here (workspace disables ring);
-    // install aws-lc-rs once before any client config is built.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // install ring once before any client config is built.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     match Cli::parse().cmd {
         Cmd::Setup { dir } => setup(dir),

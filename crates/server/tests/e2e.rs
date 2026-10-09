@@ -53,7 +53,7 @@ const JWT_OTHER_PUB_PEM: &[u8] = include_bytes!(concat!(
 fn install_crypto_provider() {
     // rustls needs a process-wide default provider; installing more than
     // once is a no-op error we don't care about.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 // ----- cert generation -------------------------------------------------
@@ -419,7 +419,7 @@ impl ServerCertVerifier for AcceptAnyServerCert {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -1054,4 +1054,32 @@ async fn configured_cap_applies_to_chunked_uploads() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "breaker must still be closed");
+}
+
+/// tokio-rustls' default features used to switch on `tls12`; with
+/// `default-features = false` it must be listed explicitly or TLS 1.2-only
+/// clients (older JVMs, embedded stacks) stop handshaking.
+#[tokio::test]
+async fn tls12_clients_still_handshake() {
+    let h = Harness::new(0).await;
+    let client_certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(&h.certs.client_cert_pem)
+            .collect::<Result<_, _>>()
+            .unwrap();
+    let client_key = PrivateKeyDer::from_pem_slice(&h.certs.client_key_pem).unwrap();
+    let mut cfg = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_client_auth_cert(client_certs, client_key)
+        .unwrap();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(h.proxy_addr).await.unwrap();
+    let tls = TlsConnector::from(Arc::new(cfg))
+        .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+        .await
+        .expect("TLS 1.2 handshake");
+    assert_eq!(
+        tls.get_ref().1.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_2)
+    );
 }

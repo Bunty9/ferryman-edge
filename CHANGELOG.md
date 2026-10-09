@@ -7,6 +7,21 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+### Changed (breaking)
+- TLS provider is ring (was aws-lc-rs), across the proxy, tests and
+  examples; `deny.toml` bans aws-lc. Library users install
+  `rustls::crypto::ring::default_provider()`. No FIPS build, and the
+  post-quantum `X25519MLKEM768` key exchange is no longer offered.
+  TLS 1.2 stays enabled.
+
+### Changed
+- `metrics-exporter-prometheus` without its push-gateway client;
+  `reqwest` in `ferryman-edge-core` without TLS (health probes are plain
+  HTTP). `webpki-roots` and the CDLA-Permissive-2.0 licence allowance are
+  gone.
+- `edge-demo` uses committed test-only RSA keys for its JWT issuer
+  instead of generating them.
+
 ## [0.1.2] — 2026-10-06
 
 ### Security

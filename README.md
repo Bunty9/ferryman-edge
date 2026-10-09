@@ -1,7 +1,7 @@
 # ferryman-edge
 
 > Programmable mTLS L7 reverse proxy in Rust — extends [`ferryman`](../ferryman/)
-> (P2) with rustls 0.23 + aws-lc-rs mTLS termination, in-line RS256 JWT
+> (P2) with rustls 0.23 + ring mTLS termination, in-line RS256 JWT
 > validation with an LRU verification cache, per-tenant GCRA rate
 > limiting, and a SIGUSR1-driven hot-reload that flips cert chains and
 > routing tables without dropping live connections. Pingora-class chops at
@@ -61,13 +61,13 @@ Cloudflare Pingora team to reply.
 | --------------------- | --------------------------------------------------------- |
 | Async runtime         | `tokio` 1.47 (full)                                       |
 | HTTP server           | `hyper` 1.5 + `hyper-util`                                |
-| TLS / mTLS            | `rustls` 0.23 (`aws-lc-rs` provider) + `tokio-rustls` 0.26 |
+| TLS / mTLS            | `rustls` 0.23 (`ring` provider) + `tokio-rustls` 0.26 |
 | AuthN                 | `jsonwebtoken` 9 + `moka` 0.12 (`future` cache, 10k × 5min) |
 | Rate limit            | `governor` 0.7 (keyed GCRA)                               |
 | Config / hot-swap     | `serde` + `toml` 0.8 + `arc-swap`; reload via `SIGUSR1`   |
 | Observability         | `tracing` + `metrics-exporter-prometheus` 0.16            |
 | CLI                   | `clap` 4                                                  |
-| Container build       | `cargo-chef` multi-stage; **distroless** final (NOT scratch — aws-lc-rs needs libc) |
+| Container build       | `cargo-chef` multi-stage; **distroless** final (scratch is possible with ring + musl; not done yet) |
 | Deploy                | Fly.io 2-region (`sin` + `iad`)                           |
 | CI                    | GHA (stable + beta) + `cargo-deny` + `cargo-nextest` + criterion (non-blocking) + mTLS smoke |
 
@@ -221,20 +221,17 @@ Both cert reload (`tls::ReloadingTls`) and route reload
 (`server/src/reload.rs`) share the same signal — one trigger swaps both
 surfaces atomically from the operator's perspective.
 
-### (c) rustls + aws-lc-rs over OpenSSL
+### (c) rustls + ring over OpenSSL and aws-lc-rs
 
-* **Pure-Rust audit story.** rustls is the only TLS stack with a clean
-  memory-safety argument all the way to the cipher implementations
-  (`aws-lc-rs` is the AWS-libcrypto Rust binding; ring is the historical
-  alternative). For an edge proxy that terminates customer-data TLS, that
-  argument matters more than the C/Go ecosystem's parity.
-* **FIPS path.** `aws-lc-rs` has a FIPS-mode build via the same crate.
-  No swap-out at deploy time, no separate provider — flip a feature flag
-  and recompile. OpenSSL FIPS 3.0 modules ship, but the build process is
-  brittle and OS-distribution-specific.
-* **Cost.** Distroless final image instead of scratch (`aws-lc-rs` needs
-  libc + dynamic loader). ~12 MB extra over a musl/scratch build. Worth
-  it for the audit + FIPS leverage.
+* **Pure-Rust audit story.** rustls with ring keeps the TLS stack in
+  Rust plus ring's small, audited assembly.
+* **Static builds.** ring cross-compiles to musl with only `musl-gcc`,
+  so the release binaries are static and the image is `scratch`.
+  aws-lc-rs needed a C toolchain (and CMake on some targets) per target
+  and kept the image on glibc/distroless.
+* **Cost.** No FIPS build and no post-quantum `X25519MLKEM768` key
+  exchange by default (rustls offers it only with aws-lc-rs). An opt-in
+  `tls-aws-lc` feature will be added if someone needs either.
 
 ## Benchmarks
 

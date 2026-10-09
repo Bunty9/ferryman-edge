@@ -85,8 +85,8 @@ Starting with 0.1.1, releases are published by CI, not from a laptop. Pushing a
 workflow's top-level `permissions` is empty, every action is pinned by
 commit SHA, and checkouts use `persist-credentials: false`. There is no
 `workflow_dispatch` trigger and no binaries: a manual run has no tag to
-verify, and prebuilt binaries wait for the 0.2.0 ring switch (aws-lc-rs
-needs a C toolchain per cross target).
+verify, and prebuilt binaries are not built yet (ring removed the aws-lc C
+toolchain requirement per cross target).
 
 ### Verifying provenance
 
@@ -146,7 +146,7 @@ After publishing:
 
 - Check <https://docs.rs/ferryman-edge-core> and
   <https://docs.rs/ferryman-edge> build. docs.rs builds
-  `aws-lc-sys`; if it fails there, add
+  `ring`; if it fails there, add
   `[package.metadata.docs.rs]` settings rather than changing the TLS
   provider.
 - `cargo install ferryman-edge` on a clean machine and run the

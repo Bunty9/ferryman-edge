@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt().init();
     }
     // rustls needs a process-wide provider before any config is built.
-    rustls::crypto::aws_lc_rs::default_provider()
+    rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("crypto provider already installed"))?;
 

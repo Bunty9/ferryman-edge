@@ -1,14 +1,11 @@
 //! Demo PKI: one root CA, a server leaf, a client leaf, an untrusted "rogue"
-//! chain, and RSA keys for signing JWTs.
+//! chain, and RSA keys for signing JWTs (committed test-only fixtures).
 //!
 //! Everything is written as PEM files into one directory, because that is
 //! exactly how the proxy consumes them (`[tls]` and `[jwt]` in its config).
 //! In production these come from your CA and identity provider; the demo
 //! only generates them so it can run with no setup.
 
-use aws_lc_rs::encoding::{AsDer, Pkcs8V1Der, PublicKeyX509Der};
-use aws_lc_rs::rsa::{KeyPair as RsaKeyPair, KeySize};
-use aws_lc_rs::signature::KeyPair as _;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose,
@@ -18,6 +15,16 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const CA_CN: &str = "ferryman-edge demo CA";
+
+/// RSA-2048 test-only keys (PKCS#8 private, SPKI public). ring cannot
+/// generate RSA keys, so the demo ships the same committed fixtures the
+/// core crate's tests use. They are public: never trust them outside a demo.
+const JWT_SIGNING_KEY: &str =
+    include_str!("../../../../../crates/core/tests/fixtures/jwt-test-priv.pem");
+const JWT_SIGNING_PUB: &str =
+    include_str!("../../../../../crates/core/tests/fixtures/jwt-test-pub.pem");
+const JWT_OTHER_KEY: &str =
+    include_str!("../../../../../crates/core/tests/fixtures/jwt-test-other-priv.pem");
 
 /// Handle to a directory of generated key material.
 ///
@@ -31,6 +38,9 @@ const CA_CN: &str = "ferryman-edge demo CA";
 /// * `jwt-signing.key` (PKCS#8) and `jwt-signing.pub` (SPKI): the issuer's
 ///   RSA-2048 pair; the proxy's `jwks_path` points at the `.pub`
 /// * `jwt-other.key`: an RSA key the proxy does *not* trust
+///
+/// The two JWT keys are copied from the repository's committed test-only
+/// fixtures; ring cannot generate RSA keys.
 #[derive(Clone, Debug)]
 pub struct Pki {
     pub dir: PathBuf,
@@ -96,10 +106,9 @@ impl Pki {
         pki.write("rogue-client.crt", &crt)?;
         pki.write_key("rogue-client.key", &key)?;
 
-        let (private, public) = rsa_pem_pair()?;
-        pki.write_key("jwt-signing.key", &private)?;
-        pki.write("jwt-signing.pub", &public)?;
-        pki.write_key("jwt-other.key", &rsa_pem_pair()?.0)?;
+        pki.write_key("jwt-signing.key", JWT_SIGNING_KEY)?;
+        pki.write("jwt-signing.pub", JWT_SIGNING_PUB)?;
+        pki.write_key("jwt-other.key", JWT_OTHER_KEY)?;
         Ok(pki)
     }
 
@@ -187,25 +196,13 @@ fn issue_leaf(
     Ok((cert.pem(), key.serialize_pem()))
 }
 
-/// RSA-2048 pair as `(PKCS#8 private PEM, SPKI public PEM)`. rcgen cannot
-/// generate RSA keys, so this goes through aws-lc-rs directly.
-fn rsa_pem_pair() -> anyhow::Result<(String, String)> {
-    let key = RsaKeyPair::generate(KeySize::Rsa2048)?;
-    let private: Pkcs8V1Der = key.as_der()?;
-    let public: PublicKeyX509Der = key.public_key().as_der()?;
-    Ok((
-        pem::encode(&pem::Pem::new("PRIVATE KEY", private.as_ref())),
-        pem::encode(&pem::Pem::new("PUBLIC KEY", public.as_ref())),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn generated_files_build_an_mtls_server_config() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let pki = Pki::generate(dir.path()).unwrap();
         let p = |n: &str| pki.path(n).to_str().unwrap().to_owned();

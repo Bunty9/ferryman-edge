@@ -10,7 +10,7 @@ wires these behind a `tokio-rustls` acceptor.
 
 | Module | What it gives you |
 | --- | --- |
-| `tls` | `build_mtls_config` (rustls 0.23 + aws-lc-rs, required client certs, ALPN h2/http1.1) and `ReloadingTls`, which swaps cert/key/client-CA atomically on `SIGUSR1` or `reload()` |
+| `tls` | `build_mtls_config` (rustls 0.23 + ring, required client certs, ALPN h2/http1.1) and `ReloadingTls`, which swaps cert/key/client-CA atomically on `SIGUSR1` or `reload()` |
 | `jwt` | `JwtVerifier`: RS256 with a 10k-entry / 5-minute moka cache; `exp` re-checked on cache hits, `nbf` enforced, optional `iss` / `aud`; `reload_key` swaps the public key and clears the cache |
 | `ratelimit` | Per-tenant GCRA limiter (`governor`), `0` rps = disabled, `spawn_gc` to bound per-tenant state |
 | `route` | `RouteTable` with segment-boundary longest-prefix matching and a lock-free Closed / Open / HalfOpen circuit breaker per upstream |
@@ -32,6 +32,6 @@ async fn authorize(pem: &[u8], token: &str) -> anyhow::Result<bool> {
 
 `ReloadingTls::new` spawns a tokio task, so call it inside a runtime, and
 install a rustls crypto provider first
-(`rustls::crypto::aws_lc_rs::default_provider().install_default()`).
+(`rustls::crypto::ring::default_provider().install_default()`).
 
 Minimum Rust version: 1.88. Licensed under MIT or Apache-2.0, at your option.

@@ -2,10 +2,9 @@
 #
 # ferryman-edge multi-stage build.
 #
-# Unlike P2 (FROM scratch + musl), P4 lands on distroless because rustls'
-# `aws-lc-rs` provider transitively pulls aws-lc-sys, which needs a working
-# libc + dynamic loader. Distroless ships those without the rest of a
-# Debian userland.
+# Unlike P2 (FROM scratch + musl), this builds a glibc binary and runs on
+# distroless, which ships libc + the dynamic loader without the rest of a
+# Debian userland. TLS is ring, so a musl/scratch image is possible later.
 
 # ---- Stage 1: chef base (cargo-chef for layer-cacheable builds) -------------
 # Builder and runtime must share a Debian release: a binary linked against
@@ -27,8 +26,7 @@ COPY . .
 RUN cargo build --release --bin ferryman-edge-server
 
 # ---- Stage 4: distroless runtime --------------------------------------------
-# `distroless/cc-debian12` carries glibc + libstdc++ which aws-lc-rs needs.
-# Not scratch — rustls' aws-lc-rs provider links libc and the dynamic loader.
+# `distroless/cc-debian12` carries glibc + libstdc++ for the dynamic binary.
 FROM gcr.io/distroless/cc-debian12 AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/release/ferryman-edge-server /usr/local/bin/ferryman-edge-server
