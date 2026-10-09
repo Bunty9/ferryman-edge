@@ -449,7 +449,8 @@ async fn spawn_write_timeout_upstream() -> SocketAddr {
 /// body bytes arrive for 1.5 s (above the proxy's 1 s stall threshold).
 /// `/strict-b` sends its 200 head first, `/strict-a` does not, and
 /// `/strict-g` is a gateway: it answers 502 when its (simulated) backend
-/// gives up. A GET (no body) is answered normally.
+/// gives up; `/strict-t` does the same with a truncated body. A GET (no
+/// body) is answered normally.
 async fn spawn_strict_read_upstream() -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -496,6 +497,14 @@ async fn spawn_strict_read_upstream() -> SocketAddr {
                         )
                         .await;
                 }
+                if text.contains(" /strict-t") {
+                    // A 502 whose body is cut off (no terminating chunk).
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 502 Bad Gateway\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                        )
+                        .await;
+                }
                 // Dropping the stream closes it without a (further) answer.
             });
         }
@@ -523,13 +532,15 @@ async fn spawn_upstream() -> SocketAddr {
     addr
 }
 
-/// Two distinct ports nobody listens on. Both listeners are bound at once so
-/// the ports differ: core gives each `host:port` one breaker, and routes on
-/// one `host:port` must agree on the cooldown.
-fn closed_ports() -> (SocketAddr, SocketAddr) {
-    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    (a.local_addr().unwrap(), b.local_addr().unwrap())
+/// A port nobody listens on, reserved for as long as the returned socket
+/// lives: it is bound but never `listen()`s, so connects are refused and no
+/// parallel test can be handed the port. Each call gives a distinct port
+/// (core gives each `host:port` one breaker, and routes on one `host:port`
+/// must agree on the cooldown).
+fn dead_port() -> (SocketAddr, tokio::net::TcpSocket) {
+    let s = tokio::net::TcpSocket::new_v4().unwrap();
+    s.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    (s.local_addr().unwrap(), s)
 }
 
 // ----- proxy harness -------------------------------------------------------
@@ -541,6 +552,8 @@ struct Harness {
     tls: Arc<ReloadingTls>,
     jwt: Arc<JwtVerifier>,
     table: SharedTable,
+    /// Keeps the `/probe` and `/down` ports reserved (see `dead_port`).
+    _dead: [tokio::net::TcpSocket; 2],
 }
 
 /// Harness settings. `failure_threshold` defaults to core's 3; the blame
@@ -613,7 +626,8 @@ impl Harness {
         let strict_addr = spawn_strict_read_upstream().await;
         let dying_addr = spawn_dying_upstream().await;
         let wt_addr = spawn_write_timeout_upstream().await;
-        let (probe_addr, down_addr) = closed_ports();
+        let (probe_addr, probe_sock) = dead_port();
+        let (down_addr, down_sock) = dead_port();
 
         let tls = ReloadingTls::new(
             certs.server_cert_path.to_str().unwrap(),
@@ -635,6 +649,7 @@ impl Harness {
             ("/strict-a", strict_addr, ""),
             ("/strict-b", strict_addr, ""),
             ("/strict-g", strict_addr, ""),
+            ("/strict-t", strict_addr, ""),
             ("/dies", dying_addr, ""),
             ("/wt", wt_addr, ""),
             (
@@ -683,6 +698,7 @@ impl Harness {
             tls,
             jwt,
             table,
+            _dead: [probe_sock, down_sock],
         }
     }
 
@@ -2239,6 +2255,9 @@ async fn aborted_probe_burst_rearms_at_most_once_per_cooldown() {
     }
     tokio::time::sleep(Duration::from_millis(3100)).await; // cooldown 3 s
 
+    // Everything below must happen within one cooldown of the first probe,
+    // or the stale-probe rule legitimately hands out another one.
+    let started = std::time::Instant::now();
     let mut admitted = 0;
     for _ in 0..20 {
         let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
@@ -2248,7 +2267,7 @@ async fn aborted_probe_burst_rearms_at_most_once_per_cooldown() {
         );
         tls.write_all(req.as_bytes()).await.unwrap();
         let mut buf = [0u8; 64];
-        match tokio::time::timeout(Duration::from_millis(150), tls.read(&mut buf)).await {
+        match tokio::time::timeout(Duration::from_millis(400), tls.read(&mut buf)).await {
             // Refused at once: 503.
             Ok(Ok(n)) => {
                 let line = String::from_utf8_lossy(&buf[..n]);
@@ -2260,12 +2279,17 @@ async fn aborted_probe_burst_rearms_at_most_once_per_cooldown() {
         drop(tls);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_ne!(h.circuit("/burst"), CircuitState::Closed);
+    let (s, _) = raw_get(&h, "/burst/fail", Some(&token)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "burst took {elapsed:?}, longer than the 3 s cooldown: inconclusive"
+    );
     assert!(
         (1..=2).contains(&admitted),
         "the probe plus at most one re-arm, got {admitted}"
     );
-    assert_ne!(h.circuit("/burst"), CircuitState::Closed);
-    let (s, _) = raw_get(&h, "/burst/fail", Some(&token)).await;
     assert!(s.contains(" 503"), "no further probe this cooldown: {s}");
 }
 
@@ -2297,4 +2321,81 @@ async fn gateway_502_after_a_client_stall_does_not_trip_the_breaker() {
     drop(tls);
     let (s, _) = raw_get(&h, "/strict-g/after", Some(&token)).await;
     assert!(s.contains(" 200"), "breaker must stay closed: {s}");
+}
+
+/// The client stalls its upload for at least θ, then finishes it. The
+/// gateway's backend gave up during the stall, so the gateway answers 502
+/// only after the upload is complete: by then only the "stalled at some
+/// point" record exempts it. `/strict-t` sends that 502 with a truncated
+/// body, which the same record exempts on the response-body path.
+#[tokio::test]
+async fn gateway_502_after_a_finished_client_stall_does_not_trip_the_breaker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(strict(), |t| {
+        t.with_request_body_idle_timeout(Duration::from_secs(5))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for route in ["/strict-g", "/strict-t"] {
+        let mut tls = tls_connect(h.proxy_addr, &h.certs).await;
+        let req = format!(
+            "POST {route}/up HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+             transfer-encoding: chunked\r\nconnection: close\r\n\r\n4\r\nabcd\r\n"
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1250)).await; // θ = 1 s
+        tls.write_all(b"0\r\n\r\n").await.unwrap();
+        // Read to the end, so the proxy polls (and fails) the whole body.
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut out)).await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 502"), "{route}: {text}");
+        drop(tls);
+        let (s, _) = raw_get(&h, &format!("{route}/after"), Some(&token)).await;
+        assert!(s.contains(" 200"), "{route}: breaker must stay closed: {s}");
+    }
+}
+
+/// The client stalls for at least θ, then resumes sending; the upstream then
+/// dies mid-upload. As in ferryman, a stall earlier in the request exempts
+/// the upstream: released, not blamed. (An upstream dying under a client that
+/// never paused is still blamed: see
+/// `upstream_dying_mid_upload_while_the_client_sends_trips_the_breaker`.)
+#[tokio::test]
+async fn upstream_dying_after_an_earlier_client_stall_is_not_blamed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = Harness::build(strict(), |t| {
+        t.with_request_body_idle_timeout(Duration::from_secs(5))
+    })
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let tls = tls_connect(h.proxy_addr, &h.certs).await;
+    let (mut rd, mut wr) = tokio::io::split(tls);
+    let head = format!(
+        "POST /dies/up HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+         transfer-encoding: chunked\r\n\r\n"
+    );
+    let writer = tokio::spawn(async move {
+        let chunk = format!("100\r\n{}\r\n", "x".repeat(256));
+        wr.write_all(head.as_bytes()).await?;
+        wr.write_all(chunk.as_bytes()).await?; // 256 B: the upstream wants 2 KB
+        tokio::time::sleep(Duration::from_millis(1250)).await; // θ = 1 s
+        for _ in 0..400 {
+            wr.write_all(chunk.as_bytes()).await?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::io::Result::Ok(())
+    });
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(6), rd.read(&mut buf))
+        .await
+        .expect("answered")
+        .unwrap();
+    writer.abort();
+    let line = String::from_utf8_lossy(&buf[..n]);
+    assert!(line.starts_with("HTTP/1.1 502"), "{line}");
+    let (s, _) = raw_get(&h, "/dies/after", Some(&token)).await;
+    assert!(s.contains(" 200"), "earlier stall: not blamed: {s}");
 }

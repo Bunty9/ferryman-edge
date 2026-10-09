@@ -149,5 +149,15 @@ mod tests {
             assert_eq!(state(&table), CircuitState::Open);
             assert!(table.load().lookup("/b").is_some(), "live table kept");
         }
+
+        // ConflictingHealth: two routes on one host:port disagree.
+        let conflict = format!(
+            "{CFG}health_path = \"/a\"\n\
+             [[routes]]\nprefix = \"/c\"\nupstream = \"http://127.0.0.1:9\"\nhealth_path = \"/c\"\n"
+        );
+        let e = format!("{:#}", apply(&conflict, &table).unwrap_err());
+        assert!(e.contains("different health_path"), "{e}");
+        assert_eq!(state(&table), CircuitState::Open);
+        assert!(table.load().lookup("/c").is_none(), "live table kept");
     }
 }

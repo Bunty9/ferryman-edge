@@ -177,10 +177,11 @@ hang-up, h2 stream reset) hands its admission back: an abandoned half-open
 probe is re-armed at once, at most once per cooldown. An upstream that hangs
 up after the client stalled its upload, or paused reading the response, for
 at least θ = min(1 s, `request_body_idle_timeout_secs` / 2, at least
-100 ms) is not blamed either, nor is a forwarded 502–504 when the client
-stalled its upload that long at any point of the request (a gateway whose
-backend gave up on it); an upstream that fails while the client sends or
-reads without such a pause generally is. Known limits, where the upstream is
+100 ms) is not blamed either, nor is a forwarded 502–504 (a gateway whose
+backend gave up on the stalled upload); an upload stall counts if it
+happened at any point of the request, as in ferryman. An upstream that
+fails while the client sends or reads without such a pause generally is
+blamed. Known limits, where the upstream is
 blamed for what the client did: its own read or write timeout is under θ;
 or it has a total request or response deadline (e.g. Go `http.Server`
 `ReadTimeout` / `WriteTimeout`) that a slow but steady client exceeds, since

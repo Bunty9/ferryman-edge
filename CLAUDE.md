@@ -81,10 +81,11 @@ SIGUSR1 reloads.
   413, idle/total upload deadline 408, disconnect 400) and elapsed time in
   a response body (a long stream) must not count, or any tenant can open a
   route's breaker for everyone. They must not record success either, or a
-  client could close an open breaker by aborting an upload. A forwarded
-  502–504 after the client stalled its upload for at least θ at any point
-  of the request is not blamed (ferryman does the same); edge's own 504
-  timer still is. Edge also blames response-body errors after the head;
+  client could close an open breaker by aborting an upload. An upload
+  stall counts if it lasted at least θ at any point of the request
+  (`BodyState::stalled_during_request`, ferryman's rule), on every blame
+  path: transport error, forwarded 502–504 and response-body error. Edge's
+  own 504 timer still counts. Edge also blames response-body errors after the head;
   ferryman does not (deliberate difference).
 - Every admission goes into a `proxy::Ticket` right after `try_acquire`;
   only upstream-caused outcomes call `success` / `failure`, exactly once.

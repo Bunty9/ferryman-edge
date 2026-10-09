@@ -18,9 +18,10 @@
 //! (not a slow or long one) counts against the breaker. An upstream failure
 //! after the client stalled its upload or its response reads for at least
 //! θ = min(1 s, idle gap / 2), floored at 100 ms, does not: the upstream was
-//! reacting to the client. Nor does a forwarded 502–504 when the client
-//! stalled its upload for at least θ at any point of the request (a gateway
-//! whose backend gave up on the stalled upload). Known limits, where the
+//! reacting to the client. The upload stall counts if it happened at any
+//! point of the request, not only if it is still going on, and it also
+//! exempts a forwarded 502–504 (a gateway whose backend gave up on the
+//! stalled upload). Known limits, where the
 //! upstream is still blamed: its own read/write timeout is under θ; or it
 //! has a total request or response deadline (Go `http.Server` `ReadTimeout`
 //! / `WriteTimeout`) that a slow but steady client exceeds, since every gap
@@ -325,9 +326,10 @@ impl BodyState {
     }
 
     /// The client stalled its upload for at least `stall` at some point of
-    /// this request, or is stalling now. A gateway upstream that answers
-    /// 502–504 because its backend gave up on the stalled upload is not
-    /// blamed for it.
+    /// this request, or is stalling now (ferryman's rule). Every blame path
+    /// checks this: an upstream that hangs up, breaks its body, or (as a
+    /// gateway) answers 502–504 after such a stall may be reacting to it, so
+    /// it is not blamed. One whose client never paused that long is.
     fn stalled_during_request(&self) -> bool {
         self.stalled_once.load(Ordering::Acquire) || self.client_stalled()
     }
@@ -543,7 +545,7 @@ impl hyper::body::Body for WatchedBody {
             if !this.failed
                 && client_fault(e).is_none()
                 && !this.request.client_failed.load(Ordering::Acquire)
-                && !this.request.client_stalled()
+                && !this.request.stalled_during_request()
                 && !this.client_stalled_reading
             {
                 this.failed = true;
@@ -780,9 +782,9 @@ pub(crate) async fn handle_checked(
             }
             tracing::warn!(upstream = %host, error = %e, "upstream request failed");
             // An upstream that drops the connection after the client stalled
-            // its upload for `stall` is reacting to that stall: answer 502,
-            // blame no one.
-            if client_state.client_stalled() {
+            // its upload for `stall` (now or earlier in the request) may be
+            // reacting to that stall: answer 502, blame no one.
+            if client_state.stalled_during_request() {
                 ticket.release();
             } else {
                 ticket.failure();

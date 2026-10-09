@@ -63,7 +63,8 @@ Both crates share one version. Format follows
   run concurrently. Migration: an upstream whose health path answers 4xx
   while broken needs a real health endpoint, or `health_disabled = true`.
   Health probes no longer speak TLS: an `https://` upstream is rejected at
-  load (forwarding never supported https).
+  load (forwarding never supported https). Migration: point the route at
+  the upstream's `http://` address.
 - Route prefixes match a normalised path (`%XX` of unreserved characters
   decoded, other escapes' hex uppercased, `//` merged; still
   case-sensitive), so `/%73vc-a/x` and `//svc-a/x` now reach `/svc-a`. The
@@ -80,12 +81,18 @@ Both crates share one version. Format follows
   different `cooldown_secs` / `health_path` / `health_disabled` are
   rejected. Core keys edge does not implement yet are rejected when set
   (today only `trusted_proxies`: edge always replaces forwarding headers).
+  Migration: write each prefix in the normalised form the error prints;
+  point `https://` upstreams at their `http://` address; remove
+  `trusted_proxies`; give routes on one `host:port` the same
+  `cooldown_secs`, `health_path` and `health_disabled`.
 - Reload carries breaker state by upstream `host:port`, so an open
   circuit stays open across SIGUSR1 even when its routes change.
 - The `upstream` metric label is core's normalised `host:port` (lowercase,
   default port filled in: `http://localhost` is `localhost:80`).
   `ferryman_upstream_alive` now follows the circuit state (1 = closed) and
-  is written for `health_disabled` upstreams too.
+  is written for `health_disabled` upstreams too. Migration: update
+  dashboards and alerts that match the old label or treat
+  `ferryman_upstream_alive` as the last probe result.
 - Bodies always stream: the buffering (default) mode and the `boxed_body`
   feature are removed. `proxy::Body` is `BoxBody<Bytes, BoxErr>` and
   `UpstreamClient` is `Client<HttpConnector, proxy::RequestBody>`.
@@ -96,7 +103,8 @@ Both crates share one version. Format follows
   head only; the response body has no deadline (a broken body still counts
   against the breaker, unless the client had stalled its upload or its
   reads for at least θ = min(1 s, idle gap / 2), floored at 100 ms; a
-  forwarded 502–504 after such an upload stall is not blamed either).
+  forwarded 502–504 after such an upload stall is not blamed either, and
+  an upload stall counts if it happened at any point of the request).
   Blaming a broken response body is a deliberate difference from
   ferryman, which never blames after the response head. Known limits,
   where the upstream is still blamed: its own read/write timeout is under

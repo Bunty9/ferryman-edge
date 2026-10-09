@@ -162,10 +162,12 @@ deliberate difference from ferryman, which never blames after the head.
 What never counts: client body errors (400), the body cap (413), slow or
 stalled uploads (408), a client hanging up or resetting its h2 stream, and an
 upstream failure (transport error, body error or forwarded 502–504) after
-the client stalled its upload or response reads for at least
-θ = min(1 s, `request_body_idle_timeout_secs` / 2), at least 100 ms. Such a
-request hands its admission back: if it was the half-open probe, the next
-request probes (at most once per cooldown). Known limits, where the upstream
+the client stalled its upload (at any point of the request) or its response
+reads for at least θ = min(1 s, `request_body_idle_timeout_secs` / 2), at
+least 100 ms. When such an outcome ends the request before the response
+head, the request hands its admission back: if it was the half-open probe,
+the next request probes (at most once per cooldown). A body error after the
+head has no admission left to return; it simply does not count. Known limits, where the upstream
 is still blamed: its own read or write timeout is under θ, or it enforces a
 total request or response deadline that a slow but steady client exceeds.
 
