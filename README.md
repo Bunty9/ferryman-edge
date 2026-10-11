@@ -153,8 +153,10 @@ including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
 (any client-supplied value is dropped first). It keeps the client's `Host` (h2 `:authority` included) and sets
 `x-forwarded-host` to it, dropping any client-sent value (per-route
 `rewrite_host = true` sends the upstream authority instead), replaces `x-forwarded-for` with the peer IP (dropping client-sent
-`Forwarded` / `X-Real-IP`), sets `x-forwarded-proto: https`, and downgrades
-the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
+`Forwarded`, `X-Real-IP` and the other `X-Forwarded-*` headers it does not
+set, and other spellings of the headers it asserts), sets
+`x-forwarded-proto: https`, does not forward request trailers, and
+downgrades the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
 (`h2` or `http/1.1`). A connection with no request within 10 s (default;
 `first_request_timeout_secs`) of the
 handshake is closed (this also covers a stalled h2 preface); h2 connections
@@ -173,6 +175,12 @@ upstream response-body error after the head against the breaker, ferryman
 never does (a deliberate difference). A plain `500`
 does not count, and neither does a failure caused by the client's own body
 (size cap, disconnect, stall), even if the upstream had already answered.
+A 502–504 head counts at once; for any other head an ordinary request's
+verdict waits for the end of the body (clean end: success; upstream body
+error: failure; client hang-up: none), so an upstream that answers 200 and
+then resets mid-body opens the breaker after `failure_threshold` requests.
+The half-open probe is judged on its head, and a result that arrives after
+the breaker opened is ignored.
 A request that ends without a verdict on the upstream (client body error,
 hang-up, h2 stream reset) hands its admission back: an abandoned half-open
 probe is re-armed at once, at most once per cooldown. An upstream that hangs
@@ -196,7 +204,7 @@ SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
 25 s by default (`drain_timeout_secs`). SIGUSR1 reloads TLS material, the
 routing table (including per-route `health_path` / `health_disabled`) and
 the JWT public key (read from the boot-time path; the token cache is
-cleared). `[limits]`, `issuer` / `audience`,
+cleared only when the key changed). `[limits]`, `issuer` / `audience`,
 `health_interval_secs` and `keepalive_timeout_secs` are read once at boot.
 
 Every route shares one mTLS + JWT + rate-limit policy; prefixes are

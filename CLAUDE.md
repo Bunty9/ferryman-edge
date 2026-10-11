@@ -97,13 +97,24 @@ SIGUSR1 reloads.
   ferryman does not (deliberate difference).
 - Every admission goes into a `proxy::Ticket` right after `try_acquire`;
   only upstream-caused outcomes call `success` / `failure`, exactly once.
-  A ticket dropped without a verdict (client fault, stall-exempt upstream
-  failure, handler future dropped by a hang-up or h2 reset) calls
+  When: a 502–504 head gives its verdict at the head. Any other head: a
+  `Probe` gets `success` at the head (closes half-open at once; a long
+  stream never holds the probe slot); a `Normal` ticket moves into
+  `WatchedBody` and reports at the end of the body (clean end → `success`,
+  upstream body error → `failure`, stall-exempt body error → `release`,
+  dropped mid-stream → `release` via `Drop`). An empty body (`is_end_stream`
+  at the head) succeeds at the head. Never give a `Normal` success at the
+  head of a non-empty body: it resets the consecutive count, so an
+  upstream that always resets mid-body would never open the breaker at the
+  default threshold. A late Normal result while Open/HalfOpen is ignored by
+  core (`Breaker::record_success`/`record_failure`). A ticket dropped
+  without a verdict (client fault, stall-exempt upstream failure, handler
+  future or response body dropped by a hang-up or h2 reset) calls
   `Upstream::release`. Never release for an upstream timeout or error, and
   never call `record_*` on an `Upstream` directly in the request path,
   except `WatchedBody`'s one `record_failure(Admission::Normal)` for a
-  body error after the head (skipped when the head already counted as a
-  failure: one request, one failure).
+  body error after a probe's successful head (skipped when the head
+  already counted as a failure: one request, one failure).
 - Bodies stream; nothing is buffered.
 - Pass `RouteTable::lookup` the raw path (core normalises it for matching
   only) and forward the raw path. `lookup` ignores breaker state and never

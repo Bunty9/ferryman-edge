@@ -69,6 +69,11 @@ restart (no log line).
 
 Unknown keys in any table are rejected at load.
 
+Known limits: there is no response-side idle bound, so a client that stops
+reading a response holds its upstream connection until the upstream's own
+write timeout. There is no per-tenant concurrency cap and no connection
+limit; `tenant_rps` limits request rate only.
+
 Slowloris trade-off: `first_request_timeout_secs`, `keepalive_timeout_secs`
 (the HTTP/1 header-read timeout) and `tls_handshake_timeout_secs` bound how long an
 unauthenticated or silent client can hold a connection slot. Raising them
@@ -162,6 +167,18 @@ What counts against an upstream's breaker: transport errors, 502–504, the
 error from the response body after a healthy head. The last one is a
 deliberate difference from ferryman, which never blames after the head.
 
+When the verdict is given: a 502–504 head counts at once. For any other
+head, an ordinary request's verdict waits for the end of the response body:
+a clean end is a success (resets the consecutive-failure count), an
+upstream body error a failure, and a client hang-up mid-stream no verdict.
+So an upstream that always answers 200 and then resets mid-body opens the
+breaker after `failure_threshold` such requests, and a long healthy stream
+counts as one success when it ends. The half-open probe is judged on its
+head (so the breaker closes at once and a long stream never holds the probe
+slot); a later body error on it counts as one ordinary failure. A result
+that arrives after the breaker opened is ignored, so a stream that started
+before the trip cannot close it.
+
 What never counts: client body errors (400), the body cap (413), slow or
 stalled uploads (408), a client hanging up or resetting its h2 stream, and an
 upstream failure (transport error, body error or forwarded 502–504) after
@@ -170,8 +187,7 @@ reads for at least θ = max(100 ms, min(1 s,
 `request_body_idle_timeout_secs` / 2)). When such an outcome ends the
 request before the response head, the request hands its admission back: if
 it was the half-open probe, the next request probes (at most once per
-cooldown). A body error after the head has no admission left to return; it
-simply does not count. Known limits, where the upstream is still blamed: its own read or write timeout is under θ, or it enforces a
+cooldown). Known limits, where the upstream is still blamed: its own read or write timeout is under θ, or it enforces a
 total request or response deadline that a slow but steady client exceeds.
 
 ## Troubleshooting

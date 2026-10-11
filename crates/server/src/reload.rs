@@ -41,7 +41,9 @@ pub fn apply(raw: &str, table: &SharedTable) -> anyhow::Result<Vec<String>> {
 }
 
 /// Spawn the SIGUSR1 reload loop. Routes, their health keys and the four
-/// top-level timeouts reload; `[limits]`, `[jwt]` issuer/audience,
+/// top-level timeouts reload, and so do `failure_threshold` and
+/// `default_cooldown_secs` (core's `build_table` retunes each surviving
+/// upstream's breaker through `Breaker::reconfigure`, keeping its state); `[limits]`, `[jwt]` issuer/audience,
 /// `health_interval_secs` and `keepalive_timeout_secs` are boot-only. The
 /// `[mtls]` / `[jwt]` paths are fixed at boot; file contents are re-read on
 /// SIGUSR1. Returns immediately; the loop runs until process exit.

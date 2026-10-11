@@ -7,15 +7,6 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
-### Security
-- Strip non-canonical spellings of proxy-asserted headers (forwarding
-  headers, `x-real-ip`, `x-ferryman-tenant`) from client requests, so only
-  the values the proxy sets reach the upstream. Client-sent forwarding
-  headers the proxy does not set itself (`forwarded`, `x-real-ip`,
-  `x-forwarded-port` / `-ssl` / `-scheme` / `-prefix`) are stripped too,
-  and request trailers are not forwarded. This also applies to library
-  callers of `proxy::handle` / `handle_with`.
-
 ### Changed (breaking)
 - Docker image: a static musl binary in `scratch` running as `65532:65532`
   (was distroless/cc as root). Migration: mounted certs, keys and config
@@ -67,7 +58,12 @@ Both crates share one version. Format follows
 - Breaker: one per upstream `host:port`, shared by the routes that use it
   (was one per rule). It opens after `failure_threshold` (new key, default
   3) consecutive upstream failures. A late result of an ordinary request
-  can no longer close an open circuit.
+  can no longer close an open circuit. A 502–504 head counts at once; for
+  any other head an ordinary request's verdict waits for the end of the
+  response body (clean end: success; upstream body error: failure; client
+  hang-up: none). The half-open probe is judged on its head. Migration:
+  routes sharing a `host:port` share one breaker and must agree on
+  `cooldown_secs`, `health_path` and `health_disabled`.
 - Health checks: any status below 500 counts as up (was 2xx only); probes
   run concurrently. Migration: an upstream whose health path answers 4xx
   while broken needs a real health endpoint, or `health_disabled = true`.
@@ -92,7 +88,7 @@ Both crates share one version. Format follows
   path, query or `https://` scheme; and routes sharing an upstream with
   different `cooldown_secs` / `health_path` / `health_disabled` are
   rejected. Core keys edge does not implement yet are rejected when set
-  (today only `trusted_proxies`: edge always replaces forwarding headers).
+  (`trusted_proxies` here; the others are listed below).
   Migration: write each prefix in the normalised form the error prints;
   point `https://` upstreams at their `http://` address; remove
   `trusted_proxies`; give routes on one `host:port` the same
@@ -121,6 +117,7 @@ Both crates share one version. Format follows
 - Bodies always stream: the buffering (default) mode and the `boxed_body`
   feature are removed. `proxy::Body` is `BoxBody<Bytes, BoxErr>` and
   `UpstreamClient` is `Client<HttpConnector, proxy::RequestBody>`.
+  Migration: drop `--features boxed_body` from builds.
 - No request-body cap by default (was 8 MiB). `[limits]
   max_request_body_bytes` is optional and has no upper bound; when set,
   over-cap uploads get 413. Migration: set it to keep a cap.
@@ -156,8 +153,6 @@ Both crates share one version. Format follows
   `ferryman-edge-server --version`.
 
 ### Fixed
-- A 502–504 response whose body then breaks counts once against the
-  breaker, not twice.
 - One 502 no longer blackholes a route for a whole cooldown (breaker
   threshold 1 → 3).
 - Upstreams without a `/health` route (most third-party apps) no longer
@@ -183,7 +178,7 @@ Both crates share one version. Format follows
 - `edge-demo` covers 0.2.0 exit criterion 8 (65 s SSE stream, 50 MiB upload,
   Host, threshold-3 breaker) and runs 65 checks.
 
-## [0.1.3] — 2026-10-09
+## [0.1.3] — 2026-10-11
 
 ### Security
 - Strip non-canonical spellings of proxy-asserted headers, and client-supplied forwarding headers the proxy does not set, so only values set by the proxy reach the upstream.

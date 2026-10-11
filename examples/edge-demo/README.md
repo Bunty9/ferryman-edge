@@ -212,7 +212,7 @@ material, routes and the JWT key.
 - **JWT**: point `[jwt] jwks_path` at your identity provider's RSA public key
   (PEM, RS256) and **set `issuer` and `audience`**; without them any token
   signed by that key is accepted for any service. SIGUSR1 re-reads the key from the
-  boot-time path and clears the token cache. There is no overlap window:
+  boot-time path and clears the token cache only when the key changed. There is no overlap window:
   tokens signed by the old key fail right after the reload, so rotate at the
   IdP accordingly.
 - **Backends**: read `x-ferryman-tenant` as the caller identity and do not

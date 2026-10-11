@@ -18,7 +18,7 @@ default_cooldown_secs = 30
 
 [limits]
 tenant_rps = 1000                       # per JWT `sub`; 0 disables
-# max_request_body_bytes     = 8388608  # optional cap; unset = no cap
+# max_request_body_bytes     = 8388608  # example, not a default: default is no cap
 # tls_handshake_timeout_secs = 10
 # first_request_timeout_secs = 10
 # h2_max_concurrent_streams  = 64
