@@ -101,6 +101,19 @@
 - [x] Version bumped to 0.1.2, CHANGELOG section dated; tag and publish
       are separate, explicit steps.
 
+## 0.2.0 (prepared on branch `edge-0.2.0`, not yet released)
+
+- [x] Routing, breaker, health checks and core config come from
+      `ferryman-core` 0.3 (crates.io); edge adds mTLS, JWT, tenant rate
+      limit and `EdgeConfig` on top.
+- [x] ring as the only TLS provider; static musl `scratch` image running as
+      uid 65532; release binaries and binstall metadata.
+- [x] Client `Host` preserved, streaming bodies with no default cap,
+      per-upstream breaker (3 failures), breaker verdict deferred to the end
+      of the response body.
+- [x] Version 0.2.0, CHANGELOG section dated; tag and publish are separate,
+      explicit steps.
+
 ## Next sprint — Phase 3: numbers + deploy
 
 - [ ] mTLS-capable load generator (e.g. a small hyper/rustls client or

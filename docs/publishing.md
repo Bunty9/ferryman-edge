@@ -29,7 +29,9 @@ publishes each crate with `cargo publish -p`; locally
   is what crates.io uses.
 - `cargo publish --workspace --dry-run` passes: both crates package and
   build in isolation, with server resolved against core through a temporary
-  registry, which is how crates.io will resolve it.
+  registry, which is how crates.io will resolve it. `ferryman-core` is a
+  registry dependency (`"0.3"`) and `deny.toml` allows no git sources; bump
+  it when ferryman-core's minor changes.
 
 ## Status
 

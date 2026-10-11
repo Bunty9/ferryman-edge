@@ -483,8 +483,9 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferryman-core"
-version = "0.2.3"
-source = "git+https://github.com/Bunty9/ferryman?rev=c09ed57ff0896cc453680a89f2338342cb107210#c09ed57ff0896cc453680a89f2338342cb107210"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11208d954c80a3ad466342a38d49e38a5f5aeefc90d9ae7c98ae30859681c3ff"
 dependencies = [
  "arc-swap",
  "http",

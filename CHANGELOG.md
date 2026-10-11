@@ -7,6 +7,8 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-11
+
 Upgrading from 0.1.x: a 0.1.2 `config.toml` still boots (deprecated
 spellings log a warning). Check the items under "Changed (breaking)":
 `Host` is now the client's, bodies stream with no default size cap, the
@@ -285,7 +287,8 @@ No code changes in either crate.
 - Prometheus metrics (requests, auth failures, rate limiting, TLS
   handshakes, breaker state, upstream health).
 
-[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.0...v0.1.1

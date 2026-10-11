@@ -20,10 +20,7 @@ categories = ["network-programming", "web-programming::http-server", "authentica
 
 [workspace.dependencies]
 # Routing table, circuit breaker, health checks and the core config schema.
-# Git rev during development; switches to crates.io "0.3" before release.
-# `version` is that rev's own package version (unreleased 0.3 API); without
-# one, cargo-deny counts the git dependency as a wildcard.
-ferryman-core = { git = "https://github.com/Bunty9/ferryman", rev = "c09ed57ff0896cc453680a89f2338342cb107210", version = "0.2.3" }
+ferryman-core = "0.3"
 
 # Runtime + HTTP
 tokio = { version = "1.47", features = ["full"] }

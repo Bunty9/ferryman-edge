@@ -139,9 +139,8 @@ SIGUSR1 reloads.
   into it must be readable by that uid. The Dockerfile sets
   `RUSTUP_TOOLCHAIN=stable` because `rust-toolchain.toml` would otherwise
   switch cargo to a toolchain without the musl target.
-- `ferryman-core` comes from a git rev until 0.3.0 is on crates.io
-  (`deny.toml` `allow-git`); the release task switches it to the registry.
-  Its breaker opens after 3 consecutive failures by default: e2e blame
+- `ferryman-core` is a crates.io dependency (`"0.3"`); `deny.toml` allows
+  no git sources. Its breaker opens after 3 consecutive failures by default: e2e blame
   tests use `strict()` (threshold 1) so one wrong blame shows as a 503.
   Routes on one `host:port` share a breaker and must agree on cooldown and
   health keys, so tests that need isolated breakers spawn separate
