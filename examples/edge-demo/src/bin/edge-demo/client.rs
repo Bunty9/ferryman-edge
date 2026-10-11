@@ -6,7 +6,7 @@
 
 use crate::pki::Pki;
 use anyhow::Context;
-use aws_lc_rs::digest;
+use ring::digest;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::net::SocketAddr;

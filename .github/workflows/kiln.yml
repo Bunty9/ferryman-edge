@@ -1,0 +1,122 @@
+# Full test gate plus smokes on kiln (self-hosted: a fresh KVM VM per job on
+# the maintainer's box, https://github.com/Bunty9/kiln). Runs on the working
+# branches only, never on pull requests: this repo is public and fork code
+# must not run on self-hosted hardware. ci.yml (GitHub-hosted) stays the
+# merge gate; release.yml never runs here.
+name: kiln
+
+on:
+  push:
+    branches: [edge-0.2.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kiln-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: [self-hosted, kiln]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        # ~/.cargo and ~/.rustup live on kiln's per-repo cache disk, so this
+        # is usually a no-op update.
+        run: curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy,rustfmt
+      - name: Format
+        run: . "$HOME/.cargo/env" && cargo fmt --all -- --check
+      - name: TLS provider is ring
+        # Dependency-graph gate: aws-lc must not be in the normal or dev graph
+        # of the published crates or the examples (deny.toml ban scope); ring must be.
+        run: |
+          . "$HOME/.cargo/env"
+          for p in ferryman-edge ferryman-edge-core ferryman-edge-demo ferryman-edge-embed-example; do
+            # The graph must resolve at all, or the check below proves nothing.
+            cargo tree --locked -p "$p" -e normal,dev > /dev/null
+            out=$(cargo tree --locked -p "$p" -e normal,dev -i aws-lc-rs 2>&1) && {
+              echo "aws-lc-rs is in the dependency graph of $p:"; echo "$out"; exit 1; }
+            case "$out" in
+              *"did not match any packages"*) ;;
+              *) echo "unexpected cargo tree failure for $p:"; echo "$out"; exit 1 ;;
+            esac
+          done
+          cargo tree --locked -e normal -p ferryman-edge -i ring | grep -q '^ring '
+      - name: Clippy
+        run: |
+          . "$HOME/.cargo/env"
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: |
+          . "$HOME/.cargo/env"
+          cargo test --workspace --locked
+      - name: Docs
+        run: . "$HOME/.cargo/env" && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+      - name: Dependency audit
+        run: |
+          . "$HOME/.cargo/env"
+          [ "$(cargo deny --version 2>/dev/null)" = "cargo-deny 0.20.2" ] || cargo install cargo-deny --locked --version 0.20.2
+          cargo deny --locked check
+      - name: edge-demo walkthrough
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --locked -p ferryman-edge -p ferryman-edge-demo
+          target/debug/edge-demo run
+      - name: mTLS smoke
+        run: |
+          set -euo pipefail
+          . "$HOME/.cargo/env"
+          bash scripts/gen-test-certs.sh
+          cargo build --locked --release -p ferryman-edge
+          up="$RUNNER_TEMP/up"
+          mkdir -p "$up/svc-a"
+          echo ok > "$up/health"
+          echo hello > "$up/svc-a/hello"
+          (cd "$up" && exec python3 -m http.server 8001 --bind 127.0.0.1) > "$RUNNER_TEMP/upstream.log" 2>&1 &
+          upid=$!
+          # Free :8001 for the container smoke step below.
+          trap 'kill $upid ${pid:-} 2>/dev/null || true' EXIT
+          # Upstream first, so the first health tick cannot open the breaker.
+          for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8001/health && break; sleep 0.25; done
+          curl -sf -o /dev/null http://127.0.0.1:8001/health || { echo "upstream did not start"; cat "$RUNNER_TEMP/upstream.log"; exit 1; }
+          ./target/release/ferryman-edge-server --config config.toml \
+              --bind 127.0.0.1:8443 --metrics-bind 127.0.0.1:9090 > "$RUNNER_TEMP/server.log" 2>&1 &
+          pid=$!
+          for _ in $(seq 1 20); do (echo > /dev/tcp/127.0.0.1/8443) 2>/dev/null && break; sleep 0.5; done
+          C="--cacert certs/ca.crt --cert certs/client.crt --key certs/client.key"
+          TOKEN=$(bash scripts/mint-jwt.sh smoke-tenant 300)
+          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || true; }
+          check() { [ "$1" = "$2" ] || { echo "FAIL $3: got $1 want $2"; cat "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/upstream.log"; getent ahosts localhost; exit 1; }; echo "ok $3 ($1)"; }
+          # Ready = the route answers; allow up to two health intervals.
+          for _ in $(seq 1 24); do
+            [ "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" = 200 ] && break
+            sleep 0.5
+          done
+          check "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" 200 "valid cert + JWT (h2)"
+          check "$(code --http1.1 $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" 200 "valid cert + JWT (h1.1)"
+          check "$(code $C https://localhost:8443/svc-a/hello)" 401 "missing JWT"
+          check "$(code $C -H 'Authorization: Bearer nope' https://localhost:8443/svc-a/hello)" 401 "bad JWT"
+          check "$(code --cacert certs/ca.crt https://localhost:8443/svc-a/hello)" 000 "no client cert"
+          check "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/nope)" 404 "unknown route"
+          curl -sf 127.0.0.1:9090/metrics | grep -q ferryman_requests_total
+          kill -USR1 "$pid"; sleep 1
+          check "$(code $C -H "Authorization: Bearer $TOKEN" https://localhost:8443/svc-a/hello)" 200 "after SIGUSR1 reload"
+      - name: Container image smoke (read-only rootfs, uid 65532)
+        # Spec Q04: the scratch image must serve mTLS + JWT traffic with a
+        # read-only root filesystem as a non-root user, not just print --version.
+        run: |
+          set -euo pipefail
+          docker build -t ferryman-edge:kiln .
+          [ "$(docker inspect -f '{{.Config.User}}' ferryman-edge:kiln)" = "65532:65532" ]
+          SMOKE_IMAGE=ferryman-edge:kiln bash scripts/smoke.sh
+      - name: Logs on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP"/*.log examples/edge-demo/.demo/run/*.log 2>/dev/null || true

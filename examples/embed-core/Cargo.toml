@@ -8,7 +8,7 @@ publish = false
 description = "Protect your own axum service with ferryman-edge-core: mTLS, JWT middleware, per-tenant rate limiting, hot cert reload."
 
 [dependencies]
-ferryman-edge-core = { path = "../../crates/core", version = "0.1" }
+ferryman-edge-core = { path = "../../crates/core", version = "0.2" }
 axum = { workspace = true }
 tokio = { workspace = true }
 hyper = { workspace = true }
@@ -22,7 +22,7 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots"] }
 rcgen = { workspace = true }
 jsonwebtoken = { workspace = true }
 tempfile = "3"

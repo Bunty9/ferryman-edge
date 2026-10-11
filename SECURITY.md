@@ -14,5 +14,5 @@ you prefer otherwise.
 
 ## Supported versions
 
-Until 1.0, only the latest minor release (currently 0.1.x) receives
+Until 1.0, only the latest minor release (currently 0.2.x) receives
 security fixes.
