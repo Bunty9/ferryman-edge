@@ -81,7 +81,10 @@ Both crates share one version. Format follows
 - Paths that an upstream reading `%2F` / `%5C` / `\` as `/`, or dropping
   `;params`, would send to a different route than the proxy chose get
   `400 bad path` (`/api%2Fsecret` with a `/` catch-all next to `/api`),
-  checked right after the dot-segment check. Migration: send plain `/`
+  checked right after the dot-segment check. The dot-segment check also
+  runs on the normalised path when the raw path holds `%`, so dot segments
+  hidden behind mixed encodings (`/svc/%2%65%2%65/x`) get `400 bad path`
+  too (`ferryman_core::path::bad_path_normalized`). Migration: send plain `/`
   separators; an encoded slash that does not change the route
   (`group%2Fproject`) still passes.
 - Config validation (from core): duplicate prefixes; prefixes not in
@@ -94,6 +97,19 @@ Both crates share one version. Format follows
   point `https://` upstreams at their `http://` address; remove
   `trusted_proxies`; give routes on one `host:port` the same
   `cooldown_secs`, `health_path` and `health_disabled`.
+- Config: `[limits] shutdown_drain_secs` becomes top-level
+  `drain_timeout_secs` (ferryman-core's name, default 25 s; the old
+  spelling loads with a warning, both together is an error). It now
+  reloads on SIGUSR1 (applies to the next shutdown). `Limits` loses
+  `shutdown_drain_secs`; `serve_with` reads the drain from the table
+  (`RouteTable::drain_timeout()`). Migration: move the key to the top level.
+- Config: further ferryman-core keys edge does not implement yet are
+  rejected unless at their default: `shutdown_delay_secs` (0),
+  `local_health_path` (unset), `forwarded_header` (false), `access_log`
+  (false; edge writes no access log), `request_id` (false) and per-route
+  `strip_prefix` (false). `xff` may be left out or set to `"replace"`
+  (edge always replaces `x-forwarded-for` with the peer IP); an explicit
+  `xff = "append"` is rejected. Migration: remove those keys.
 - Reload carries breaker state by upstream `host:port`, so an open
   circuit stays open across SIGUSR1 even when its routes change.
 - The `upstream` metric label is core's normalised `host:port` (lowercase,

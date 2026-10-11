@@ -14,6 +14,7 @@ default_cooldown_secs = 30
 # keepalive_timeout_secs         = 10   # HTTP/1 idle keep-alive
 # request_body_idle_timeout_secs = 30   # longest gap between body frames
 # request_body_timeout_secs      = 300  # whole upload
+# drain_timeout_secs             = 25   # shutdown drain for in-flight connections
 
 [limits]
 tenant_rps = 1000                       # per JWT `sub`; 0 disables
@@ -21,7 +22,6 @@ tenant_rps = 1000                       # per JWT `sub`; 0 disables
 # tls_handshake_timeout_secs = 10
 # first_request_timeout_secs = 10
 # h2_max_concurrent_streams  = 64
-# shutdown_drain_secs        = 25
 
 [mtls]
 cert_path      = "certs/server.crt"

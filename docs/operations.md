@@ -18,6 +18,9 @@ are resolved against the process working directory.
 | `keepalive_timeout_secs` | `10` | no | HTTP/1 keep-alive idle timeout; also bounds header reads of later requests, and the first request on HTTP/1 is cut off at the smaller of this and `first_request_timeout_secs`. Behind an ALB use ALB idle + 15 s. If you raised `first_request_timeout_secs` in 0.1.x, set this to the same value. |
 | `request_body_idle_timeout_secs` | `30` | yes | Longest gap between request-body frames; exceeded gets 408. |
 | `request_body_timeout_secs` | `300` | yes | Whole upload; exceeded gets 408. (0.1.x: `[limits] request_body_timeout_secs`, still loads with a warning.) |
+| `drain_timeout_secs` | `25` | yes (applies to the next shutdown) | 1 to 86400. How long in-flight connections get to finish after a shutdown signal. Keep it below your orchestrator's kill timeout. (0.1.x: `[limits] shutdown_drain_secs`, still loads with a warning; setting both is an error.) |
+| `xff` | unset | — | Edge always **replaces** `x-forwarded-for` with the TLS peer IP, which is ferryman-core's `"replace"`. Leave the key out or set `xff = "replace"`; `xff = "append"` (core's default, not edge's behaviour) is rejected at load and on reload. |
+| `shutdown_delay_secs`, `local_health_path`, `forwarded_header`, `access_log`, `request_id`, `[[routes]] strip_prefix` | `0` / unset / `false` | — | ferryman-core keys ferryman-edge does not implement yet: any value other than the default is rejected at load and on reload ("&lt;key&gt; is not supported by ferryman-edge yet"). In particular edge writes **no access log** and sets no `x-request-id`. |
 | `[mtls] cert_path` (0.1.x name `[tls]` still loads, with a warning) | — | yes (contents) | Server certificate chain, PEM (leaf first, then intermediates). |
 | `[mtls] key_path` | — | yes (contents) | Server private key, PEM (PKCS#8, PKCS#1 or SEC1). |
 | `[mtls] client_ca_path` | — | yes (contents) | Client CA bundle, PEM. Every client cert must chain to one of these. |
@@ -62,7 +65,7 @@ restart (no log line).
 | `first_request_timeout_secs` | `10` | 1 to 86400 | Time a new connection has to send its first request; on HTTP/1 also capped by `keepalive_timeout_secs` (the smaller applies). |
 | `tenant_rps` | `1000` | 0 to 2^32-1 | Per-tenant GCRA limit keyed by JWT sub; 0 disables. (0.1.x: top level, still loads with a warning.) |
 | `h2_max_concurrent_streams` | `64` | at least 1 | Concurrent h2 streams per connection. |
-| `shutdown_drain_secs` | `25` | 1 to 86400 | How long in-flight connections get to finish after a shutdown signal. |
+| `shutdown_drain_secs` | — | — | Deprecated: loads as top-level `drain_timeout_secs`, with a warning (and reloads like it). Setting both is an error. |
 
 Unknown keys in any table are rejected at load.
 
@@ -70,7 +73,7 @@ Slowloris trade-off: `first_request_timeout_secs`, `keepalive_timeout_secs`
 (the HTTP/1 header-read timeout) and `tls_handshake_timeout_secs` bound how long an
 unauthenticated or silent client can hold a connection slot. Raising them
 widens that window; raise them only for slow, trusted networks. Keep
-`shutdown_drain_secs` below your orchestrator's kill timeout.
+`drain_timeout_secs` below your orchestrator's kill timeout.
 
 ## Local run
 
@@ -131,7 +134,7 @@ kernel `comm`, so `pgrep -x ferryman-edge-server` never matches.
 ## Shutdown
 
 SIGTERM or SIGINT stops accepting, lets in-flight connections finish for up
-to 25 s by default (`shutdown_drain_secs`), then exits. `fly.toml` sends SIGINT with a 30 s kill timeout.
+to 25 s by default (top-level `drain_timeout_secs`), then exits. `fly.toml` sends SIGINT with a 30 s kill timeout.
 
 ## Metrics
 
@@ -179,7 +182,7 @@ total request or response deadline that a slow but steady client exceeds.
 | `503` persists | Upstream's health path answers 5xx or not at all, or requests keep failing. Check `ferryman_upstream_alive`, then fix the upstream or set the route's `health_path` (or `health_disabled = true`). A disabled upstream is not probed: after a trip it recovers only via the half-open request let through after `cooldown_secs`. |
 | `404 no route` | No prefix matches on a segment boundary (`/svc-a` does not match `/svc-abc`). |
 | `400 bad host` | The `Host` is unusable: duplicate or empty, `*`, userinfo (`u@x`), a path or comma, non-ASCII bytes, an invalid port; or HTTP/1.1 with neither `Host` nor an absolute-form target (HTTP/1.0 may omit it). An empty `Host` is stricter than RFC 9112 §3.2, which allows it when the target's authority is empty. |
-| `400 bad path` | Path has a `.` or `..` segment (also `%2e`), or is ambiguous: read with `%2F` / `%5C` / `\` as `/` or with `;params` dropped, it would match a different route (`/api%2Fsecret` with a `/` catch-all). Send plain `/` separators. |
+| `400 bad path` | Path has a `.` or `..` segment (also `%2e`, or one hidden behind mixed encodings such as `%2%65%2%65`), or is ambiguous: read with `%2F` / `%5C` / `\` as `/` or with `;params` dropped, it would match a different route (`/api%2Fsecret` with a `/` catch-all). Send plain `/` separators. |
 | `501 protocol upgrades are not supported` | The request has an `Upgrade` header (e.g. WebSocket) other than `h2c`, or uses `CONNECT`. The proxy can't splice connections. It is checked before route lookup, so an unrouted path also gets 501, not 404. |
 | `401` with a token you believe is valid | Expired (60 s leeway), `nbf` in the future, wrong key, or `iss`/`aud` mismatch. `ferryman_auth_failures_total{reason="invalid"}` counts these. |
 | curl exits 56 / handshake failure | No client cert, or it doesn't chain to `client_ca_path`. `ferryman_tls_handshake_failures_total` counts these. |

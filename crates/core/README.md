@@ -18,7 +18,7 @@ wires these behind a `tokio-rustls` acceptor.
 | `jwt` | `JwtVerifier`: RS256 with a 10k-entry / 5-minute moka cache; `exp` re-checked on cache hits, `nbf` enforced, optional `iss` / `aud`; `reload_key` swaps the public key and clears the cache (no-op if the PEM is unchanged) |
 | `ratelimit` | Per-tenant GCRA limiter (`governor`), `0` rps = disabled, `spawn_gc` to bound per-tenant state |
 | `config` | `EdgeConfig::parse` (`[mtls]`, `[jwt]`, `[limits]`) over `ferryman_core::ConfigToml`; errors are `ConfigError` (core errors wrapped as `ConfigError::Core`) |
-| `ferryman_core` | Re-export: `RouteTable`, `Upstream` with its Admission-ticket breaker, `build_table`, `health_loop`, `path::{bad_path, ambiguous_route}` |
+| `ferryman_core` | Re-export: `RouteTable`, `Upstream` with its Admission-ticket breaker, `build_table`, `health_loop`, `path::{bad_path, bad_path_normalized, ambiguous_route}` |
 
 ```rust
 use ferryman_edge_core::{build_limiter, check, JwtVerifier};

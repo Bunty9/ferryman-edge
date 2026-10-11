@@ -30,7 +30,7 @@
 //! Auth (JWT verify + rate limit + `x-ferryman-tenant` stamping) happens in
 //! `lib.rs` before a request reaches `handle`.
 
-use ferryman_edge_core::ferryman_core::path::{ambiguous_route, bad_path};
+use ferryman_edge_core::ferryman_core::path::{ambiguous_route, bad_path_normalized};
 use ferryman_edge_core::ferryman_core::{Admission, SharedTable, Upstream};
 use ferryman_edge_core::Limits;
 use http::{HeaderMap, HeaderValue};
@@ -783,10 +783,10 @@ pub(crate) async fn handle_checked(
 
     // Everything that needs no upstream is rejected before admission
     // (`try_acquire` may hand this request the breaker's single half-open
-    // probe), in this order: bad path, ambiguous route (both on the raw
-    // path; `ambiguous_route` relies on `bad_path` having run), Host,
-    // upgrade, declared body size.
-    if bad_path(&path) || ambiguous_route(&snapshot, &path) {
+    // probe), in this order: bad path (on the raw path, and on the
+    // normalised one when it holds '%'), ambiguous route (raw path; relies on
+    // the bad-path check having run), Host, upgrade, declared body size.
+    if bad_path_normalized(&path) || ambiguous_route(&snapshot, &path) {
         return plain(400, b"bad path");
     }
     if bad_host(req.headers(), req.uri(), req.version()) {

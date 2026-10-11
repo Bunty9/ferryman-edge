@@ -62,9 +62,10 @@ SIGUSR1 reloads.
   name not in `SET_BY_PROXY`. Keep a header in the list whenever the proxy
   starts asserting it. Request trailers are dropped in `RequestBody`.
 - Order in `proxy::handle_checked` (called by `handle` and `handle_with`):
-  `bad_path` → `ambiguous_route` (both 400 bad path, both from
-  `ferryman_core::path`, both on the raw path; `ambiguous_route` relies on
-  `bad_path` having run) → Host validation (400 bad host) → 501
+  `bad_path_normalized` → `ambiguous_route` (both 400 bad path, both from
+  `ferryman_core::path`; the first runs `bad_path` on the raw path and, when
+  it holds `%`, on the normalised one; `ambiguous_route` takes the raw path
+  and relies on that check having run) → Host validation (400 bad host) → 501
   upgrade/CONNECT → 413 declared length → `lookup` (404) →
   `Upstream::try_acquire` (503). Everything before `try_acquire` needs no
   admission. `Upgrade` is stripped as

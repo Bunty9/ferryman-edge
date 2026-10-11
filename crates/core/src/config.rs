@@ -11,7 +11,7 @@
 //! [`EdgeConfig::deprecations`], which the binary logs as a warning.
 
 use anyhow::{bail, ensure, Context};
-use ferryman_core::ConfigToml;
+use ferryman_core::{ConfigToml, XffMode};
 use serde::Deserialize;
 
 /// Upper bound for every duration key, so `Duration` arithmetic can't overflow.
@@ -92,8 +92,6 @@ pub struct Limits {
     pub first_request_timeout_secs: u64,
     /// HTTP/2 max concurrent streams per connection.
     pub h2_max_concurrent_streams: u32,
-    /// Graceful-shutdown drain window.
-    pub shutdown_drain_secs: u64,
     /// Per-tenant requests/second, keyed by JWT `sub`. `0` disables.
     pub tenant_rps: u32,
 }
@@ -105,7 +103,6 @@ impl Default for Limits {
             tls_handshake_timeout_secs: 10,
             first_request_timeout_secs: 10,
             h2_max_concurrent_streams: 64,
-            shutdown_drain_secs: 25,
             tenant_rps: 1_000,
         }
     }
@@ -122,7 +119,6 @@ impl Limits {
                 "first_request_timeout_secs",
                 self.first_request_timeout_secs,
             ),
-            ("shutdown_drain_secs", self.shutdown_drain_secs),
         ] {
             ensure!(
                 (1..=MAX_SECS).contains(&v),
@@ -143,10 +139,26 @@ impl Limits {
 
 /// Core keys edge does not implement yet. A non-default value is rejected
 /// (at load and on reload), never accepted and silently ignored. Adding a
-/// key is one line: its name and "is it set?".
-fn reject_unsupported(core: &ConfigToml) -> Result<(), ConfigError> {
-    // Edge always replaces forwarding headers with the TLS peer it sees.
-    let unsupported = [("trusted_proxies", !core.trusted_proxies.is_empty())];
+/// key is one line: its name and "is it set?". `xff_set`: the file names
+/// `xff` explicitly (core cannot tell an explicit `"append"` from its default).
+fn reject_unsupported(core: &ConfigToml, xff_set: bool) -> Result<(), ConfigError> {
+    let unsupported = [
+        // Edge always replaces forwarding headers with the TLS peer it sees.
+        ("trusted_proxies", !core.trusted_proxies.is_empty()),
+        ("shutdown_delay_secs", core.shutdown_delay_secs != 0),
+        ("local_health_path", core.local_health_path.is_some()),
+        ("forwarded_header", core.forwarded_header),
+        // Edge sets X-Forwarded-For to the peer IP: that is core's "replace".
+        // Core's default "append" is not edge's behaviour, so an explicit
+        // "append" is rejected; an absent key means edge's documented replace.
+        ("xff = \"append\"", xff_set && core.xff != XffMode::Replace),
+        ("access_log", core.access_log),
+        ("request_id", core.request_id),
+        (
+            "[[routes]] strip_prefix",
+            core.routes.iter().any(|r| r.strip_prefix),
+        ),
+    ];
     match unsupported.into_iter().find(|(_, set)| *set) {
         Some((key, _)) => Err(ConfigError::Edge(format!(
             "{key} is not supported by ferryman-edge yet; remove it"
@@ -162,8 +174,9 @@ impl EdgeConfig {
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
         let edge = |e: anyhow::Error| ConfigError::Edge(format!("{e:#}"));
         let (top, mtls, jwt, limits, deprecations) = Self::parse_edge(raw).map_err(edge)?;
+        let xff_set = top.contains_key("xff");
         let core = ConfigToml::from_table(top)?;
-        reject_unsupported(&core)?;
+        reject_unsupported(&core, xff_set)?;
         Ok(Self {
             core,
             mtls,
@@ -210,15 +223,17 @@ impl EdgeConfig {
             );
             limits.insert("tenant_rps".into(), v);
         }
-        for key in ["upstream_timeout_secs", "request_body_timeout_secs"] {
-            if let Some(v) = limits.remove(key) {
+        for (old, key) in [
+            ("upstream_timeout_secs", "upstream_timeout_secs"),
+            ("request_body_timeout_secs", "request_body_timeout_secs"),
+            ("shutdown_drain_secs", "drain_timeout_secs"),
+        ] {
+            if let Some(v) = limits.remove(old) {
                 ensure!(
                     !top.contains_key(key),
-                    "{key} is set in [limits] (deprecated) and at the top level; keep the top-level key"
+                    "[limits] {old} (deprecated) and top-level {key} are both set; keep top-level {key}"
                 );
-                deprecations.push(format!(
-                    "[limits] {key} is deprecated: move it to the top level"
-                ));
+                deprecations.push(format!("[limits] {old} is deprecated: use top-level {key}"));
                 top.insert(key.into(), v);
             }
         }
@@ -360,9 +375,10 @@ health_path = "/ready"
                 k.upstream_timeout_secs,
                 k.keepalive_timeout_secs,
                 k.request_body_idle_timeout_secs,
-                k.request_body_timeout_secs
+                k.request_body_timeout_secs,
+                k.drain_timeout_secs
             ),
-            (5, 30, 3, 30, 10, 30, 300)
+            (5, 30, 3, 30, 10, 30, 300, 25)
         );
         let l = &c.limits;
         assert_eq!(
@@ -370,16 +386,42 @@ health_path = "/ready"
                 l.tls_handshake_timeout_secs,
                 l.first_request_timeout_secs,
                 l.h2_max_concurrent_streams,
-                l.shutdown_drain_secs,
                 l.tenant_rps
             ),
-            (10, 10, 64, 25, 1000)
+            (10, 10, 64, 1000)
         );
         let t = build_table(c.core, None).unwrap();
         assert_eq!(t.upstream_timeout, Duration::from_secs(30));
         assert_eq!(t.keepalive_timeout(), Duration::from_secs(10));
         assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(30));
         assert_eq!(t.request_body_timeout(), Duration::from_secs(300));
+        assert_eq!(t.drain_timeout(), Duration::from_secs(25));
+    }
+
+    #[test]
+    fn shutdown_drain_secs_is_a_deprecated_alias_of_drain_timeout_secs() {
+        let c = EdgeConfig::parse(&cfg("", "", "", "shutdown_drain_secs = 7", "")).unwrap();
+        assert_eq!(c.core.drain_timeout_secs, 7);
+        assert!(
+            c.deprecations.len() == 1 && c.deprecations[0].contains("drain_timeout_secs"),
+            "{:?}",
+            c.deprecations
+        );
+        let c = EdgeConfig::parse(&cfg("drain_timeout_secs = 8", "", "", "", "")).unwrap();
+        assert_eq!(c.core.drain_timeout_secs, 8);
+        assert!(c.deprecations.is_empty());
+        let e = err(&cfg(
+            "drain_timeout_secs = 8",
+            "",
+            "",
+            "shutdown_drain_secs = 7",
+            "",
+        ));
+        assert!(e.contains("both set"), "{e}");
+        // Range checks are core's (build_table), on the new name.
+        let c = EdgeConfig::parse(&cfg("", "", "", "shutdown_drain_secs = 0", "")).unwrap();
+        let e = build_table(c.core, None).err().unwrap().to_string();
+        assert!(e.contains("drain_timeout_secs"), "{e}");
     }
 
     #[test]
@@ -443,7 +485,6 @@ health_path = "/ready"
                 "first_request_timeout_secs",
             ),
             ("h2_max_concurrent_streams = 0", "h2_max_concurrent_streams"),
-            ("shutdown_drain_secs = 0", "shutdown_drain_secs"),
         ] {
             let e = err(&cfg("", "", "", line, ""));
             assert!(e.contains(key), "{line}: {e}");
@@ -458,6 +499,37 @@ health_path = "/ready"
             "{e}"
         );
         assert!(EdgeConfig::parse(&cfg("trusted_proxies = []", "", "", "", "")).is_ok());
+    }
+
+    #[test]
+    fn unsupported_core_keys_are_rejected_unless_default() {
+        for (top, route, key) in [
+            ("shutdown_delay_secs = 1", "", "shutdown_delay_secs"),
+            ("local_health_path = \"/up\"", "", "local_health_path"),
+            ("forwarded_header = true", "", "forwarded_header"),
+            ("xff = \"append\"", "", "xff = \"append\""),
+            ("access_log = true", "", "access_log"),
+            ("request_id = true", "", "request_id"),
+            ("", "strip_prefix = true", "strip_prefix"),
+        ] {
+            let e = err(&cfg(top, "", "", "", route));
+            assert!(
+                e.contains(&format!("{key} is not supported by ferryman-edge yet")),
+                "{top}{route}: {e}"
+            );
+        }
+        for (top, route) in [
+            ("shutdown_delay_secs = 0", ""),
+            ("forwarded_header = false", ""),
+            // Edge always replaces X-Forwarded-For: "replace" says so.
+            ("xff = \"replace\"", ""),
+            ("access_log = false", ""),
+            ("request_id = false", ""),
+            ("", "strip_prefix = false"),
+        ] {
+            let c = EdgeConfig::parse(&cfg(top, "", "", "", route)).unwrap();
+            build_table(c.core, None).unwrap();
+        }
     }
 
     /// Core's schema errors arrive wrapped, not re-expressed as edge errors.

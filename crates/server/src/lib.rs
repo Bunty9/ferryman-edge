@@ -66,8 +66,8 @@ pub async fn serve(
 /// timeout makes every request or connection time out immediately.
 ///
 /// Accept loop. Runs until `shutdown` resolves, then stops accepting new
-/// connections, lets in-flight ones finish (bounded by
-/// `limits.shutdown_drain_secs`), and returns.
+/// connections, lets in-flight ones finish (bounded by the current table's
+/// `drain_timeout()`, config `drain_timeout_secs`), and returns.
 pub async fn serve_with(
     listener: TcpListener,
     state: Arc<AppState>,
@@ -122,7 +122,7 @@ pub async fn serve_with(
     tracing::info!("shutdown signal received; draining connections");
     tokio::select! {
         _ = graceful.shutdown() => tracing::info!("all connections drained"),
-        _ = tokio::time::sleep(Duration::from_secs(limits.shutdown_drain_secs)) => {
+        _ = tokio::time::sleep(state.table.load().drain_timeout()) => {
             tracing::warn!("graceful shutdown timed out; dropping remaining connections");
         }
     }

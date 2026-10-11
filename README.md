@@ -139,7 +139,7 @@ Every request passes the same gates, in order:
 | TLS handshake, client cert must chain to `client_ca_path` (10 s by default; `tls_handshake_timeout_secs`) | connection closed | `ferryman_tls_handshake_failures_total`, `ferryman_tls_handshake_seconds` |
 | `Authorization: Bearer <RS256 JWT>`: `exp` (also on cache hits), `nbf`, and `iss`/`aud` when configured | `401` + `www-authenticate: Bearer` | `ferryman_auth_failures_total{reason}` |
 | Per-tenant GCRA limit keyed by `sub` (`[limits] tenant_rps`, `0` disables) | `429` + `retry-after: 1` | `ferryman_ratelimited_total` |
-| No `.` / `..` path segments (incl. `%2e`), and no ambiguous route: a path that an upstream reading `%2F` / `%5C` / `\` as `/` or dropping `;params` would send to a different route (`/api%2Fsecret` next to a `/` catch-all) | `400` bad path | `ferryman_requests_total{status}` |
+| No `.` / `..` path segments (incl. `%2e`, also after normalising mixed encodings such as `%2%65`), and no ambiguous route: a path that an upstream reading `%2F` / `%5C` / `\` as `/` or dropping `;params` would send to a different route (`/api%2Fsecret` next to a `/` catch-all) | `400` bad path | `ferryman_requests_total{status}` |
 | One valid `Host` (or a request-target authority); HTTP/1.1 needs one | `400` bad host | `ferryman_requests_total{status}` |
 | Not a protocol upgrade: `Upgrade` other than `h2c`, or `CONNECT` (checked before route lookup, so unrouted paths get it too) | `501` | `ferryman_requests_total{status}` |
 | Longest-prefix route on a path-segment boundary, matched on a normalised path (`%XX` of unreserved characters decoded, `//` merged; the upstream still gets the raw path); no fall-through to a shorter prefix | `404` no route | |
@@ -193,7 +193,7 @@ up. A route reload keeps breaker state per upstream `host:port`, so an open
 circuit stays open even when its routes change.
 
 SIGTERM / SIGINT stop accepting and drain in-flight connections for up to
-25 s by default (`shutdown_drain_secs`). SIGUSR1 reloads TLS material, the
+25 s by default (`drain_timeout_secs`). SIGUSR1 reloads TLS material, the
 routing table (including per-route `health_path` / `health_disabled`) and
 the JWT public key (read from the boot-time path; the token cache is
 cleared). `[limits]`, `issuer` / `audience`,

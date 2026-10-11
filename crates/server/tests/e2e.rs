@@ -570,6 +570,8 @@ struct Harness {
     table: SharedTable,
     /// Keeps the `/probe` and `/down` ports reserved (see `dead_port`).
     _dead: [tokio::net::TcpSocket; 2],
+    /// The `serve_with` task; it ends only after `Opts::shutdown` fires.
+    served: tokio::task::JoinHandle<()>,
 }
 
 /// Harness settings. `failure_threshold` defaults to core's 3; the blame
@@ -581,6 +583,8 @@ struct Opts {
     failure_threshold: u32,
     /// Extra `[[routes]]` TOML appended to the standard set.
     extra_routes: String,
+    /// Resolving it shuts the proxy down; `None` serves forever.
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl Default for Opts {
@@ -590,6 +594,7 @@ impl Default for Opts {
             limits: Limits::default(),
             failure_threshold: 3,
             extra_routes: String::new(),
+            shutdown: None,
         }
     }
 }
@@ -700,12 +705,13 @@ impl Harness {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_with(
-            listener,
-            state,
-            opts.limits,
-            std::future::pending(),
-        ));
+        let shutdown = opts.shutdown;
+        let served = tokio::spawn(serve_with(listener, state, opts.limits, async move {
+            match shutdown {
+                Some(rx) => drop(rx.await),
+                None => std::future::pending().await,
+            }
+        }));
 
         Self {
             certs,
@@ -715,6 +721,7 @@ impl Harness {
             jwt,
             table,
             _dead: [probe_sock, down_sock],
+            served,
         }
     }
 
@@ -2130,6 +2137,62 @@ async fn routes_match_the_normalised_path_but_forward_it_raw() {
             );
         }
     }
+}
+
+/// `drain_timeout_secs` bounds the shutdown drain: with 1 s, `serve_with`
+/// returns about 1 s after the signal although a `/slow` request (3 s) is
+/// still in flight.
+#[tokio::test]
+async fn drain_timeout_bounds_the_shutdown_drain() {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let h = Harness::build(
+        Opts {
+            shutdown: Some(rx),
+            ..Opts::default()
+        },
+        |t| t.with_drain_timeout(Duration::from_secs(1)),
+    )
+    .await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let req = h.client().get(h.url("/slow/x")).bearer_auth(&token).send();
+    let inflight = tokio::spawn(req);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let t0 = std::time::Instant::now();
+    tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), h.served)
+        .await
+        .unwrap()
+        .unwrap();
+    let took = t0.elapsed();
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_millis(2_500),
+        "{took:?}"
+    );
+    inflight.abort();
+}
+
+/// Dot segments hidden behind mixed encodings pass the raw `bad_path` check
+/// but normalise to `%2e%2e`; `bad_path_normalized` rejects them with 400,
+/// before the Host check. A plain encoded byte still routes.
+#[tokio::test]
+async fn dot_segments_behind_mixed_encodings_are_bad_paths() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    for p in [
+        "/svc-a/%2%65%2%65/x",
+        "/svc-a/%%32%65%%32%65/x",
+        "/svc-a/%2%65/x",
+    ] {
+        let (s, rest) = raw_get(&h, p, Some(&token)).await;
+        assert!(
+            s.contains(" 400") && rest.ends_with("bad path"),
+            "{p}: {s} {rest}"
+        );
+        let (s, rest) = raw_get_with(&h, p, Some(&token), "host: other\r\n").await;
+        assert!(rest.ends_with("bad path"), "{p} before Host: {s} {rest}");
+    }
+    let (s, _) = raw_get(&h, "/svc-a/a%2eb", Some(&token)).await;
+    assert!(s.contains(" 200"), "{s}");
 }
 
 /// With a `/` catch-all next to `/api`, a path an upstream could read as
