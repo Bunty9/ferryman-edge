@@ -311,6 +311,7 @@ async fn spawn_sse_upstream() -> SocketAddr {
 /// Answers 200 (502 for `/trunc/bad`) with a chunked body, then closes
 /// without the terminating chunk: a body error after the head. `/trunc/ok`
 /// is a healthy stream instead: `hello`, 600 ms later `world`, then the end.
+/// `/trunc/sized` is a healthy `Content-Length: 10` body, sent in full.
 async fn spawn_truncating_upstream() -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -323,6 +324,13 @@ async fn spawn_truncating_upstream() -> SocketAddr {
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
+                if buf[..n].windows(13).any(|w| w == b" /trunc/sized") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhelloworld")
+                        .await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
                 let bad = buf[..n].windows(11).any(|w| w == b" /trunc/bad");
                 if buf[..n].windows(10).any(|w| w == b" /trunc/ok") {
                     let _ = stream
@@ -1977,6 +1985,39 @@ async fn stream_end_is_success_and_client_hang_up_is_no_verdict() {
         h.circuit("/trunc"),
         CircuitState::Open,
         "hang-up is no success"
+    );
+}
+
+/// A fully served `Content-Length` body is a success too (hyper never polls
+/// past its last frame, so `WatchedBody` records it on `is_end_stream`):
+/// 2 failures, a sized response, 2 failures stay under the threshold of 3.
+#[tokio::test]
+async fn sized_body_end_records_the_deferred_success() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let get = |p: &str| {
+        h.client()
+            .get(h.url(p))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    let fail = || async {
+        let resp = get("/trunc/a").await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.bytes().await.is_err(), "body must error");
+    };
+    fail().await;
+    fail().await;
+    let resp = get("/trunc/sized").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-length"], "10");
+    assert_eq!(resp.text().await.unwrap(), "helloworld");
+    fail().await;
+    fail().await;
+    assert_eq!(
+        h.circuit("/trunc"),
+        CircuitState::Closed,
+        "sized body reset the count"
     );
 }
 
