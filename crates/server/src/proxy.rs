@@ -197,10 +197,12 @@ fn upstream_error(status: u16, msg: &'static [u8], host: String) -> anyhow::Resu
 
 /// One admitted request's breaker report, created right after
 /// `Upstream::try_acquire`. `success` and `failure` take `self`, so the
-/// admission reports at most once. Dropped without a verdict (client body
-/// error 400/408/413, an upload stall the upstream reacted to, or the
-/// handler future dropped because the client hung up or reset its h2
-/// stream before the upstream answered), it hands the admission back with
+/// admission reports at most once. A normal admission whose head is not
+/// 502–504 moves into `WatchedBody` and reports at the end of the body.
+/// Dropped without a verdict (client body error 400/408/413, an upload
+/// stall the upstream reacted to, or the handler future or response body
+/// dropped because the client hung up or reset its h2 stream), it hands the
+/// admission back with
 /// `Upstream::release`: core re-arms a half-open probe slot at most once per
 /// cooldown, and a normal admission is a no-op. Upstream timeouts and
 /// errors never get here; they call `failure`.
@@ -566,11 +568,20 @@ async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
 }
 
 /// The upstream's response body. An error from it (reset, truncated chunked
-/// stream) is the upstream's fault and counts against the breaker, once, as
-/// an ordinary (`Admission::Normal`) failure: the head already gave the
-/// ticket's verdict. A slow or long body is never blamed, and a client that
-/// goes away drops the body without a poll error. (ferryman itself never
-/// blames after the head; edge does on purpose.)
+/// stream) is the upstream's fault and counts against the breaker once. A
+/// slow or long body is never blamed, and a client that goes away drops the
+/// body without a poll error. (ferryman itself never blames after the head;
+/// edge does on purpose.)
+///
+/// For a `Normal` admission with a non-502–504 head the verdict waits for
+/// the body: `ticket` is `Some`, and the clean end of the upstream body is
+/// `success`, an upstream body error `failure`, an exempt error (see below)
+/// or a drop before the end (client hang-up) `release`. Giving `success` at
+/// the head would reset the consecutive-failure count on every request, so
+/// an upstream that always resets mid-body would never open the breaker.
+/// A `Probe` gets its verdict at the head (closes a half-open breaker at
+/// once; a long stream never holds the probe slot), so `ticket` is `None`
+/// and a later body error counts as one `Admission::Normal` failure.
 ///
 /// Not blamed either: an error after the client was slow to pull the
 /// response. hyper polls this body only when the client side can take more,
@@ -580,6 +591,9 @@ async fn upstream_timer(eos: Eos, upstream_timeout: Duration) {
 struct WatchedBody {
     inner: Incoming,
     upstream: Upstream,
+    /// The deferred verdict (see above); `None` once given or when the
+    /// head gave it.
+    ticket: Option<Ticket>,
     request: Arc<BodyState>,
     /// This request already counted one failure (its head, or an earlier
     /// body error); never count another.
@@ -607,24 +621,44 @@ impl hyper::body::Body for WatchedBody {
             }
         }
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
-        if let Poll::Ready(Some(Ok(_))) = &polled {
-            this.ready_at = Some(now);
-        }
-        // The upstream may answer before it has read the whole upload. If the
-        // client then aborts or stalls, hyper tears the connection down and
-        // surfaces a plain "connection error" here, with no trace of the
-        // client's error in its source chain. So besides the head's
-        // classifier, check whether the request body itself failed.
-        if let Poll::Ready(Some(Err(e))) = &polled {
-            if !this.failed
-                && client_fault(e).is_none()
-                && !this.request.client_failed.load(Ordering::Acquire)
-                && !this.request.stalled_during_request()
-                && !this.client_stalled_reading
-            {
-                this.failed = true;
-                this.upstream.record_failure(Admission::Normal);
+        match &polled {
+            Poll::Ready(Some(Ok(_))) => {
+                this.ready_at = Some(now);
+                // hyper does not poll again once a sized body reports its end.
+                if this.inner.is_end_stream() {
+                    if let Some(t) = this.ticket.take() {
+                        t.success();
+                    }
+                }
             }
+            Poll::Ready(None) => {
+                if let Some(t) = this.ticket.take() {
+                    t.success();
+                }
+            }
+            // The upstream may answer before it has read the whole upload. If
+            // the client then aborts or stalls, hyper tears the connection
+            // down and surfaces a plain "connection error" here, with no trace
+            // of the client's error in its source chain. So besides the head's
+            // classifier, check whether the request body itself failed.
+            Poll::Ready(Some(Err(e))) => {
+                let blamed = client_fault(e).is_none()
+                    && !this.request.client_failed.load(Ordering::Acquire)
+                    && !this.request.stalled_during_request()
+                    && !this.client_stalled_reading;
+                if let Some(t) = this.ticket.take() {
+                    if blamed {
+                        t.failure();
+                    } else {
+                        t.release();
+                    }
+                    this.failed = true;
+                } else if blamed && !this.failed {
+                    this.failed = true;
+                    this.upstream.record_failure(Admission::Normal);
+                }
+            }
+            Poll::Pending => {}
         }
         polled
     }
@@ -650,6 +684,11 @@ fn declared_len<B>(req: &Request<B>) -> Option<u64> {
 /// Handle a single inbound request with [`Limits::default`]. Hop-by-hop
 /// headers are expected to be stripped by the caller (before it stamps
 /// `x-ferryman-tenant`); upgrades are detected from what is still present.
+///
+/// Other spellings of the proxy-asserted headers are removed here, but a
+/// canonical client-sent `x-ferryman-tenant` is not: only the server's
+/// auth layer stamps it. Library callers must remove or stamp that header
+/// themselves, or the client's value reaches the upstream.
 pub async fn handle(
     table: SharedTable,
     client: Client<HttpConnector, RequestBody>,
@@ -659,7 +698,9 @@ pub async fn handle(
     handle_with(table, client, req, peer_ip, &Limits::default()).await
 }
 
-/// `handle` with explicit [`Limits`] (body cap).
+/// `handle` with explicit [`Limits`] (body cap). Like [`handle`], it leaves
+/// a canonical client-sent `x-ferryman-tenant` in place: the caller must
+/// remove or stamp it.
 pub async fn handle_with(
     table: SharedTable,
     client: Client<HttpConnector, RequestBody>,
@@ -872,14 +913,18 @@ pub(crate) async fn handle_checked(
     };
 
     let status = resp.status();
-    // Health is judged on the response head; the body then streams with no
-    // deadline. Only gateway-class 5xx mean "this upstream is unhealthy": a
-    // 500 is one request's bug and must not blackhole the route. A gateway
-    // answering 502–504 after the client stalled its upload is passing on
-    // its backend's reaction to that stall: no verdict (and never success).
-    // A head that already counted as a failure must not count again if its
-    // body then breaks: one request, one failure.
+    // Only gateway-class 5xx mean "this upstream is unhealthy": a 500 is one
+    // request's bug and must not blackhole the route. They are judged on the
+    // head. A gateway answering 502–504 after the client stalled its upload
+    // is passing on its backend's reaction to that stall: no verdict (and
+    // never success). A head that already counted as a failure must not
+    // count again if its body then breaks: one request, one failure.
+    // Any other head: a probe succeeds now; a normal admission's verdict
+    // waits for the end of the body (see `WatchedBody`). An empty body
+    // (204, HEAD, length 0) may never be polled, so it succeeds now too.
     let mut head_failed = false;
+    let (mut resp_parts, resp_body) = resp.into_parts();
+    let mut deferred = None;
     if matches!(status.as_u16(), 502..=504) {
         if client_state.stalled_during_request() {
             ticket.release();
@@ -887,13 +932,15 @@ pub(crate) async fn handle_checked(
             ticket.failure();
             head_failed = true;
         }
+    } else if admission == Admission::Normal && !resp_body.is_end_stream() {
+        deferred = Some(ticket);
     } else {
         ticket.success();
     }
-    let (mut resp_parts, resp_body) = resp.into_parts();
     let resp_body = WatchedBody {
         inner: resp_body,
         upstream: upstream.clone(),
+        ticket: deferred,
         request: client_state,
         failed: head_failed,
         // The gap between the head and the first body poll counts too.

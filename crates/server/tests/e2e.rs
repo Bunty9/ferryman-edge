@@ -309,7 +309,8 @@ async fn spawn_sse_upstream() -> SocketAddr {
 }
 
 /// Answers 200 (502 for `/trunc/bad`) with a chunked body, then closes
-/// without the terminating chunk: a body error after the head.
+/// without the terminating chunk: a body error after the head. `/trunc/ok`
+/// is a healthy stream instead: `hello`, 600 ms later `world`, then the end.
 async fn spawn_truncating_upstream() -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -323,6 +324,17 @@ async fn spawn_truncating_upstream() -> SocketAddr {
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let bad = buf[..n].windows(11).any(|w| w == b" /trunc/bad");
+                if buf[..n].windows(10).any(|w| w == b" /trunc/ok") {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                        )
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let _ = stream.write_all(b"5\r\nworld\r\n0\r\n\r\n").await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
                 let head: &[u8] = if bad {
                     b"HTTP/1.1 502 Bad Gateway\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
                 } else {
@@ -1890,6 +1902,81 @@ async fn upstream_body_reset_after_200_head_trips_the_breaker() {
         get("/trunc/b").await.unwrap().status(),
         503,
         "breaker must open"
+    );
+}
+
+/// At core's default threshold (3), a 200 head must not reset the failure
+/// count before its body is done: three 200-then-reset requests in a row
+/// open the breaker. (With the verdict at the head they cycled 0→1→0→1.)
+#[tokio::test]
+async fn body_resets_after_200_heads_open_the_breaker_at_the_default_threshold() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let get = |p: &str| {
+        h.client()
+            .get(h.url(p))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    for i in 1..=3 {
+        let resp = get("/trunc/a").await.unwrap();
+        assert_eq!(resp.status(), 200, "request {i}");
+        assert!(resp.bytes().await.is_err(), "request {i}: body must error");
+    }
+    assert_eq!(
+        get("/trunc/b").await.unwrap().status(),
+        503,
+        "breaker must open"
+    );
+}
+
+/// A normal admission's verdict comes at the end of the body: a healthy
+/// stream that runs to its end is a success (it resets the failure count),
+/// and a client hanging up mid-stream is no verdict at all (neither a
+/// failure nor a reset). Default threshold 3.
+#[tokio::test]
+async fn stream_end_is_success_and_client_hang_up_is_no_verdict() {
+    let h = Harness::new(0).await;
+    let token = mint_jwt("tenant-a", 3600, "read");
+    let get = |p: &str| {
+        h.client()
+            .get(h.url(p))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    let fail = || async {
+        let resp = get("/trunc/a").await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.bytes().await.is_err(), "body must error");
+    };
+    fail().await;
+    fail().await;
+    // A healthy 600 ms stream, read to its end: success, count back to 0.
+    let resp = get("/trunc/ok").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "helloworld");
+    fail().await;
+    fail().await;
+    assert_eq!(
+        h.circuit("/trunc"),
+        CircuitState::Closed,
+        "stream reset the count"
+    );
+    // Hang up after the first chunk: release, so still 2 failures.
+    let mut resp = get("/trunc/ok").await.unwrap();
+    assert_eq!(resp.chunk().await.unwrap().as_deref(), Some(&b"hello"[..]));
+    drop(resp);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        h.circuit("/trunc"),
+        CircuitState::Closed,
+        "hang-up is no failure"
+    );
+    fail().await;
+    assert_eq!(
+        h.circuit("/trunc"),
+        CircuitState::Open,
+        "hang-up is no success"
     );
 }
 
