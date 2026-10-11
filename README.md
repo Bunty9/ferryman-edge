@@ -140,7 +140,8 @@ On the way through, the proxy strips hop-by-hop headers (both directions,
 including any named in `Connection`), then stamps `x-ferryman-tenant: <sub>`
 (any client-supplied value is dropped first). It rewrites `Host` to the
 upstream, replaces `x-forwarded-for` with the peer IP (dropping client-sent
-`Forwarded` / `X-Real-IP`), sets `x-forwarded-proto: https`, and downgrades
+`Forwarded`, `X-Real-IP` and the other `X-Forwarded-*` headers), sets
+`x-forwarded-proto: https`, does not forward request trailers, and downgrades
 the outbound request to HTTP/1.1. Inbound protocol is pinned from ALPN
 (`h2` or `http/1.1`). A connection with no request within 10 s (default;
 `first_request_timeout_secs`) of the

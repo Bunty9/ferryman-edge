@@ -7,6 +7,11 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-10-09
+
+### Security
+- Strip non-canonical spellings of proxy-asserted headers, and client-supplied forwarding headers the proxy does not set, so only values set by the proxy reach the upstream.
+
 ## [0.1.2] — 2026-10-06
 
 ### Security
@@ -101,7 +106,8 @@ No code changes in either crate.
 - Prometheus metrics (requests, auth failures, rate limiting, TLS
   handshakes, breaker state, upstream health).
 
-[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Bunty9/ferryman-edge/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Bunty9/ferryman-edge/releases/tag/v0.1.0

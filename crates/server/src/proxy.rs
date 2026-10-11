@@ -71,11 +71,77 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+/// Request headers the proxy asserts to the upstream: it sets, replaces or
+/// removes them itself.
+const PROXY_ASSERTED_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-forwarded-prefix",
+    "x-real-ip",
+    "x-ferryman-tenant",
+];
+
+/// Normalise a header name for [`strip_noncanonical_asserted`]: ASCII
+/// lowercase, every non-alphanumeric byte read as `-`, runs of `-` collapsed
+/// and leading/trailing `-` trimmed.
+fn normalise_header_name(n: &str) -> String {
+    let mut out = String::with_capacity(n.len());
+    for b in n.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b.to_ascii_lowercase() as char);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Strip non-canonical spellings of proxy-asserted headers from a client
+/// request: only the canonical name, set by the proxy, may reach the
+/// upstream. A name is a spelling of a listed header when it is not that
+/// name but normalises to it (see [`normalise_header_name`]). Idempotent,
+/// and never touches a canonical name.
+pub(crate) fn strip_noncanonical_asserted(headers: &mut HeaderMap) {
+    let drop: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|n| {
+            let n = n.as_str();
+            !PROXY_ASSERTED_HEADERS.contains(&n)
+                && PROXY_ASSERTED_HEADERS.contains(&normalise_header_name(n).as_str())
+        })
+        .cloned()
+        .collect();
+    for n in drop {
+        headers.remove(n);
+    }
+}
+
 /// This is the edge: whatever forwarding headers the client sent are
-/// untrusted, so replace them with the peer address instead of appending.
+/// untrusted. Non-canonical spellings of every proxy-asserted header go, the
+/// canonical forwarding headers the proxy does not set go, and
+/// `x-forwarded-for` / `x-forwarded-proto` are replaced with the peer
+/// address and `https`. The tenant header is stamped by the caller.
 fn set_forwarded(headers: &mut HeaderMap, ip: IpAddr) {
-    headers.remove("forwarded");
-    headers.remove("x-real-ip");
+    strip_noncanonical_asserted(headers);
+    for h in [
+        "forwarded",
+        "x-real-ip",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-ssl",
+        "x-forwarded-scheme",
+        "x-forwarded-prefix",
+    ] {
+        headers.remove(h);
+    }
     headers.insert(
         "x-forwarded-for",
         HeaderValue::from_str(&ip.to_string()).expect("an IP is a valid header value"),
@@ -440,7 +506,13 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        // Trailers are dropped: the upstream gets only the body data.
+        let polled = loop {
+            match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+                std::task::Poll::Ready(Some(Ok(f))) if f.is_trailers() => continue,
+                p => break p,
+            }
+        };
         if matches!(polled, std::task::Poll::Ready(None)) || self.inner.is_end_stream() {
             self.done.store(true, Ordering::Release);
         }
@@ -458,7 +530,53 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for TrackEnd<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bad_path, wants_upgrade};
+    use super::{bad_path, strip_noncanonical_asserted, wants_upgrade, PROXY_ASSERTED_HEADERS};
+    use http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn noncanonical_spellings_are_stripped() {
+        let mut m = HeaderMap::new();
+        for h in PROXY_ASSERTED_HEADERS {
+            m.insert(*h, HeaderValue::from_static("keep"));
+            // `_`, `.`, and mixed separators; uppercase is folded by HeaderName.
+            for alt in [
+                h.replace('-', "_").to_ascii_uppercase(),
+                h.replace('-', "."),
+                h.replacen('-', ".", 1).replace('-', "_"),
+            ] {
+                if !alt.eq_ignore_ascii_case(h) {
+                    m.insert(
+                        http::HeaderName::from_bytes(alt.as_bytes()).unwrap(),
+                        HeaderValue::from_static("drop"),
+                    );
+                }
+            }
+        }
+        // Repeated, leading and trailing separators are spellings too.
+        for alt in [
+            "x__forwarded_for",
+            "x._forwarded-for",
+            "-x-ferryman-tenant",
+            "x-forwarded-for-",
+            "_X..Real__IP.",
+        ] {
+            m.insert(
+                http::HeaderName::from_bytes(alt.as_bytes()).unwrap(),
+                HeaderValue::from_static("drop"),
+            );
+        }
+        m.insert("x_custom", HeaderValue::from_static("keep"));
+        m.insert("x-forwarded_for_x", HeaderValue::from_static("keep"));
+        assert!(m.contains_key("x_ferryman_tenant") && m.contains_key("x.ferryman.tenant"));
+        assert!(m.contains_key("x.forwarded_for"));
+        strip_noncanonical_asserted(&mut m);
+        for h in PROXY_ASSERTED_HEADERS {
+            assert_eq!(m.get(*h).unwrap(), "keep", "{h}");
+        }
+        assert!(m.values().all(|v| v == "keep"), "{m:?}");
+        assert!(m.contains_key("x_custom") && m.contains_key("x-forwarded_for_x"));
+        assert_eq!(m.len(), PROXY_ASSERTED_HEADERS.len() + 2);
+    }
 
     #[test]
     fn upgrade_detection() {
