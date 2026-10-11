@@ -34,5 +34,5 @@ ring = "0.17"
 [dev-dependencies]
 # Same repo crates the proxy is built from, by path *and* version: delete
 # `path = ...` and this is a plain crates.io dependency.
-ferryman-edge-core = { path = "../../crates/core", version = "0.1" }
+ferryman-edge-core = { path = "../../crates/core", version = "0.2" }
 tempfile = "3"

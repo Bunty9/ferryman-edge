@@ -7,5 +7,5 @@
 
 ```toml
 [dependencies]
-ferryman-edge-core = "0.1"
+ferryman-edge-core = "0.2"
 ```

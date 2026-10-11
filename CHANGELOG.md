@@ -7,12 +7,20 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
+Upgrading from 0.1.x: a 0.1.2 `config.toml` still boots (deprecated
+spellings log a warning). Check the items under "Changed (breaking)":
+`Host` is now the client's, bodies stream with no default size cap, the
+breaker opens after 3 failures per upstream `host:port`, `/health` answers
+below 500 count as up, the image runs as uid 65532, and the TLS provider
+is ring.
+
 ### Changed (breaking)
 - Docker image: a static musl binary in `scratch` running as `65532:65532`
   (was distroless/cc as root). Migration: mounted certs, keys and config
   must be readable by uid 65532 (volume ownership: `chgrp 65532` + `chmod
   0640`, or `chown`), or run the container with `--user`.
 - `JwtVerifier::reload_key` returns `Ok(bool)` (whether the key changed).
+  Migration: callers that matched on `Ok(())` match `Ok(_)`.
 - TLS provider is ring (was aws-lc-rs), across the proxy, tests and
   examples; `deny.toml` bans aws-lc. Library users install
   `rustls::crypto::ring::default_provider()`. No FIPS build, and the
