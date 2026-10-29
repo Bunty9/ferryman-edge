@@ -7,7 +7,16 @@ Both crates share one version. Format follows
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-10-11
+## [0.2.0] — 2026-10-30
+
+### Security
+- Dependency updates: `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382:
+  certificate verification could accept distrusted intermediates; edge
+  verifies client certificates for mTLS), `rustls` 0.23.46
+  (RUSTSEC-2026-0346 to 0349, client-side and brotli-feature issues that
+  do not affect the proxy's server role) and `tokio` 1.54.1
+  (RUSTSEC-2026-0386). Rebuild 0.1.x binaries or run `cargo update` to
+  pick up the `rustls-webpki` fix there too.
 
 Upgrading from 0.1.x: a 0.1.2 `config.toml` still boots (deprecated
 spellings log a warning). Check the items under "Changed (breaking)":
