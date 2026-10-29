@@ -36,8 +36,9 @@ fn now_secs() -> u64 {
 }
 
 pub struct JwtVerifier {
-    /// Current key plus its generation (bumped by `reload_key`).
-    key: ArcSwap<(DecodingKey, u64)>,
+    /// Current key, its generation (bumped by `reload_key`), and the PEM it
+    /// came from.
+    key: ArcSwap<(DecodingKey, u64, Vec<u8>)>,
     validation: Validation,
     /// Values carry the key generation they were verified under, so an
     /// insert racing `reload_key`'s `invalidate_all` can never be served.
@@ -49,7 +50,11 @@ impl JwtVerifier {
     /// and a 10k-entry LRU cache with a 5-minute TTL.
     pub fn new(jwks_pem: &[u8]) -> anyhow::Result<Self> {
         Ok(Self {
-            key: ArcSwap::from_pointee((DecodingKey::from_rsa_pem(jwks_pem)?, 0)),
+            key: ArcSwap::from_pointee((
+                DecodingKey::from_rsa_pem(jwks_pem)?,
+                0,
+                jwks_pem.to_vec(),
+            )),
             validation: {
                 let mut v = Validation::new(Algorithm::RS256);
                 // Checked once at decode; a token is only cached after it
@@ -117,14 +122,29 @@ impl JwtVerifier {
     }
 
     /// Replace the public key (SIGUSR1 rotation). The PEM is parsed first; on
-    /// error the old key stays. Cached verifications under the old key are
-    /// dropped. Issuer, audience and leeway are unchanged.
-    pub fn reload_key(&self, pem: &[u8]) -> anyhow::Result<()> {
+    /// error the old key stays. Identical PEM bytes are a no-op (`Ok(false)`):
+    /// the key, generation and token cache are kept, so an unrelated reload
+    /// (cert renewal, route edit) costs nothing. Otherwise the key is swapped
+    /// in and cached verifications under the old key are dropped
+    /// (`Ok(true)`). Issuer, audience and leeway are unchanged.
+    pub fn reload_key(&self, pem: &[u8]) -> anyhow::Result<bool> {
         let new = DecodingKey::from_rsa_pem(pem)?;
-        // rcu makes the generation bump atomic across concurrent reloads.
-        self.key.rcu(|cur| Arc::new((new.clone(), cur.1 + 1)));
-        self.cache.invalidate_all();
-        Ok(())
+        let mut changed = false;
+        // The byte comparison lives inside rcu so concurrent reloads stay
+        // atomic (generation bump and "unchanged" decision see the same
+        // snapshot). The closure may retry, so reset the flag each run.
+        self.key.rcu(|cur| {
+            changed = cur.2 != pem;
+            if changed {
+                Arc::new((new.clone(), cur.1 + 1, pem.to_vec()))
+            } else {
+                Arc::clone(cur)
+            }
+        });
+        if changed {
+            self.cache.invalidate_all();
+        }
+        Ok(changed)
     }
 }
 
@@ -306,17 +326,40 @@ mod tests {
     fn concurrent_reloads_bump_generation_atomically() {
         let v = Arc::new(JwtVerifier::new(PUB_PEM).unwrap());
         let hs: Vec<_> = (0..8)
-            .map(|_| {
+            .map(|t| {
                 let v = v.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..10 {
-                        v.reload_key(OTHER_PUB_PEM).unwrap();
+                    for i in 0..10 {
+                        // Alternate the two keys, and pad with a per-reload
+                        // number of trailing newlines so no two reloads ever
+                        // share bytes, whatever the interleaving.
+                        let mut pem = if i % 2 == 0 { OTHER_PUB_PEM } else { PUB_PEM }.to_vec();
+                        pem.extend(std::iter::repeat_n(b'\n', 1 + t * 10 + i));
+                        assert!(v.reload_key(&pem).unwrap());
                     }
                 })
             })
             .collect();
         hs.into_iter().for_each(|h| h.join().unwrap());
         assert_eq!(v.key.load().1, 80);
+    }
+
+    #[tokio::test]
+    async fn reload_with_identical_pem_keeps_cache_and_generation() {
+        let v = JwtVerifier::new(PUB_PEM).unwrap();
+        let a = sign(PRIV_PEM, &claims());
+        assert!(v.verify(&a).await.is_some()); // cached under gen 0
+        assert!(!v.reload_key(PUB_PEM).unwrap(), "same bytes: no swap");
+        assert_eq!(v.key.load().1, 0, "generation unchanged");
+        assert_eq!(
+            v.cache.get(&a).await.map(|(_, g)| g),
+            Some(0),
+            "still cached"
+        );
+        assert!(v.reload_key(OTHER_PUB_PEM).unwrap());
+        assert_eq!(v.key.load().1, 1);
+        assert!(!v.reload_key(OTHER_PUB_PEM).unwrap());
+        assert_eq!(v.key.load().1, 1);
     }
 
     #[tokio::test]

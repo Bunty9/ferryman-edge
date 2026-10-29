@@ -1,7 +1,6 @@
 //! mTLS server config + hot-reloading wrapper.
 //!
-//! Uses `rustls` 0.23 with the `aws-lc-rs` cryptographic provider — FIPS
-//! path is via the same `aws-lc-fips-sys` crate (interview talking point).
+//! Uses `rustls` 0.23 with the `ring` provider (the only one compiled in).
 //! The cert chain is loaded via `rustls-pki-types`' PEM parser from disk; we deliberately
 //! avoid `webpki-roots` for the *client* CA store because we want only the
 //! tenant's CA chain to validate inbound peers.
@@ -25,9 +24,8 @@ use std::sync::Arc;
 /// * the trusted client-CA bundle from `client_ca_path` — any inbound peer
 ///   cert must chain to one of these roots.
 ///
-/// ALPN advertises `h2` then `http/1.1`. The provider is `aws-lc-rs`
-/// (selected at workspace level via `rustls`'s `aws-lc-rs` feature with
-/// `default-features = false`).
+/// ALPN advertises `h2` then `http/1.1`. The provider is ring (workspace
+/// `rustls` features, `default-features = false`).
 pub fn build_mtls_config(
     cert_path: &str,
     key_path: &str,

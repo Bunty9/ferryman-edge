@@ -15,8 +15,8 @@
 - [x] `crates/core/src/route.rs` — `Upstream`, `RouteTable`, `SharedTable`
       (verbatim from P2).
 - [x] `crates/core/src/health.rs` — `health_loop` (verbatim from P2).
-- [x] `crates/core/src/config.rs` — extended `ConfigToml` with `TlsToml`,
-      `JwtToml`, `tenant_rps`.
+- [x] `crates/core/src/config.rs` — `EdgeConfig` (0.2.0): `[mtls]` (alias `[tls]`),
+      `[jwt]`, `[limits] tenant_rps` over the core-shaped `ConfigToml`.
 - [x] `crates/core/src/tls.rs` — `build_mtls_config` + `ReloadingTls`
       (SIGUSR1 reload).
 - [x] `crates/core/src/jwt.rs` — `Claims`, `JwtVerifier` with moka LRU.
@@ -101,6 +101,19 @@
 - [x] Version bumped to 0.1.2, CHANGELOG section dated; tag and publish
       are separate, explicit steps.
 
+## 0.2.0 (prepared on branch `edge-0.2.0`, not yet released)
+
+- [x] Routing, breaker, health checks and core config come from
+      `ferryman-core` 0.3 (crates.io); edge adds mTLS, JWT, tenant rate
+      limit and `EdgeConfig` on top.
+- [x] ring as the only TLS provider; static musl `scratch` image running as
+      uid 65532; release binaries and binstall metadata.
+- [x] Client `Host` preserved, streaming bodies with no default cap,
+      per-upstream breaker (3 failures), breaker verdict deferred to the end
+      of the response body.
+- [x] Version 0.2.0, CHANGELOG section dated; tag and publish are separate,
+      explicit steps.
+
 ## Next sprint — Phase 3: numbers + deploy
 
 - [ ] mTLS-capable load generator (e.g. a small hyper/rustls client or
@@ -115,7 +128,7 @@
 ## Examples
 
 - [x] `examples/edge-demo`: `edge-demo run` checks every feature
-      against the real binary (56 checks, ~4 s; CI runs both body modes).
+      against the real binary (65 checks, ~73 s, mostly the 65 s SSE stream; one body mode).
       Manual walkthrough and docker-compose topology (proxy + 3 backends +
       Prometheus) verified by hand 2026-09-30.
 - [x] `examples/embed-core`: ferryman-edge-core in an axum service, 8 tests.

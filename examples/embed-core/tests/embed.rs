@@ -44,7 +44,7 @@ struct Harness {
 
 impl Harness {
     async fn new(rps: u32) -> Self {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let ca_key = KeyPair::generate().unwrap();
         let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
