@@ -16,3 +16,12 @@ you prefer otherwise.
 
 Until 1.0, only the latest minor release (currently 0.2.x) receives
 security fixes.
+
+## Notes for older releases
+
+- **0.1.x and RUSTSEC-2026-0382.** The `Cargo.lock` shipped with 0.1.0–0.1.3
+  pins `rustls-webpki` 0.103.15, which may accept distrusted intermediates
+  when verifying certificates; ferryman-edge uses it to verify mTLS client
+  certificates. 0.2.0 ships 0.103.16. If you cannot upgrade, install 0.1.3
+  without `--locked` (Cargo then resolves a fixed `rustls-webpki`), or run
+  `cargo update -p rustls-webpki` before building from source.
